@@ -1,0 +1,17 @@
+{
+  "Host": "192.168.1.100",
+  "PreSharedKey": "1234",
+  "DarkMode": true,
+  "Mica": true,
+  "TextInputControls": true,
+  "InputControls": false,
+  "AppControls": true,
+  "ChannelControls": false,
+  "NavigationControls": true,
+  "PlaybackControls": true,
+  "VolumeControls": true,
+  "Apps": {},
+  "SystemTray": false,
+  "CloseToTray": false,
+  "DropdownAnimationWorkaround": true
+}
