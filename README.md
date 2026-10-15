@@ -101,7 +101,7 @@ The app automatically restarts when it detects that `SonyRemote.json` has change
 
 Only one instance of SonyRemote can run at a time.
 
-### Text input
+## Text input
 
 - **Enter** — Sends the text to the TV.
 - **Ctrl+Enter** — Sends the text and automatically activates the TV keyboard action, such as **Search** or **Go**.
