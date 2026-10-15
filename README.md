@@ -1,6 +1,6 @@
 # Sony-Remote-Control
 
-Small PySide6 desktop remote for Sony BRAVIA TVs using the Sony BRAVIA IP Control API.
+Small PySide6 desktop remote for Sony BRAVIA TVs using the Sony BRAVIA IP Control API (only tested on XR-55X90J)
 
 ![Sony Remote](screenshots/sony_remote.jpg)
 
