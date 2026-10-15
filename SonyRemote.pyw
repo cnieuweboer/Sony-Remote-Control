@@ -1491,8 +1491,10 @@ class SonyRemote(QMainWindow):
         if not self.config["SystemTray"] or not QSystemTrayIcon.isSystemTrayAvailable():
             return
         self.tray = QSystemTrayIcon(self.windowIcon(), self)
+        self.tray.setToolTip("Sony Remote")
+
         menu = QMenu()
-        show_action = QAction("Show Sony Remote", self)
+        show_action = QAction("Show", self)
         quit_action = QAction("Exit", self)
         show_action.triggered.connect(self.show_from_tray)
         quit_action.triggered.connect(self.quit_from_tray)
@@ -1504,7 +1506,7 @@ class SonyRemote(QMainWindow):
         self.tray.show()
 
     def tray_activated(self, reason):
-        if reason == QSystemTrayIcon.Trigger:
+        if reason == QSystemTrayIcon.DoubleClick:
             self.show_from_tray()
 
     def show_from_tray(self):
