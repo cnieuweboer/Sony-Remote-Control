@@ -1112,15 +1112,21 @@ class SonyRemote(QMainWindow):
         for command, button in self.channel_buttons.items():
             button.setEnabled(bool(enabled and command in remote_codes))
 
-    def set_controls_enabled(self, enabled, power_enabled=None):
+    def set_controls_enabled(
+        self,
+        enabled,
+        power_enabled=None,
+        app_enabled=None,
+    ):
         if power_enabled is None:
             power_enabled = enabled
+        if app_enabled is None:
+            app_enabled = enabled
 
         self.power_button.setEnabled(power_enabled)
 
         for widget in (
             getattr(self, "text_input", None),
-            getattr(self, "app_combo", None),
             getattr(self, "input_combo", None),
             getattr(self, "mute_button", None),
             getattr(self, "volume_down", None),
@@ -1129,10 +1135,23 @@ class SonyRemote(QMainWindow):
             if widget is not None:
                 widget.setEnabled(enabled)
 
+        # Start from the general state for all ordinary buttons.
         for button in self.findChildren(QPushButton):
             if button is self.power_button:
                 continue
             button.setEnabled(enabled)
+
+        # App launching works while the TV is in standby and can wake it, so
+        # App controls have their own availability state.
+        if hasattr(self, "app_combo"):
+            self.app_combo.setEnabled(app_enabled)
+
+        if hasattr(self, "app_favorites_layout"):
+            for index in range(self.app_favorites_layout.count()):
+                item = self.app_favorites_layout.itemAt(index)
+                button = item.widget()
+                if isinstance(button, QPushButton):
+                    button.setEnabled(app_enabled)
 
         # Channel commands vary between Sony models/regions. Keep unsupported
         # commands disabled even when the rest of the connected UI is active.
@@ -1179,7 +1198,11 @@ class SonyRemote(QMainWindow):
                     self.show_error(f"Could not update SonyRemote.json:\n\n{exc}")
 
             self.initialized = True
-            self.set_controls_enabled(True, power_enabled=True)
+            self.set_controls_enabled(
+                False,
+                power_enabled=True,
+                app_enabled=True,
+            )
             self.poll_status()
             self.poll_timer.start()
 
@@ -1359,7 +1382,12 @@ class SonyRemote(QMainWindow):
                 QTimer.singleShot(0, self.initialize_tv)
                 return
 
-            self.set_controls_enabled(True, power_enabled=True)
+            is_active = self.last_power == "active"
+            self.set_controls_enabled(
+                is_active,
+                power_enabled=True,
+                app_enabled=True,
+            )
             self.update_power_ui(self.last_power)
             if data.get("volume"):
                 self.last_volume = data["volume"]
