@@ -7,13 +7,14 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import threading
 import traceback
 import urllib.request
 from pathlib import Path
 from xml.sax.saxutils import escape
 
-from PySide6.QtCore import QFileSystemWatcher, QLockFile, QObject, QRunnable, Qt, QThreadPool, QTimer, Signal
+from PySide6.QtCore import QEvent, QFileSystemWatcher, QLockFile, QObject, QRunnable, Qt, QThreadPool, QTimer, Signal
 from PySide6.QtGui import QAction, QColor, QPalette
 from PySide6.QtWidgets import (
     QApplication, QComboBox, QDialogButtonBox, QFrame, QGridLayout, QHBoxLayout, QLabel,
@@ -31,6 +32,8 @@ POLL_INTERVAL_MS = 2000
 CONFIG_RESTART_DEBOUNCE_MS = 250
 POPUP_GUARD_DURATION_MS = 220
 POPUP_GUARD_FAVORITE_COUNT = 4
+TEXT_INPUT_STATE_TIMEOUT_SECONDS = 1.5
+TEXT_INPUT_STATE_POLL_SECONDS = 0.05
 
 _instance_mutex_handle = None
 _instance_lock_file = None
@@ -366,6 +369,29 @@ class SonyApi:
             version="1.0",
         )
 
+    def is_text_input_active(self):
+        entries = self.rpc(
+            "appControl",
+            "getApplicationStatusList",
+            version="1.0",
+        )["result"][0]
+
+        for entry in entries:
+            if entry.get("name") == "textInput":
+                return entry.get("status") == "on"
+
+        return False
+
+    def wait_for_text_input_state(self, active, timeout=TEXT_INPUT_STATE_TIMEOUT_SECONDS):
+        deadline = time.monotonic() + timeout
+
+        while True:
+            if self.is_text_input_active() == active:
+                return True
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(TEXT_INPUT_STATE_POLL_SECONDS)
+
     def set_power(self, on):
         return self.rpc("system", "setPowerStatus", [{"status": bool(on)}])
 
@@ -436,6 +462,7 @@ class SonyApi:
 
 class TvTextEdit(QTextEdit):
     submitRequested = Signal()
+    submitAndConfirmRequested = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -448,10 +475,17 @@ class TvTextEdit(QTextEdit):
         self.setFixedHeight(line_height * 2 + 24)
 
     def keyPressEvent(self, event):
-        if event.key() in (Qt.Key_Return, Qt.Key_Enter) and not (
-            event.modifiers() & Qt.ShiftModifier
-        ):
-            self.submitRequested.emit()
+        if event.key() in (Qt.Key_Return, Qt.Key_Enter):
+            modifiers = event.modifiers()
+
+            if modifiers & Qt.ShiftModifier:
+                super().keyPressEvent(event)
+                return
+
+            if modifiers & Qt.ControlModifier:
+                self.submitAndConfirmRequested.emit()
+            else:
+                self.submitRequested.emit()
             return
 
         super().keyPressEvent(event)
@@ -646,6 +680,9 @@ class SonyRemote(QMainWindow):
 
         self.text_input = TvTextEdit()
         self.text_input.submitRequested.connect(self.send_text_input)
+        self.text_input.submitAndConfirmRequested.connect(
+            self.send_text_input_and_confirm
+        )
         layout.addWidget(self.text_input)
 
     def _build_channel_controls(self):
@@ -1168,7 +1205,8 @@ class SonyRemote(QMainWindow):
 
             # Only discover IRCC codes when the enabled UI actually needs them.
             if (
-                self.config["ChannelControls"]
+                self.config["TextInputControls"]
+                or self.config["ChannelControls"]
                 or self.config["NavigationControls"]
                 or self.config["PlaybackControls"]
             ):
@@ -1203,14 +1241,13 @@ class SonyRemote(QMainWindow):
                 power_enabled=True,
                 app_enabled=True,
             )
-            self.poll_status()
-            self.poll_timer.start()
+            self._update_polling_state(refresh=True)
 
         def failed(_message):
             self.initialized = False
             self.power_button.setText("TV unavailable")
             self.set_controls_enabled(False, power_enabled=False)
-            self.poll_timer.start()
+            self._update_polling_state()
 
         def finished():
             self.initialization_running = False
@@ -1442,6 +1479,50 @@ class SonyRemote(QMainWindow):
             ),
         )
 
+    def send_text_input_and_confirm(self):
+        if not hasattr(self, "text_input"):
+            return
+
+        text = self.text_input.toPlainText()
+        if not text:
+            return
+
+        def send_and_confirm():
+            # Reset Gboard's selection to its initial key before using the
+            # navigation macro. If the keyboard is already open, Return closes
+            # it while leaving the text field focused.
+            if self.api.is_text_input_active():
+                self.api.ircc("Return")
+                if not self.api.wait_for_text_input_state(False):
+                    raise RuntimeError("Software keyboard did not close.")
+
+            # Confirm on the still-focused text field reopens the software
+            # keyboard. Wait for Sony's status API rather than relying on a
+            # fixed UI delay.
+            self.api.ircc("Confirm")
+            if not self.api.wait_for_text_input_state(True):
+                raise RuntimeError("Software keyboard did not become active.")
+
+            # setTextForm now doubles as the final readiness check.
+            self.api.set_text_form(text)
+
+            # With a freshly opened Gboard keyboard the active key starts at Q.
+            # Left wraps to the right-side action column, then three Down
+            # presses reach the contextual Search/Go/etc. button.
+            self.api.ircc("Left")
+            self.api.ircc("Down")
+            self.api.ircc("Down")
+            self.api.ircc("Down")
+            self.api.ircc("Confirm")
+
+        self.run_worker(
+            send_and_confirm,
+            on_error=lambda _message: self.show_error(
+                "Could not send or submit the text on the TV.\n\n"
+                "Make sure a TV software keyboard or text field is currently active."
+            ),
+        )
+
     def toggle_power(self):
         turn_on = self.last_power != "active"
         self.power_button.setEnabled(False)
@@ -1486,6 +1567,20 @@ class SonyRemote(QMainWindow):
         target = not bool(self.last_volume.get("mute"))
         self.run_worker(lambda: self.api.set_mute(target), on_finished=lambda: QTimer.singleShot(200, self.poll_status))
 
+    def _update_polling_state(self, refresh=False):
+        if self._shutting_down or not hasattr(self, "poll_timer"):
+            return
+
+        should_poll = self.isVisible() and not self.isMinimized()
+
+        if should_poll:
+            if refresh:
+                self.poll_status()
+            if not self.poll_timer.isActive():
+                self.poll_timer.start()
+        else:
+            self.poll_timer.stop()
+
     def _setup_tray(self):
         self.tray = None
         if not self.config["SystemTray"] or not QSystemTrayIcon.isSystemTrayAvailable():
@@ -1513,6 +1608,7 @@ class SonyRemote(QMainWindow):
         self.showNormal()
         self.raise_()
         self.activateWindow()
+        self._update_polling_state(refresh=True)
 
     def _shutdown(self):
         if self._shutting_down:
@@ -1542,10 +1638,22 @@ class SonyRemote(QMainWindow):
         self._shutdown()
         QApplication.quit()
 
+    def changeEvent(self, event):
+        super().changeEvent(event)
+
+        if event.type() == QEvent.WindowStateChange:
+            QTimer.singleShot(
+                0,
+                lambda: self._update_polling_state(
+                    refresh=self.isVisible() and not self.isMinimized()
+                ),
+            )
+
     def closeEvent(self, event):
         if self.tray and self.config["CloseToTray"] and not self._really_close:
             event.ignore()
             self.hide()
+            self._update_polling_state()
             return
 
         self._shutdown()
