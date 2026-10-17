@@ -1,16 +1,29 @@
 {
-  "Host": "192.168.1.100",
+  "Host": "192.168.1.1000",
   "PreSharedKey": "1234",
   "DarkMode": true,
   "Mica": true,
   "TextInputControls": true,
+  "TextInputSubmit": true,
+  "TextInputSubmitSequence": [
+    "Left",
+    "Down",
+    "Down",
+    "Down",
+    "Confirm"
+  ],
   "InputControls": false,
   "AppControls": true,
   "ChannelControls": false,
   "NavigationControls": true,
   "PlaybackControls": true,
   "VolumeControls": true,
+  "VolumeRateLimit": {
+    "Active": false,
+    "RateMs": 300
+  },
   "Apps": {},
+  "Inputs": {},
   "SystemTray": false,
   "CloseToTray": false,
   "DropdownAnimationWorkaround": true

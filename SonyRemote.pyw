@@ -1,4 +1,5 @@
 import ctypes
+from datetime import datetime
 import faulthandler
 import hashlib
 import html
@@ -24,6 +25,7 @@ from PySide6.QtWidgets import (
 )
 
 APP_NAME = "Sony Remote"
+__version__ = "2026.10.17.1"
 INSTANCE_MUTEX_NAME = "Local\\SonyRemote.SingleInstance"
 CONFIG_PATH = Path(__file__).with_name("SonyRemote.json")
 
@@ -38,18 +40,91 @@ TEXT_INPUT_STATE_POLL_SECONDS = 0.05
 _instance_mutex_handle = None
 _instance_lock_file = None
 
+# Windows-only keyboard shortcut interception. Installed only while the app
+# is running on Windows; the hook itself only consumes keys while this window
+# is foreground.
+if sys.platform == "win32":
+    _user32 = ctypes.windll.user32
+
+    WH_KEYBOARD_LL = 13
+    WM_KEYDOWN = 0x0100
+    WM_SYSKEYDOWN = 0x0104
+
+    VK_BACK = 0x08
+    VK_RETURN = 0x0D
+    VK_HOME = 0x24
+    VK_LEFT = 0x25
+    VK_UP = 0x26
+    VK_RIGHT = 0x27
+    VK_DOWN = 0x28
+
+    VK_NUMPAD0 = 0x60
+    VK_NUMPAD1 = 0x61
+    VK_NUMPAD2 = 0x62
+    VK_NUMPAD3 = 0x63
+    VK_NUMPAD4 = 0x64
+    VK_NUMPAD5 = 0x65
+    VK_NUMPAD6 = 0x66
+    VK_NUMPAD7 = 0x67
+    VK_NUMPAD8 = 0x68
+    VK_NUMPAD9 = 0x69
+    VK_ADD = 0x6B
+    VK_SUBTRACT = 0x6D
+
+    VK_MEDIA_NEXT_TRACK = 0xB0
+    VK_MEDIA_PREV_TRACK = 0xB1
+    VK_MEDIA_STOP = 0xB2
+    VK_MEDIA_PLAY_PAUSE = 0xB3
+
+    VK_VOLUME_MUTE = 0xAD
+    VK_VOLUME_DOWN = 0xAE
+    VK_VOLUME_UP = 0xAF
+
+    _LowLevelKeyboardProc = ctypes.WINFUNCTYPE(
+        ctypes.c_long,
+        ctypes.c_int,
+        ctypes.c_ulong,
+        ctypes.c_void_p,
+    )
+
+    class _KBDLLHOOKSTRUCT(ctypes.Structure):
+        _fields_ = [
+            ("vkCode", ctypes.c_ulong),
+            ("scanCode", ctypes.c_ulong),
+            ("flags", ctypes.c_ulong),
+            ("time", ctypes.c_ulong),
+            ("dwExtraInfo", ctypes.c_void_p),
+        ]
+else:
+    _user32 = None
+    _LowLevelKeyboardProc = None
+    _KBDLLHOOKSTRUCT = None
+
+
 DEFAULT_CONFIG = {
     "Host": "",
     "PreSharedKey": "",
     "DarkMode": True,
     "Mica": True,
     "TextInputControls": True,
+    "TextInputSubmit": True,
+    "TextInputSubmitSequence": [
+        "Left",
+        "Down",
+        "Down",
+        "Down",
+        "Confirm",
+    ],
     "InputControls": False,
     "AppControls": True,
     "ChannelControls": True,
     "NavigationControls": True,
     "PlaybackControls": True,
     "VolumeControls": True,
+    "VolumeRateLimit": {
+        "Active": True,
+        "RateMs": 500,
+    },
     "Apps": {},
     "Inputs": {},
     "SystemTray": False,
@@ -61,6 +136,7 @@ BOOLEAN_CONFIG_KEYS = (
     "DarkMode",
     "Mica",
     "TextInputControls",
+    "TextInputSubmit",
     "InputControls",
     "AppControls",
     "ChannelControls",
@@ -257,7 +333,7 @@ def set_dark_titlebar(hwnd):
 
 def _default_config_copy():
     return {
-        key: value.copy() if isinstance(value, dict) else value
+        key: value.copy() if isinstance(value, (dict, list)) else value
         for key, value in DEFAULT_CONFIG.items()
     }
 
@@ -293,6 +369,40 @@ def load_config():
     for key in BOOLEAN_CONFIG_KEYS:
         if not isinstance(config.get(key), bool):
             config[key] = DEFAULT_CONFIG[key]
+            changed = True
+
+    rate_limit = config.get("VolumeRateLimit")
+    if not isinstance(rate_limit, dict):
+        config["VolumeRateLimit"] = DEFAULT_CONFIG["VolumeRateLimit"].copy()
+        changed = True
+    else:
+        normalized_rate_limit = {
+            "Active": rate_limit.get("Active"),
+            "RateMs": rate_limit.get("RateMs"),
+        }
+        if not isinstance(normalized_rate_limit["Active"], bool):
+            normalized_rate_limit["Active"] = DEFAULT_CONFIG["VolumeRateLimit"]["Active"]
+            changed = True
+        rate_ms = normalized_rate_limit["RateMs"]
+        if isinstance(rate_ms, bool) or not isinstance(rate_ms, int) or rate_ms < 1:
+            normalized_rate_limit["RateMs"] = DEFAULT_CONFIG["VolumeRateLimit"]["RateMs"]
+            changed = True
+        if rate_limit != normalized_rate_limit:
+            changed = True
+        config["VolumeRateLimit"] = normalized_rate_limit
+
+    submit_sequence = config.get("TextInputSubmitSequence")
+    if (
+        not isinstance(submit_sequence, list)
+        or not submit_sequence
+        or not all(isinstance(command, str) and command.strip() for command in submit_sequence)
+    ):
+        config["TextInputSubmitSequence"] = DEFAULT_CONFIG["TextInputSubmitSequence"].copy()
+        changed = True
+    else:
+        normalized_sequence = [command.strip() for command in submit_sequence]
+        if normalized_sequence != submit_sequence:
+            config["TextInputSubmitSequence"] = normalized_sequence
             changed = True
 
     for key in ("Host", "PreSharedKey"):
@@ -408,6 +518,16 @@ class SonyApi:
             [{"target": "speaker", "volume": str(int(value))}],
         )
 
+    def adjust_volume(self, amount):
+        amount = int(amount)
+        if amount == 0:
+            return None
+        value = f"{amount:+d}"
+        return self.rpc(
+            "audio", "setAudioVolume",
+            [{"target": "speaker", "volume": value}],
+        )
+
     def set_mute(self, muted):
         return self.rpc("audio", "setAudioMute", [{"status": bool(muted)}])
 
@@ -433,8 +553,27 @@ class SonyApi:
             if item.get("name") and item.get("value")
         }
 
+    def resolve_remote_command(self, name):
+        if name == "Confirm" and name not in self.remote_codes:
+            if "DpadCenter" in self.remote_codes:
+                return "DpadCenter"
+        return name
+
+    def validate_remote_commands(self, commands):
+        unavailable = [
+            name
+            for name in commands
+            if self.resolve_remote_command(name) not in self.remote_codes
+        ]
+        if unavailable:
+            joined = ", ".join(repr(name) for name in unavailable)
+            raise RuntimeError(
+                f"TextInputSubmitSequence contains unavailable remote command(s): {joined}"
+            )
+
     def ircc(self, name):
-        code = self.remote_codes.get(name)
+        resolved_name = self.resolve_remote_command(name)
+        code = self.remote_codes.get(resolved_name)
         if not code:
             raise RuntimeError(f"Remote command '{name}' is unavailable.")
         body = f'''<?xml version="1.0"?>
@@ -612,6 +751,9 @@ class SonyRemote(QMainWindow):
         self.initialized = False
         self.last_power = None
         self.last_volume = None
+        self._desired_volume = None
+        self._volume_rate_loop_running = False
+        self._volume_rate_step_running = False
         self._really_close = False
         self._shutting_down = False
 
@@ -621,6 +763,18 @@ class SonyRemote(QMainWindow):
         self._apply_style()
         self._setup_tray()
 
+        # On Windows the native low-level keyboard hook captures shortcuts
+        # reliably. Other platforms use Qt's event filter as a fallback.
+        if sys.platform != "win32":
+            app = QApplication.instance()
+            if app is not None:
+                app.installEventFilter(self)
+
+        self._keyboard_hook = None
+        self._keyboard_hook_proc = None
+        if sys.platform == "win32":
+            self._install_windows_keyboard_hook()
+
         self._config_digest = self._get_config_digest()
         self._config_restart_pending = False
         self._setup_config_watcher()
@@ -628,6 +782,10 @@ class SonyRemote(QMainWindow):
         self.poll_timer = QTimer(self)
         self.poll_timer.setInterval(POLL_INTERVAL_MS)
         self.poll_timer.timeout.connect(self.poll_status)
+
+        self.volume_rate_timer = QTimer(self)
+        self.volume_rate_timer.setSingleShot(True)
+        self.volume_rate_timer.timeout.connect(self._volume_rate_step)
 
         self.set_controls_enabled(False, power_enabled=False)
         QTimer.singleShot(0, self.initialize_tv)
@@ -1205,7 +1363,7 @@ class SonyRemote(QMainWindow):
 
             # Only discover IRCC codes when the enabled UI actually needs them.
             if (
-                self.config["TextInputControls"]
+                (self.config["TextInputControls"] and self.config["TextInputSubmit"])
                 or self.config["ChannelControls"]
                 or self.config["NavigationControls"]
                 or self.config["PlaybackControls"]
@@ -1428,7 +1586,9 @@ class SonyRemote(QMainWindow):
             self.update_power_ui(self.last_power)
             if data.get("volume"):
                 self.last_volume = data["volume"]
-                self.update_volume_ui(self.last_volume)
+                if not self._volume_rate_loop_running:
+                    self._desired_volume = None
+                    self.update_volume_ui(self.last_volume)
             if "inputs" in data:
                 self.update_active_input(data["inputs"])
 
@@ -1488,8 +1648,17 @@ class SonyRemote(QMainWindow):
             return
 
         def send_and_confirm():
-            # Reset Gboard's selection to its initial key before using the
-            # navigation macro. If the keyboard is already open, Return closes
+            # When automated submit is disabled, Ctrl+Enter falls back to the
+            # same send-only behavior as Enter.
+            if not self.config["TextInputSubmit"]:
+                self.api.set_text_form(text)
+                return
+
+            submit_sequence = self.config["TextInputSubmitSequence"]
+            self.api.validate_remote_commands(["Return", "Confirm", *submit_sequence])
+
+            # Reset the keyboard selection before using the configurable
+            # submit sequence. If the keyboard is already open, Return closes
             # it while leaving the text field focused.
             if self.api.is_text_input_active():
                 self.api.ircc("Return")
@@ -1506,14 +1675,8 @@ class SonyRemote(QMainWindow):
             # setTextForm now doubles as the final readiness check.
             self.api.set_text_form(text)
 
-            # With a freshly opened Gboard keyboard the active key starts at Q.
-            # Left wraps to the right-side action column, then three Down
-            # presses reach the contextual Search/Go/etc. button.
-            self.api.ircc("Left")
-            self.api.ircc("Down")
-            self.api.ircc("Down")
-            self.api.ircc("Down")
-            self.api.ircc("Confirm")
+            for command in submit_sequence:
+                self.api.ircc(command)
 
         self.run_worker(
             send_and_confirm,
@@ -1554,12 +1717,83 @@ class SonyRemote(QMainWindow):
     def adjust_volume(self, amount):
         if not self.last_volume:
             return
-        current = int(self.last_volume.get("volume", 0))
+
         minimum = int(self.last_volume.get("minVolume", 0))
         maximum = int(self.last_volume.get("maxVolume", 100))
-        target = max(minimum, min(maximum, current + amount))
+        current = (
+            self._desired_volume
+            if self._desired_volume is not None
+            else int(self.last_volume.get("volume", 0))
+        )
+        target = max(minimum, min(maximum, current + int(amount)))
+        if target == current:
+            return
+
+        self._desired_volume = target
         self.volume_value.setText(str(target))
-        self.run_worker(lambda: self.api.set_volume(target), on_finished=lambda: QTimer.singleShot(200, self.poll_status))
+
+        rate_limit = self.config["VolumeRateLimit"]
+        if not rate_limit["Active"]:
+            self.run_worker(
+                lambda: self.api.set_volume(target),
+                on_finished=lambda: QTimer.singleShot(200, self.poll_status),
+            )
+            return
+
+        if not self._volume_rate_loop_running:
+            self._volume_rate_loop_running = True
+            self._schedule_volume_rate_step(0)
+
+    def _schedule_volume_rate_step(self, delay_ms=None):
+        if self._shutting_down or not self._volume_rate_loop_running:
+            return
+        if delay_ms is None:
+            delay_ms = int(self.config["VolumeRateLimit"]["RateMs"])
+        self.volume_rate_timer.start(max(0, int(delay_ms)))
+
+    def _volume_rate_step(self):
+        if (
+            self._shutting_down
+            or not self._volume_rate_loop_running
+            or self._volume_rate_step_running
+            or self._desired_volume is None
+        ):
+            return
+
+        self._volume_rate_step_running = True
+
+        def step():
+            info = self.api.get_volume()
+            current = int(info.get("volume", 0))
+            target = self._desired_volume
+            if target is None or current == target:
+                return {"done": True, "info": info}
+            direction = 1 if current < target else -1
+            self.api.adjust_volume(direction)
+            return {"done": False, "info": info}
+
+        def done(result):
+            self._volume_rate_step_running = False
+            info = result.get("info")
+            if info:
+                self.last_volume = info
+            if result.get("done"):
+                self._volume_rate_loop_running = False
+                self._desired_volume = None
+                if self.last_volume:
+                    self.update_volume_ui(self.last_volume)
+                QTimer.singleShot(200, self.poll_status)
+                return
+            self._schedule_volume_rate_step()
+
+        def failed(message):
+            self._volume_rate_step_running = False
+            self._volume_rate_loop_running = False
+            self._desired_volume = None
+            self.show_error(message)
+            QTimer.singleShot(200, self.poll_status)
+
+        self.run_worker(step, on_result=done, on_error=failed)
 
     def toggle_mute(self):
         if not self.last_volume:
@@ -1615,10 +1849,15 @@ class SonyRemote(QMainWindow):
             return
 
         self._shutting_down = True
+        app = QApplication.instance()
+        if app is not None:
+            app.removeEventFilter(self)
+        self._remove_windows_keyboard_hook()
         self._really_close = True
 
         # Stop anything that can schedule more background work.
         self.poll_timer.stop()
+        self.volume_rate_timer.stop()
         if hasattr(self, "config_restart_timer"):
             self.config_restart_timer.stop()
         if hasattr(self, "config_watcher"):
@@ -1637,6 +1876,165 @@ class SonyRemote(QMainWindow):
     def quit_from_tray(self):
         self._shutdown()
         QApplication.quit()
+
+    def _dispatch_shortcut(self, command):
+        resolved = self.api.resolve_remote_command(command)
+        if resolved not in self.api.remote_codes:
+            return False
+
+        self.send_ircc(command)
+        return True
+
+    def eventFilter(self, watched, event):
+        if sys.platform == "win32":
+            return super().eventFilter(watched, event)
+
+        if event.type() != QEvent.KeyPress or not self.isActiveWindow():
+            return super().eventFilter(watched, event)
+
+        # Keep normal editing behavior while Text Input owns keyboard focus.
+        if hasattr(self, "text_input") and self.text_input.hasFocus():
+            return super().eventFilter(watched, event)
+
+        key = event.key()
+        modifiers = event.modifiers()
+        command = None
+
+        if modifiers & Qt.KeypadModifier:
+            keypad_map = {
+                Qt.Key_0: "Num0",
+                Qt.Key_1: "Num1",
+                Qt.Key_2: "Num2",
+                Qt.Key_3: "Num3",
+                Qt.Key_4: "Num4",
+                Qt.Key_5: "Num5",
+                Qt.Key_6: "Num6",
+                Qt.Key_7: "Num7",
+                Qt.Key_8: "Num8",
+                Qt.Key_9: "Num9",
+                Qt.Key_Plus: "ChannelUp",
+                Qt.Key_Minus: "ChannelDown",
+            }
+            command = keypad_map.get(key)
+
+        if command is None:
+            key_map = {
+                Qt.Key_Left: "Left",
+                Qt.Key_Right: "Right",
+                Qt.Key_Up: "Up",
+                Qt.Key_Down: "Down",
+                Qt.Key_Return: "Confirm",
+                Qt.Key_Enter: "Confirm",
+                Qt.Key_Backspace: "Return",
+                Qt.Key_Home: "Home",
+                Qt.Key_MediaTogglePlayPause: "PlayPause",
+                Qt.Key_MediaPlay: "Play",
+                Qt.Key_MediaPause: "Pause",
+                Qt.Key_MediaStop: "Stop",
+                Qt.Key_MediaNext: "Next",
+                Qt.Key_MediaPrevious: "Prev",
+            }
+            command = key_map.get(key)
+
+        if command is not None and self._dispatch_shortcut(command):
+            event.accept()
+            return True
+
+        return super().eventFilter(watched, event)
+
+    def _install_windows_keyboard_hook(self):
+        if sys.platform != "win32" or self._keyboard_hook:
+            return
+
+        self._keyboard_hook_proc = _LowLevelKeyboardProc(
+            self._windows_keyboard_hook
+        )
+        self._keyboard_hook = _user32.SetWindowsHookExW(
+            WH_KEYBOARD_LL,
+            self._keyboard_hook_proc,
+            None,
+            0,
+        )
+        if not self._keyboard_hook:
+            self._keyboard_hook_proc = None
+            raise ctypes.WinError()
+
+    def _remove_windows_keyboard_hook(self):
+        if sys.platform == "win32" and self._keyboard_hook:
+            _user32.UnhookWindowsHookEx(self._keyboard_hook)
+            self._keyboard_hook = None
+            self._keyboard_hook_proc = None
+
+    def _windows_keyboard_hook(self, n_code, w_param, l_param):
+        if n_code >= 0 and w_param in (WM_KEYDOWN, WM_SYSKEYDOWN):
+            data = ctypes.cast(
+                l_param,
+                ctypes.POINTER(_KBDLLHOOKSTRUCT),
+            ).contents
+
+            if _user32.GetForegroundWindow() == int(self.winId()):
+                vk = data.vkCode
+
+                # Keep ordinary typing/editing untouched while the text box
+                # owns focus. Volume keys remain remote controls, matching the
+                # previous Windows behavior.
+                text_input_focused = (
+                    hasattr(self, "text_input") and self.text_input.hasFocus()
+                )
+
+                if vk == VK_VOLUME_UP:
+                    self.adjust_volume(1)
+                    return 1
+
+                if vk == VK_VOLUME_DOWN:
+                    self.adjust_volume(-1)
+                    return 1
+
+                if vk == VK_VOLUME_MUTE:
+                    self.toggle_mute()
+                    return 1
+
+                if not text_input_focused:
+                    key_map = {
+                        VK_LEFT: "Left",
+                        VK_RIGHT: "Right",
+                        VK_UP: "Up",
+                        VK_DOWN: "Down",
+                        VK_RETURN: "Confirm",
+                        VK_BACK: "Return",
+                        VK_HOME: "Home",
+                        VK_NUMPAD0: "Num0",
+                        VK_NUMPAD1: "Num1",
+                        VK_NUMPAD2: "Num2",
+                        VK_NUMPAD3: "Num3",
+                        VK_NUMPAD4: "Num4",
+                        VK_NUMPAD5: "Num5",
+                        VK_NUMPAD6: "Num6",
+                        VK_NUMPAD7: "Num7",
+                        VK_NUMPAD8: "Num8",
+                        VK_NUMPAD9: "Num9",
+                        VK_ADD: "ChannelUp",
+                        VK_SUBTRACT: "ChannelDown",
+                        VK_MEDIA_PLAY_PAUSE: "PlayPause",
+                        VK_MEDIA_STOP: "Stop",
+                        VK_MEDIA_NEXT_TRACK: "Next",
+                        VK_MEDIA_PREV_TRACK: "Prev",
+                    }
+                    command = key_map.get(vk)
+                    if command is not None and self._dispatch_shortcut(command):
+                        return 1
+
+        return _user32.CallNextHookEx(
+            self._keyboard_hook,
+            n_code,
+            w_param,
+            l_param,
+        )
+
+    def mousePressEvent(self, event):
+        if hasattr(self, "text_input") and self.text_input.hasFocus():
+            self.text_input.clearFocus()
+        super().mousePressEvent(event)
 
     def changeEvent(self, event):
         super().changeEvent(event)
@@ -1690,6 +2088,8 @@ def main():
         pass
 
     def exception_hook(exc_type, exc_value, exc_tb):
+        timestamp = datetime.now().astimezone().isoformat(timespec="seconds")
+        crash_file.write(f"\n[{timestamp}] {APP_NAME} {__version__}\n")
         traceback.print_exception(exc_type, exc_value, exc_tb, file=crash_file)
         crash_file.flush()
         sys.__excepthook__(exc_type, exc_value, exc_tb)
