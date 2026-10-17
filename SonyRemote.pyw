@@ -3,19 +3,20 @@ from datetime import datetime
 import faulthandler
 import hashlib
 import html
+import ipaddress
 import json
 import os
-import subprocess
+import re
 import sys
 import tempfile
 import time
 import threading
 import traceback
 import urllib.request
+from urllib.error import HTTPError, URLError
 from pathlib import Path
 from xml.sax.saxutils import escape
-
-from PySide6.QtCore import QEvent, QFileSystemWatcher, QLockFile, QObject, QRunnable, Qt, QThreadPool, QTimer, Signal
+from PySide6.QtCore import QEvent, QFileSystemWatcher, QLockFile, QObject, QProcess, QRunnable, Qt, QThreadPool, QTimer, Signal
 from PySide6.QtGui import QAction, QColor, QPalette
 from PySide6.QtWidgets import (
     QApplication, QComboBox, QDialogButtonBox, QFrame, QGridLayout, QHBoxLayout, QLabel,
@@ -24,25 +25,363 @@ from PySide6.QtWidgets import (
     QSystemTrayIcon, QVBoxLayout, QWidget,
 )
 
+
+# ----------------------------
+# Application constants
+# ----------------------------
+
+
 APP_NAME = "Sony Remote"
-__version__ = "2026.10.17.1"
-INSTANCE_MUTEX_NAME = "Local\\SonyRemote.SingleInstance"
+
+
+__version__ = "2026.10.17.7"
+
+
 CONFIG_PATH = Path(__file__).with_name("SonyRemote.json")
 
+
+INSTANCE_MUTEX_NAME = "Local\\SonyRemote.SingleInstance"
+
+
 NETWORK_TIMEOUT_SECONDS = 2.0
+
+
 POLL_INTERVAL_MS = 2000
+
+
 CONFIG_RESTART_DEBOUNCE_MS = 250
+
+
 POPUP_GUARD_DURATION_MS = 220
+
+
 POPUP_GUARD_FAVORITE_COUNT = 4
+
+
 TEXT_INPUT_STATE_TIMEOUT_SECONDS = 1.5
+
+
 TEXT_INPUT_STATE_POLL_SECONDS = 0.05
 
+
+# ----------------------------
+# Configuration
+# ----------------------------
+
+
+DEFAULT_CONFIG = {
+    "Host": "",
+    "PreSharedKey": "",
+    "DarkMode": True,
+    "Mica": True,
+    "TextInputControls": True,
+    "TextInputSubmit": True,
+    "TextInputSubmitSequence": [
+        "Left",
+        "Down",
+        "Down",
+        "Down",
+        "Confirm",
+    ],
+    "InputControls": False,
+    "AppControls": True,
+    "ChannelControls": True,
+    "NavigationControls": True,
+    "PlaybackControls": True,
+    "VolumeControls": True,
+    "VolumeRateLimit": {
+        "Active": True,
+        "RateMs": 500,
+    },
+    "DiagnosticsEnabled": False,
+    "SortByName": False,
+    "Apps": {},
+    "Inputs": {},
+    "SystemTray": False,
+    "CloseToTray": False,
+    "DropdownAnimationWorkaround": sys.platform == "win32",
+}
+
+
+BOOLEAN_CONFIG_KEYS = (
+    "DiagnosticsEnabled",
+    "SortByName",
+    "DarkMode",
+    "Mica",
+    "TextInputControls",
+    "TextInputSubmit",
+    "InputControls",
+    "AppControls",
+    "ChannelControls",
+    "NavigationControls",
+    "PlaybackControls",
+    "VolumeControls",
+    "SystemTray",
+    "CloseToTray",
+    "DropdownAnimationWorkaround",
+)
+
+
+class ConfigError(ValueError):
+    pass
+
+
+def _require_bool(config, key, default):
+    value = config.get(key, default)
+
+    if not isinstance(value, bool):
+        raise ConfigError(
+            f'"{key}" must be true or false.'
+        )
+
+    return value
+
+
+def _validate_host(value):
+    if not isinstance(value, str):
+        raise ConfigError(
+            '"Host" must be a string.'
+        )
+
+    host = value.strip()
+
+    if not host:
+        return host
+
+    try:
+        ipaddress.ip_address(host)
+        return host
+    except ValueError:
+        pass
+
+    if len(host) > 253:
+        raise ConfigError(
+            '"Host" is too long.'
+        )
+
+    labels = host.rstrip(".").split(".")
+    hostname_label = re.compile(
+        r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$"
+    )
+
+    if not labels or any(
+        not hostname_label.fullmatch(label)
+        for label in labels
+    ):
+        raise ConfigError(
+            '"Host" must be a valid IP address or hostname.'
+        )
+
+    return host
+
+
+def _validate_entries(value, collection):
+    if not isinstance(value, dict):
+        raise ConfigError(
+            f'"{collection}" must be an object.'
+        )
+
+    normalized = {}
+
+    for input_id, settings in value.items():
+        if not isinstance(input_id, str) or not input_id.strip():
+            raise ConfigError(
+                f'"{collection}" IDs must be non-empty strings.'
+            )
+
+        input_id = input_id.strip()
+
+        if not isinstance(settings, dict):
+            raise ConfigError(
+                f'"{collection}" entry {input_id!r} must be an object.'
+            )
+
+        unknown_keys = set(settings) - {
+            "Name",
+            "NameOverride",
+            "Hidden",
+            "Favorite",
+        }
+
+        if unknown_keys:
+            names = ", ".join(sorted(unknown_keys))
+            raise ConfigError(
+                f'"{collection}" entry {input_id!r} has unknown '
+                f'field(s): {names}.'
+            )
+
+        name = settings.get("Name", input_id)
+        name_override = settings.get("NameOverride", "")
+        hidden = settings.get("Hidden", False)
+        favorite = settings.get("Favorite", False)
+
+        if not isinstance(name, str) or not name.strip():
+            raise ConfigError(
+                f'"{collection}" entry {input_id!r} must have a '
+                'non-empty string "Name".'
+            )
+
+        if not isinstance(name_override, str):
+            raise ConfigError(
+                f'"{collection}" entry {input_id!r} "NameOverride" '
+                'must be a string.'
+            )
+
+        if not isinstance(hidden, bool):
+            raise ConfigError(
+                f'"{collection}" entry {input_id!r} "Hidden" '
+                'must be true or false.'
+            )
+
+        if not isinstance(favorite, bool):
+            raise ConfigError(
+                f'"{collection}" entry {input_id!r} "Favorite" '
+                'must be true or false.'
+            )
+
+        normalized[input_id] = {
+            "Name": name.strip(),
+            "NameOverride": name_override.strip(),
+            "Hidden": hidden,
+            "Favorite": favorite,
+        }
+
+    return normalized
+
+
+def _entry_display_name(settings):
+    return settings["NameOverride"] or settings["Name"]
+
+
+def _ordered_entries(entries, sort_by_name):
+    items = list(entries.items())
+    if sort_by_name:
+        items.sort(key=lambda item: _entry_display_name(item[1]).casefold())
+    return items
+
+
+def _default_config_copy():
+    return {
+        key: value.copy() if isinstance(value, (dict, list)) else value
+        for key, value in DEFAULT_CONFIG.items()
+    }
+
+
+def missing_config_settings(config):
+    return [key for key in ("Host", "PreSharedKey") if not config[key]]
+
+
+def show_missing_config_settings(config):
+    missing = missing_config_settings(config)
+    if missing:
+        QMessageBox.information(
+            None, "Sony Remote - Configuration Required",
+            f"Add the following required settings in {CONFIG_PATH.resolve()}: "
+            + ", ".join(missing)
+            + ".\nDevice communication is disabled until you save a valid configuration.",
+        )
+
+
+def validate_config(raw_config, *, allow_incomplete=False):
+    if not isinstance(raw_config, dict):
+        raise ConfigError("The configuration root must be a JSON object.")
+    unknown = set(raw_config) - set(DEFAULT_CONFIG)
+    if unknown:
+        raise ConfigError("Unknown configuration setting(s): " + ", ".join(sorted(unknown)) + ".")
+
+    config = _default_config_copy()
+    config.update(raw_config)
+    config["Host"] = _validate_host(config["Host"])
+    if not isinstance(config["PreSharedKey"], str):
+        raise ConfigError('"PreSharedKey" must be a string.')
+    for key in BOOLEAN_CONFIG_KEYS:
+        config[key] = _require_bool(config, key, DEFAULT_CONFIG[key])
+    if config["CloseToTray"] and not config["SystemTray"]:
+        raise ConfigError('"CloseToTray" can only be true when "SystemTray" is also true.')
+    for key in ("Apps", "Inputs"):
+        config[key] = _validate_entries(config[key], key)
+
+    rate_limit = config["VolumeRateLimit"]
+    if not isinstance(rate_limit, dict):
+        raise ConfigError('"VolumeRateLimit" must be an object.')
+    if set(rate_limit) - {"Active", "RateMs"}:
+        raise ConfigError('"VolumeRateLimit" has unknown fields.')
+    normalized_rate_limit = DEFAULT_CONFIG["VolumeRateLimit"].copy()
+    normalized_rate_limit.update(rate_limit)
+    if not isinstance(normalized_rate_limit["Active"], bool):
+        raise ConfigError('"VolumeRateLimit.Active" must be true or false.')
+    rate_ms = normalized_rate_limit["RateMs"]
+    if isinstance(rate_ms, bool) or not isinstance(rate_ms, int) or rate_ms < 1:
+        raise ConfigError('"VolumeRateLimit.RateMs" must be a positive integer.')
+    config["VolumeRateLimit"] = normalized_rate_limit
+
+    sequence = config["TextInputSubmitSequence"]
+    if (not isinstance(sequence, list) or not sequence
+            or not all(isinstance(command, str) and command.strip() for command in sequence)):
+        raise ConfigError('"TextInputSubmitSequence" must be a non-empty list of non-empty strings.')
+    config["TextInputSubmitSequence"] = [command.strip() for command in sequence]
+    if not allow_incomplete:
+        missing = missing_config_settings(config)
+        if missing:
+            raise ConfigError("Required settings must not be empty: " + ", ".join(missing) + ".")
+    return config
+
+
+def load_config():
+    if not CONFIG_PATH.exists():
+        config = _default_config_copy()
+        save_config(config)
+        return validate_config(config, allow_incomplete=True)
+    try:
+        with CONFIG_PATH.open("r", encoding="utf-8") as f:
+            raw_config = json.load(f)
+    except json.JSONDecodeError as ex:
+        raise ConfigError(
+            f"Invalid JSON syntax in {CONFIG_PATH.name}: line {ex.lineno}, "
+            f"column {ex.colno}: {ex.msg}"
+        ) from ex
+    except UnicodeError as ex:
+        raise ConfigError(f"{CONFIG_PATH.name} must use UTF-8 encoding.") from ex
+    except OSError as ex:
+        raise ConfigError(f"Unable to read {CONFIG_PATH.name}: {ex}") from ex
+    return validate_config(raw_config, allow_incomplete=True)
+
+
+def save_config(config):
+    temp_path = CONFIG_PATH.with_name(CONFIG_PATH.name + ".tmp")
+    try:
+        temp_path.write_text(
+            json.dumps(config, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+        os.replace(temp_path, CONFIG_PATH)
+    except OSError as ex:
+        raise ConfigError(f"Unable to update {CONFIG_PATH.name}: {ex}") from ex
+    finally:
+        try:
+            temp_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+def _file_sha256(path):
+    try:
+        return hashlib.sha256(path.read_bytes()).digest()
+    except OSError:
+        return None
+
+
+# ----------------------------
+# Platform integration
+# ----------------------------
+
+
 _instance_mutex_handle = None
+
+
 _instance_lock_file = None
 
-# Windows-only keyboard shortcut interception. Installed only while the app
-# is running on Windows; the hook itself only consumes keys while this window
-# is foreground.
+
 if sys.platform == "win32":
     _user32 = ctypes.windll.user32
 
@@ -101,119 +440,38 @@ else:
     _KBDLLHOOKSTRUCT = None
 
 
-DEFAULT_CONFIG = {
-    "Host": "",
-    "PreSharedKey": "",
-    "DarkMode": True,
-    "Mica": True,
-    "TextInputControls": True,
-    "TextInputSubmit": True,
-    "TextInputSubmitSequence": [
-        "Left",
-        "Down",
-        "Down",
-        "Down",
-        "Confirm",
-    ],
-    "InputControls": False,
-    "AppControls": True,
-    "ChannelControls": True,
-    "NavigationControls": True,
-    "PlaybackControls": True,
-    "VolumeControls": True,
-    "VolumeRateLimit": {
-        "Active": True,
-        "RateMs": 500,
-    },
-    "Apps": {},
-    "Inputs": {},
-    "SystemTray": False,
-    "CloseToTray": False,
-    "DropdownAnimationWorkaround": sys.platform == "win32",
-}
-
-BOOLEAN_CONFIG_KEYS = (
-    "DarkMode",
-    "Mica",
-    "TextInputControls",
-    "TextInputSubmit",
-    "InputControls",
-    "AppControls",
-    "ChannelControls",
-    "NavigationControls",
-    "PlaybackControls",
-    "VolumeControls",
-    "SystemTray",
-    "CloseToTray",
-    "DropdownAnimationWorkaround",
-)
-
-OBSOLETE_CONFIG_KEYS = (
-    "PollIntervalMs",
-    "AppNameOverrides",
-    "HiddenApps",
-    "FavoriteApps",
-    "InputNameOverrides",
-    "HiddenInputs",
-    "FavoriteInputs",
-)
-
-
-# ----------------------------
-# Single-instance guard
-# ----------------------------
-
 def acquire_single_instance():
     global _instance_mutex_handle, _instance_lock_file
 
     if sys.platform == "win32":
-        try:
-            kernel32 = ctypes.windll.kernel32
-
-            kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, ctypes.c_bool, ctypes.c_wchar_p]
-            kernel32.CreateMutexW.restype = ctypes.c_void_p
-            kernel32.GetLastError.argtypes = []
-            kernel32.GetLastError.restype = ctypes.c_ulong
-            kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
-            kernel32.CloseHandle.restype = ctypes.c_bool
-
-            handle = kernel32.CreateMutexW(None, False, INSTANCE_MUTEX_NAME)
-            if not handle:
-                return True
-
-            # CreateMutexW deliberately returns a valid handle even when the
-            # named mutex already exists, so GetLastError must be checked
-            # immediately after the call.
-            ERROR_ALREADY_EXISTS = 183
-            last_error = kernel32.GetLastError()
-            if last_error == ERROR_ALREADY_EXISTS:
-                kernel32.CloseHandle(handle)
-                return False
-
-            _instance_mutex_handle = handle
-            return True
-        except Exception:
-            # Do not block startup if the guard itself fails unexpectedly.
-            return True
-
-    try:
-        # macOS/Linux: use Qt's cross-platform file lock. Include the Unix
-        # user ID so separate logged-in users do not block each other.
-        user_suffix = str(os.getuid()) if hasattr(os, "getuid") else "user"
-        lock_path = Path(tempfile.gettempdir()) / f"SonyRemote-{user_suffix}.lock"
-
-        lock_file = QLockFile(str(lock_path))
-        lock_file.setStaleLockTime(0)
-
-        if not lock_file.tryLock(0):
+        kernel32 = ctypes.windll.kernel32
+        kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, ctypes.c_bool, ctypes.c_wchar_p]
+        kernel32.CreateMutexW.restype = ctypes.c_void_p
+        kernel32.GetLastError.argtypes = []
+        kernel32.GetLastError.restype = ctypes.c_ulong
+        kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+        kernel32.CloseHandle.restype = ctypes.c_bool
+        handle = kernel32.CreateMutexW(None, False, INSTANCE_MUTEX_NAME)
+        last_error = kernel32.GetLastError()
+        if not handle:
+            raise OSError(last_error, "CreateMutexW failed.")
+        if last_error == 183:  # ERROR_ALREADY_EXISTS
+            kernel32.CloseHandle(handle)
             return False
+        _instance_mutex_handle = handle
+        return True
 
-        _instance_lock_file = lock_file
-        return True
-    except Exception:
-        # As on Windows, a failure in the guard itself should not make the
-        # remote unusable.
-        return True
+    # Include the user ID so separate logged-in users do not block each other.
+    user_suffix = str(os.getuid()) if hasattr(os, "getuid") else "user"
+    lock_path = Path(tempfile.gettempdir()) / f"SonyRemote-{user_suffix}.lock"
+    lock_file = QLockFile(str(lock_path))
+    lock_file.setStaleLockTime(0)
+    if not lock_file.tryLock(0):
+        if lock_file.error() != QLockFile.LockFailedError:
+            raise OSError("Could not create the single-instance lock file.")
+        return False
+    _instance_lock_file = lock_file
+    return True
 
 
 def release_single_instance():
@@ -236,11 +494,7 @@ def release_single_instance():
         _instance_lock_file = None
 
 
-# ----------------------------
-# Windows application identity
-# ----------------------------
-
-def set_windows_app_id(app_id):
+def set_app_user_model_id(app_id):
     if sys.platform != "win32":
         return
 
@@ -250,10 +504,8 @@ def set_windows_app_id(app_id):
         pass
 
 
-# ----------------------------
-# Windows Mica integration
-# ----------------------------
-# Same documented DWM approach used by the Yamaha remote.
+# Windows Mica integration inspired by win32mica (MIT); see THIRD_PARTY_LICENSES.txt.
+
 
 class _MicaMargins(ctypes.Structure):
     _fields_ = [
@@ -331,112 +583,161 @@ def set_dark_titlebar(hwnd):
         pass
 
 
-def _default_config_copy():
-    return {
-        key: value.copy() if isinstance(value, (dict, list)) else value
-        for key, value in DEFAULT_CONFIG.items()
-    }
+def get_app_icon():
+    return QApplication.instance().style().standardIcon(QStyle.SP_ComputerIcon)
 
 
-def load_config():
-    exists = CONFIG_PATH.exists()
-    if exists:
-        with CONFIG_PATH.open("r", encoding="utf-8") as f:
-            user = json.load(f)
-        if not isinstance(user, dict):
-            raise ValueError("SonyRemote.json must contain a JSON object.")
-    else:
-        user = {}
-
-    config = _default_config_copy()
-    config.update(user)
-    changed = not exists
-
-    for key in DEFAULT_CONFIG:
-        if key not in user:
-            changed = True
-
-    for key in OBSOLETE_CONFIG_KEYS:
-        if key in config:
-            config.pop(key, None)
-            changed = True
-
-    for key in ("Apps", "Inputs"):
-        if not isinstance(config.get(key), dict):
-            config[key] = {}
-            changed = True
-
-    for key in BOOLEAN_CONFIG_KEYS:
-        if not isinstance(config.get(key), bool):
-            config[key] = DEFAULT_CONFIG[key]
-            changed = True
-
-    rate_limit = config.get("VolumeRateLimit")
-    if not isinstance(rate_limit, dict):
-        config["VolumeRateLimit"] = DEFAULT_CONFIG["VolumeRateLimit"].copy()
-        changed = True
-    else:
-        normalized_rate_limit = {
-            "Active": rate_limit.get("Active"),
-            "RateMs": rate_limit.get("RateMs"),
-        }
-        if not isinstance(normalized_rate_limit["Active"], bool):
-            normalized_rate_limit["Active"] = DEFAULT_CONFIG["VolumeRateLimit"]["Active"]
-            changed = True
-        rate_ms = normalized_rate_limit["RateMs"]
-        if isinstance(rate_ms, bool) or not isinstance(rate_ms, int) or rate_ms < 1:
-            normalized_rate_limit["RateMs"] = DEFAULT_CONFIG["VolumeRateLimit"]["RateMs"]
-            changed = True
-        if rate_limit != normalized_rate_limit:
-            changed = True
-        config["VolumeRateLimit"] = normalized_rate_limit
-
-    submit_sequence = config.get("TextInputSubmitSequence")
-    if (
-        not isinstance(submit_sequence, list)
-        or not submit_sequence
-        or not all(isinstance(command, str) and command.strip() for command in submit_sequence)
-    ):
-        config["TextInputSubmitSequence"] = DEFAULT_CONFIG["TextInputSubmitSequence"].copy()
-        changed = True
-    else:
-        normalized_sequence = [command.strip() for command in submit_sequence]
-        if normalized_sequence != submit_sequence:
-            config["TextInputSubmitSequence"] = normalized_sequence
-            changed = True
-
-    for key in ("Host", "PreSharedKey"):
-        value = config.get(key, "")
-        if not isinstance(value, str):
-            config[key] = str(value)
-            changed = True
-
-    if changed:
-        save_config(config)
-
-    return config
+# ----------------------------
+# Request errors and optional diagnostics
+# ----------------------------
 
 
-def save_config(config):
-    temp_path = CONFIG_PATH.with_name(CONFIG_PATH.name + ".tmp")
-    try:
-        temp_path.write_text(
-            json.dumps(config, indent=2, ensure_ascii=False) + "\n",
-            encoding="utf-8",
-        )
-        os.replace(temp_path, CONFIG_PATH)
-    finally:
+class DeviceConnectionError(RuntimeError):
+    """The device could not be reached."""
+
+
+class DeviceResponseError(RuntimeError):
+    """The device rejected a request or returned an invalid response."""
+
+
+_diagnostics = None
+
+
+class Diagnostics:
+    """Optional, best-effort logs without messages, source lines, or locals."""
+
+    def __init__(self):
+        self._stream = None
+        self._lock = threading.RLock()
+        self._seen = set()
+        self._owns_fault_handler = False
+        self._old_sys_hook = sys.excepthook
+        self._old_thread_hook = threading.excepthook
+        self._sys_hook = self._exception_hook
+        self._thread_hook = self._thread_exception_hook
         try:
-            temp_path.unlink(missing_ok=True)
-        except Exception:
+            self._stream = Path(__file__).with_name(
+                Path(__file__).stem + "-crash.log"
+            ).open("a", encoding="utf-8")
+        except OSError:
+            return
+        sys.excepthook = self._sys_hook
+        threading.excepthook = self._thread_hook
+        try:
+            if not faulthandler.is_enabled():
+                faulthandler.enable(self._stream)
+                self._owns_fault_handler = True
+        except (OSError, RuntimeError, ValueError):
             pass
+
+    def _format_exception(self, error, context):
+        # Never stringify exceptions: messages and chained causes may contain
+        # credentials, request payloads, or text entered by the user.
+        lines = [f"{context}: {type(error).__name__}"]
+        visited = set()
+        while error is not None and id(error) not in visited:
+            visited.add(id(error))
+            lines.append(f"Exception type: {type(error).__name__}")
+            for frame, line in traceback.walk_tb(error.__traceback__):
+                lines.append(
+                    f"  {Path(frame.f_code.co_filename).name}:{line} in {frame.f_code.co_name}"
+                )
+            error = error.__cause__ or (
+                None if error.__suppress_context__ else error.__context__
+            )
+        return "\n".join(lines) + "\n"
+
+    def record(self, error, context, *, deduplicate=False):
+        with self._lock:
+            if self._stream is None:
+                return
+            text = self._format_exception(error, context)
+            if deduplicate and text in self._seen:
+                return
+            if deduplicate:
+                self._seen.add(text)
+            try:
+                timestamp = datetime.now().astimezone().isoformat(timespec="seconds")
+                self._stream.write(f"\n[{timestamp}] {Path(__file__).stem} {__version__}\n{text}")
+                self._stream.flush()
+            except (OSError, ValueError):
+                self.close()
+
+    def _exception_hook(self, exc_type, error, tb):
+        self.record(error, "Unhandled exception")
+        try:
+            sys.stderr.write(self._format_exception(error, "Unhandled exception"))
+        except (OSError, ValueError, AttributeError):
+            pass
+
+    def _thread_exception_hook(self, args):
+        self._exception_hook(args.exc_type, args.exc_value, args.exc_traceback)
+
+    def close(self):
+        with self._lock:
+            if sys.excepthook is self._sys_hook:
+                sys.excepthook = self._old_sys_hook
+            if threading.excepthook is self._thread_hook:
+                threading.excepthook = self._old_thread_hook
+            if self._owns_fault_handler:
+                try:
+                    faulthandler.disable()
+                except (OSError, RuntimeError, ValueError):
+                    pass
+                self._owns_fault_handler = False
+            stream, self._stream = self._stream, None
+            if stream is not None:
+                try:
+                    stream.close()
+                except (OSError, ValueError):
+                    pass
+
+
+def configure_diagnostics(config):
+    global _diagnostics
+    close_diagnostics()
+    if config["DiagnosticsEnabled"]:
+        _diagnostics = Diagnostics()
+
+
+def close_diagnostics():
+    global _diagnostics
+    if _diagnostics is not None:
+        _diagnostics.close()
+        _diagnostics = None
+
+
+def record_exception(error, context, *, deduplicate=False):
+    if _diagnostics is not None:
+        _diagnostics.record(error, context, deduplicate=deduplicate)
+
+
+def record_unexpected_exception(error, context, *, background=False):
+    if not isinstance(error, (DeviceConnectionError, DeviceResponseError)):
+        record_exception(error, context, deduplicate=background)
+
+
+# ----------------------------
+# Device API
+# ----------------------------
+
+
+class SonyConnectionError(DeviceConnectionError):
+    """Raised when the Sony TV cannot be reached."""
 
 
 class SonyApi:
     def __init__(self, host, psk, timeout=2.0):
         self.psk = psk
         self.timeout = timeout
-        self.base_url = f"http://{host}"
+        # IPv6 literals need brackets when used in a URL.
+        try:
+            address = ipaddress.ip_address(host)
+        except ValueError:
+            url_host = host
+        else:
+            url_host = f"[{host.replace('%', '%25')}]" if address.version == 6 else host
+        self.base_url = f"http://{url_host}"
         self._request_id = 0
         self._lock = threading.Lock()
         self.remote_codes = {}
@@ -445,6 +746,15 @@ class SonyApi:
         with self._lock:
             self._request_id += 1
             return self._request_id
+
+    def _read_response(self, request):
+        try:
+            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                return response.read()
+        except HTTPError as ex:
+            raise DeviceResponseError(f"Sony returned HTTP {ex.code}.") from ex
+        except (URLError, TimeoutError, OSError) as ex:
+            raise SonyConnectionError("Unable to reach the Sony TV.") from ex
 
     def rpc(self, service, method, params=None, version="1.0"):
         payload = {
@@ -462,10 +772,18 @@ class SonyApi:
                 "X-Auth-PSK": self.psk,
             },
         )
-        with urllib.request.urlopen(request, timeout=self.timeout) as response:
-            result = json.loads(response.read().decode("utf-8"))
+        try:
+            result = json.loads(self._read_response(request).decode("utf-8"))
+        except (UnicodeError, json.JSONDecodeError) as ex:
+            raise DeviceResponseError("Sony returned invalid JSON.") from ex
+        if not isinstance(result, dict):
+            raise DeviceResponseError("Sony response must be a JSON object.")
         if "error" in result:
-            raise RuntimeError(f"{method}: Sony error {result['error']}")
+            error = result["error"]
+            code = error[0] if isinstance(error, list) and error and isinstance(error[0], int) else "unknown"
+            raise DeviceResponseError(f"Sony rejected {method} (error code {code}).")
+        if not isinstance(result.get("result"), list):
+            raise DeviceResponseError("Sony response is missing a result list.")
         return result
 
     def get_power(self):
@@ -567,7 +885,7 @@ class SonyApi:
         ]
         if unavailable:
             joined = ", ".join(repr(name) for name in unavailable)
-            raise RuntimeError(
+            raise DeviceResponseError(
                 f"TextInputSubmitSequence contains unavailable remote command(s): {joined}"
             )
 
@@ -575,7 +893,7 @@ class SonyApi:
         resolved_name = self.resolve_remote_command(name)
         code = self.remote_codes.get(resolved_name)
         if not code:
-            raise RuntimeError(f"Remote command '{name}' is unavailable.")
+            raise DeviceResponseError(f"Remote command '{name}' is unavailable.")
         body = f'''<?xml version="1.0"?>
 <s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"
             s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">
@@ -595,8 +913,38 @@ class SonyApi:
                 "X-Auth-PSK": self.psk,
             },
         )
-        with urllib.request.urlopen(request, timeout=self.timeout) as response:
-            response.read()
+        self._read_response(request)
+
+
+# ----------------------------
+# Background workers
+# ----------------------------
+
+
+class WorkerSignals(QObject):
+    result = Signal(object)
+    error = Signal(object)
+    finished = Signal()
+
+
+class Worker(QRunnable):
+    def __init__(self, function):
+        super().__init__()
+        self.function = function
+        self.signals = WorkerSignals()
+
+    def run(self):
+        try:
+            self.signals.result.emit(self.function())
+        except Exception as exc:
+            self.signals.error.emit(exc)
+        finally:
+            self.signals.finished.emit()
+
+
+# ----------------------------
+# Specialized widgets
+# ----------------------------
 
 
 class TvTextEdit(QTextEdit):
@@ -717,28 +1065,17 @@ class CenteredComboDelegate(QStyledItemDelegate):
         option.displayAlignment = Qt.AlignCenter
 
 
-class WorkerSignals(QObject):
-    result = Signal(object)
-    error = Signal(str)
-    finished = Signal()
-
-
-class Worker(QRunnable):
-    def __init__(self, fn):
-        super().__init__()
-        self.fn = fn
-        self.signals = WorkerSignals()
-
-    def run(self):
-        try:
-            self.signals.result.emit(self.fn())
-        except Exception as exc:
-            self.signals.error.emit(str(exc))
-        finally:
-            self.signals.finished.emit()
+# ----------------------------
+# Main window
+# ----------------------------
 
 
 class SonyRemote(QMainWindow):
+
+    # ----------------------------
+    # Initialization
+    # ----------------------------
+
     def __init__(self, config):
         super().__init__()
         self.config = config
@@ -747,22 +1084,41 @@ class SonyRemote(QMainWindow):
         self.pool = QThreadPool(self)
         self._workers = set()
         self.poll_running = False
-        self.initialization_running = False
         self.initialized = False
+        self.tray = None
+        self._really_close = False
+        self._shutting_down = False
+        self._worker_generation = 0
+        self._restart_failed = False
+        self._config_digest = self._get_config_digest()
+        self._config_restart_pending = False
+
+        self.initialization_running = False
         self.last_power = None
         self.last_volume = None
         self._desired_volume = None
         self._volume_rate_loop_running = False
         self._volume_rate_step_running = False
-        self._really_close = False
-        self._shutting_down = False
 
         self._build_ui()
-        self._build_favorites_from_config()
-        self._configure_combo_popup_guards()
         self._apply_style()
+        self._setup_timers()
+        self._setup_config_watcher()
         self._setup_tray()
+        self._setup_shortcuts()
+        self.set_controls_enabled(False)
+        QTimer.singleShot(0, self.initialize)
 
+    def _setup_timers(self):
+        self.poll_timer = QTimer(self)
+        self.poll_timer.setInterval(POLL_INTERVAL_MS)
+        self.poll_timer.timeout.connect(self.poll_status)
+
+        self.volume_rate_timer = QTimer(self)
+        self.volume_rate_timer.setSingleShot(True)
+        self.volume_rate_timer.timeout.connect(self._volume_rate_step)
+
+    def _setup_shortcuts(self):
         # On Windows the native low-level keyboard hook captures shortcuts
         # reliably. Other platforms use Qt's event filter as a fallback.
         if sys.platform != "win32":
@@ -775,20 +1131,9 @@ class SonyRemote(QMainWindow):
         if sys.platform == "win32":
             self._install_windows_keyboard_hook()
 
-        self._config_digest = self._get_config_digest()
-        self._config_restart_pending = False
-        self._setup_config_watcher()
-
-        self.poll_timer = QTimer(self)
-        self.poll_timer.setInterval(POLL_INTERVAL_MS)
-        self.poll_timer.timeout.connect(self.poll_status)
-
-        self.volume_rate_timer = QTimer(self)
-        self.volume_rate_timer.setSingleShot(True)
-        self.volume_rate_timer.timeout.connect(self._volume_rate_step)
-
-        self.set_controls_enabled(False, power_enabled=False)
-        QTimer.singleShot(0, self.initialize_tv)
+    # ----------------------------
+    # UI construction and styling
+    # ----------------------------
 
     def _build_ui(self):
         central = QWidget()
@@ -796,14 +1141,14 @@ class SonyRemote(QMainWindow):
         if self.mica_enabled:
             central.setAttribute(Qt.WA_TranslucentBackground)
         self.setCentralWidget(central)
-        self.root = QVBoxLayout(central)
-        self.root.setContentsMargins(12, 12, 12, 12)
-        self.root.setSpacing(9)
+        self.main_layout = QVBoxLayout(central)
+        self.main_layout.setContentsMargins(12, 12, 12, 12)
+        self.main_layout.setSpacing(9)
 
         self.power_button = QPushButton("Connecting...")
         self.power_button.setMinimumHeight(38)
         self.power_button.clicked.connect(self.toggle_power)
-        self.root.addWidget(self.power_button)
+        self.main_layout.addWidget(self.power_button)
 
         if self.config["TextInputControls"]:
             self._build_text_input_controls()
@@ -819,6 +1164,8 @@ class SonyRemote(QMainWindow):
             self._build_volume_controls()
         if self.config["PlaybackControls"]:
             self._build_playback_controls()
+        self._build_favorites_from_config()
+        self._configure_combo_popup_guards()
 
     def _section(self, title):
         frame = QFrame()
@@ -830,7 +1177,7 @@ class SonyRemote(QMainWindow):
         label.setObjectName("sectionTitle")
         label.setAlignment(Qt.AlignCenter)
         layout.addWidget(label)
-        self.root.addWidget(frame)
+        self.main_layout.addWidget(frame)
         return layout
 
     def _build_text_input_controls(self):
@@ -875,7 +1222,7 @@ class SonyRemote(QMainWindow):
             self.channel_buttons[command] = button
             grid.addWidget(button, row, column)
 
-        self.root.addLayout(grid)
+        self.main_layout.addLayout(grid)
 
     def _build_app_controls(self):
         layout = self._section("Apps")
@@ -890,20 +1237,6 @@ class SonyRemote(QMainWindow):
         self.app_favorites_layout.setColumnStretch(0, 1)
         self.app_favorites_layout.setColumnStretch(1, 1)
         layout.addLayout(self.app_favorites_layout)
-
-    def _build_input_controls(self):
-        layout = self._section("Inputs")
-        self.input_combo = CenteredComboBox()
-        self.input_combo.view().setAutoFillBackground(True)
-        self.input_combo.view().viewport().setAutoFillBackground(True)
-        self.input_combo.setItemDelegate(CenteredComboDelegate(self.input_combo))
-        self.input_combo.activated.connect(self.select_input)
-        layout.addWidget(self.input_combo)
-        self.input_favorites_layout = QGridLayout()
-        self.input_favorites_layout.setSpacing(6)
-        self.input_favorites_layout.setColumnStretch(0, 1)
-        self.input_favorites_layout.setColumnStretch(1, 1)
-        layout.addLayout(self.input_favorites_layout)
 
     def _build_navigation_controls(self):
         layout = self._section("Navigation")
@@ -931,20 +1264,6 @@ class SonyRemote(QMainWindow):
         row.addWidget(home)
         layout.addLayout(row)
 
-    def _build_playback_controls(self):
-        layout = self._section("Playback")
-        row = QHBoxLayout()
-        row.setSpacing(6)
-        for text, command in (
-            ("Prev", "Prev"), ("Rew", "Rewind"),
-            ("Play / Pause", "PlayPause"), ("Fwd", "Forward"),
-            ("Next", "Next"),
-        ):
-            button = QPushButton(text)
-            button.clicked.connect(lambda checked=False, c=command: self.send_ircc(c))
-            row.addWidget(button)
-        layout.addLayout(row)
-
     def _build_volume_controls(self):
         layout = self._section("Volume")
         row = QGridLayout()
@@ -968,6 +1287,70 @@ class SonyRemote(QMainWindow):
         self.mute_button = QPushButton("Mute")
         self.mute_button.clicked.connect(self.toggle_mute)
         layout.addWidget(self.mute_button)
+
+    def _build_playback_controls(self):
+        layout = self._section("Playback")
+        row = QHBoxLayout()
+        row.setSpacing(6)
+        for text, command in (
+            ("Prev", "Prev"), ("Rew", "Rewind"),
+            ("Play / Pause", "PlayPause"), ("Fwd", "Forward"),
+            ("Next", "Next"),
+        ):
+            button = QPushButton(text)
+            button.clicked.connect(lambda checked=False, c=command: self.send_ircc(c))
+            row.addWidget(button)
+        layout.addLayout(row)
+
+    def _build_favorites_from_config(self):
+        collections = (
+            ("Apps", "app_favorites_layout", self.launch_app),
+            ("Inputs", "input_favorites_layout", self.set_input),
+        )
+        for collection, layout_name, action in collections:
+            if not hasattr(self, layout_name):
+                continue
+            layout = getattr(self, layout_name)
+            buttons = {}
+            while layout.count():
+                widget = layout.takeAt(0).widget()
+                if widget is not None:
+                    buttons[widget.property("remote_id")] = widget
+            favorites = [
+                (uri, settings)
+                for uri, settings in _ordered_entries(
+                    self.config[collection], self.config["SortByName"]
+                )
+                if settings["Favorite"]
+            ]
+            for index, (uri, settings) in enumerate(favorites):
+                button = buttons.pop(uri, None)
+                if button is None:
+                    button = QPushButton()
+                    button.setProperty("remote_id", uri)
+                    button.clicked.connect(
+                        lambda checked=False, value=uri, callback=action: callback(value)
+                    )
+                button.setText(_entry_display_name(settings))
+                row, column = divmod(index, 2)
+                layout.addWidget(button, row, column)
+            for button in buttons.values():
+                button.hide()
+                button.deleteLater()
+
+    def _build_input_controls(self):
+        layout = self._section("Inputs")
+        self.input_combo = CenteredComboBox()
+        self.input_combo.view().setAutoFillBackground(True)
+        self.input_combo.view().viewport().setAutoFillBackground(True)
+        self.input_combo.setItemDelegate(CenteredComboDelegate(self.input_combo))
+        self.input_combo.activated.connect(self.select_input)
+        layout.addWidget(self.input_combo)
+        self.input_favorites_layout = QGridLayout()
+        self.input_favorites_layout.setSpacing(6)
+        self.input_favorites_layout.setColumnStretch(0, 1)
+        self.input_favorites_layout.setColumnStretch(1, 1)
+        layout.addLayout(self.input_favorites_layout)
 
     def _fit_and_lock_window(self):
         self.setMinimumSize(0, 0)
@@ -1101,81 +1484,6 @@ class SonyRemote(QMainWindow):
                 }
             """)
 
-    def showEvent(self, event):
-        super().showEvent(event)
-
-        if self.mica_enabled:
-            apply_mica(int(self.winId()))
-
-        if self.config["DarkMode"] and sys.platform == "win32":
-            set_dark_titlebar(int(self.winId()))
-
-    def run_worker(self, fn, on_result=None, on_error=None, on_finished=None):
-        if self._shutting_down:
-            return
-
-        worker = Worker(fn)
-        self._workers.add(worker)
-
-        if on_result:
-            worker.signals.result.connect(on_result)
-        worker.signals.error.connect(on_error or self.show_error)
-        if on_finished:
-            worker.signals.finished.connect(on_finished)
-
-        def release_worker():
-            self._workers.discard(worker)
-
-        worker.signals.finished.connect(release_worker)
-        self.pool.start(worker)
-
-    def _build_favorites_from_config(self):
-        if hasattr(self, "app_favorites_layout"):
-            app_items = []
-            for uri, settings in self.config.get("Apps", {}).items():
-                if not isinstance(settings, dict):
-                    continue
-                if settings.get("Hidden", False) or not settings.get("Favorite", False):
-                    continue
-
-                name = str(settings.get("Name", "")).strip()
-                override = str(settings.get("NameOverride", "")).strip()
-                label = override or name or uri
-                app_items.append((label, uri))
-
-            app_items.sort(key=lambda item: item[0].casefold())
-
-            for index, (label, uri) in enumerate(app_items):
-                button = QPushButton(label)
-                button.clicked.connect(
-                    lambda checked=False, value=uri: self.launch_app_by_uri(value)
-                )
-                row, column = divmod(index, 2)
-                self.app_favorites_layout.addWidget(button, row, column)
-
-        if hasattr(self, "input_favorites_layout"):
-            input_items = []
-            for uri, settings in self.config.get("Inputs", {}).items():
-                if not isinstance(settings, dict):
-                    continue
-                if settings.get("Hidden", False) or not settings.get("Favorite", False):
-                    continue
-
-                name = str(settings.get("Name", "")).strip()
-                override = str(settings.get("NameOverride", "")).strip()
-                label = override or name or uri
-                input_items.append((label, uri))
-
-            input_items.sort(key=lambda item: item[0].casefold())
-
-            for index, (label, uri) in enumerate(input_items):
-                button = QPushButton(label)
-                button.clicked.connect(
-                    lambda checked=False, value=uri: self.set_input_by_uri(value)
-                )
-                row, column = divmod(index, 2)
-                self.input_favorites_layout.addWidget(button, row, column)
-
     def _configure_combo_popup_guards(self):
         # Only guard the first four favorite buttons. They sit directly below
         # the dropdown and spend the longest time underneath its opening
@@ -1209,151 +1517,44 @@ class SonyRemote(QMainWindow):
                 enabled,
             )
 
-    def _get_config_digest(self):
-        try:
-            return hashlib.sha256(CONFIG_PATH.read_bytes()).digest()
-        except Exception:
-            return None
+    # ----------------------------
+    # Background work
+    # ----------------------------
 
-    def _setup_config_watcher(self):
-        self.config_watcher = QFileSystemWatcher(self)
-
-        if CONFIG_PATH.exists():
-            self.config_watcher.addPath(str(CONFIG_PATH))
-
-        parent = str(CONFIG_PATH.parent)
-        if parent not in self.config_watcher.directories():
-            self.config_watcher.addPath(parent)
-
-        self.config_watcher.fileChanged.connect(self._config_path_changed)
-        self.config_watcher.directoryChanged.connect(self._config_path_changed)
-
-        self.config_restart_timer = QTimer(self)
-        self.config_restart_timer.setSingleShot(True)
-        self.config_restart_timer.setInterval(CONFIG_RESTART_DEBOUNCE_MS)
-        self.config_restart_timer.timeout.connect(self._check_external_config_change)
-
-    def _config_path_changed(self, _path):
-        if self._shutting_down or self._config_restart_pending:
+    def run_worker(self, function, on_result=None, on_error=None, on_finished=None):
+        if self._shutting_down or missing_config_settings(self.config):
             return
+        worker = Worker(function)
+        self._workers.add(worker)
+        generation = self._worker_generation
 
-        # Many editors save by replacing the file, which removes a direct
-        # QFileSystemWatcher file watch. The directory watch lets us re-arm it.
-        config_path = str(CONFIG_PATH)
-        if CONFIG_PATH.exists() and config_path not in self.config_watcher.files():
-            self.config_watcher.addPath(config_path)
+        def deliver_result(result):
+            if not self._shutting_down and generation == self._worker_generation and on_result:
+                on_result(result)
 
-        self.config_restart_timer.start()
+        def deliver_error(error):
+            if not self._shutting_down and generation == self._worker_generation:
+                (on_error or self.handle_request_error)(error)
 
-    def _check_external_config_change(self):
-        if self._shutting_down or self._config_restart_pending:
-            return
+        def finished():
+            self._workers.discard(worker)
+            if not self._shutting_down and generation == self._worker_generation and on_finished:
+                on_finished()
 
-        digest = self._get_config_digest()
-        if digest is None or digest == self._config_digest:
-            return
+        worker.signals.result.connect(deliver_result)
+        worker.signals.error.connect(deliver_error)
+        worker.signals.finished.connect(finished)
+        self.pool.start(worker)
 
-        try:
-            with CONFIG_PATH.open("r", encoding="utf-8") as f:
-                candidate = json.load(f)
-            if not isinstance(candidate, dict):
-                return
-        except Exception:
-            return
+    # ----------------------------
+    # Discovery and polling
+    # ----------------------------
 
-        self._config_restart_pending = True
-        self._restart_for_config_change()
-
-    def _restart_for_config_change(self):
-        # Complete in-flight work first. Then release the single-instance
-        # guard before starting the replacement process.
-        self._shutdown()
-        release_single_instance()
-
-        try:
-            script_path = Path(__file__).resolve()
-            if getattr(sys, "frozen", False):
-                command = [sys.executable, *sys.argv[1:]]
-            else:
-                command = [sys.executable, str(script_path), *sys.argv[1:]]
-
-            subprocess.Popen(
-                command,
-                cwd=str(script_path.parent),
-            )
-        except Exception as exc:
-            QMessageBox.critical(
-                self,
-                APP_NAME,
-                f"Could not restart after SonyRemote.json changed:\n\n{exc}",
-            )
-
-        QApplication.quit()
-
-    def _save_config_without_restart(self):
-        save_config(self.config)
-        self._config_digest = self._get_config_digest()
-
-        # Re-arm the file watch if a save implementation ever replaces it.
-        config_path = str(CONFIG_PATH)
-        if CONFIG_PATH.exists() and config_path not in self.config_watcher.files():
-            self.config_watcher.addPath(config_path)
-
-    def _update_channel_button_availability(self, enabled):
-        if not hasattr(self, "channel_buttons"):
-            return
-
-        remote_codes = getattr(self.api, "remote_codes", {})
-        for command, button in self.channel_buttons.items():
-            button.setEnabled(bool(enabled and command in remote_codes))
-
-    def set_controls_enabled(
-        self,
-        enabled,
-        power_enabled=None,
-        app_enabled=None,
-    ):
-        if power_enabled is None:
-            power_enabled = enabled
-        if app_enabled is None:
-            app_enabled = enabled
-
-        self.power_button.setEnabled(power_enabled)
-
-        for widget in (
-            getattr(self, "text_input", None),
-            getattr(self, "input_combo", None),
-            getattr(self, "mute_button", None),
-            getattr(self, "volume_down", None),
-            getattr(self, "volume_up", None),
-        ):
-            if widget is not None:
-                widget.setEnabled(enabled)
-
-        # Start from the general state for all ordinary buttons.
-        for button in self.findChildren(QPushButton):
-            if button is self.power_button:
-                continue
-            button.setEnabled(enabled)
-
-        # App launching works while the TV is in standby and can wake it, so
-        # App controls have their own availability state.
-        if hasattr(self, "app_combo"):
-            self.app_combo.setEnabled(app_enabled)
-
-        if hasattr(self, "app_favorites_layout"):
-            for index in range(self.app_favorites_layout.count()):
-                item = self.app_favorites_layout.itemAt(index)
-                button = item.widget()
-                if isinstance(button, QPushButton):
-                    button.setEnabled(app_enabled)
-
-        # Channel commands vary between Sony models/regions. Keep unsupported
-        # commands disabled even when the rest of the connected UI is active.
-        self._update_channel_button_availability(enabled)
-
-    def initialize_tv(self):
+    def initialize(self):
         if self._shutting_down or self.initialization_running:
+            return
+        if missing_config_settings(self.config):
+            self.power_button.setText("Configure device")
             return
 
         self.initialization_running = True
@@ -1391,8 +1592,12 @@ class SonyRemote(QMainWindow):
                 try:
                     self._save_config_without_restart()
                 except Exception as exc:
+                    record_exception(exc, "Configuration save")
                     self.show_error(f"Could not update SonyRemote.json:\n\n{exc}")
 
+            self._build_favorites_from_config()
+            self._configure_combo_popup_guards()
+            self._fit_and_lock_window()
             self.initialized = True
             self.set_controls_enabled(
                 False,
@@ -1401,10 +1606,9 @@ class SonyRemote(QMainWindow):
             )
             self._update_polling_state(refresh=True)
 
-        def failed(_message):
+        def failed(error):
             self.initialized = False
-            self.power_button.setText("TV unavailable")
-            self.set_controls_enabled(False, power_enabled=False)
+            self.handle_request_error(error, background=True)
             self._update_polling_state()
 
         def finished():
@@ -1478,29 +1682,20 @@ class SonyRemote(QMainWindow):
         apps_config = self.config.get("Apps", {})
         apps = []
 
-        for entry in entries:
-            uri = str(entry.get("uri", "")).strip()
-            tv_name = html.unescape(str(entry.get("title", ""))).strip()
-            if not uri or not tv_name:
-                continue
-
-            settings = apps_config.get(uri, {})
-            if bool(settings.get("Hidden", False)):
-                continue
-
-            name = str(settings.get("Name", tv_name)).strip() or tv_name
-            override = str(settings.get("NameOverride", "")).strip()
-            label = override or name
-            favorite = bool(settings.get("Favorite", False))
-
-            apps.append((label, uri, favorite))
-
-        apps.sort(key=lambda item: item[0].casefold())
+        available = {
+            str(entry.get("uri", "")).strip()
+            for entry in entries
+            if str(entry.get("uri", "")).strip()
+            and html.unescape(str(entry.get("title", ""))).strip()
+        }
+        for uri, settings in _ordered_entries(apps_config, self.config["SortByName"]):
+            if uri in available and not settings["Hidden"]:
+                apps.append((_entry_display_name(settings), uri))
 
         self.app_combo.blockSignals(True)
         self.app_combo.clear()
         self.app_combo.setPlaceholderText("Select app")
-        for label, uri, _favorite in apps:
+        for label, uri in apps:
             self.app_combo.addItem(label, uri)
             self.app_combo.setItemData(
                 self.app_combo.count() - 1, Qt.AlignCenter, Qt.TextAlignmentRole
@@ -1513,34 +1708,25 @@ class SonyRemote(QMainWindow):
         inputs = []
         active_uri = None
 
-        for entry in entries:
-            uri = str(entry.get("uri", "")).strip()
-            tv_name = html.unescape(str(entry.get("title", ""))).strip()
-            if not uri or not tv_name:
+        available = {
+            str(entry.get("uri", "")).strip(): entry
+            for entry in entries
+            if str(entry.get("uri", "")).strip()
+            and html.unescape(str(entry.get("title", ""))).strip()
+        }
+        for uri, settings in _ordered_entries(inputs_config, self.config["SortByName"]):
+            if uri not in available or settings["Hidden"]:
                 continue
-
-            settings = inputs_config.get(uri, {})
-            if bool(settings.get("Hidden", False)):
-                continue
-
-            name = str(settings.get("Name", tv_name)).strip() or tv_name
-            override = str(settings.get("NameOverride", "")).strip()
-            label = override or name
-            favorite = bool(settings.get("Favorite", False))
-
-            inputs.append((label, uri, favorite))
-
-            if str(entry.get("status", "")).lower() == "true":
+            inputs.append((_entry_display_name(settings), uri))
+            if str(available[uri].get("status", "")).lower() == "true":
                 active_uri = uri
-
-        inputs.sort(key=lambda item: item[0].casefold())
 
         self.input_combo.blockSignals(True)
         self.input_combo.clear()
         self.input_combo.setPlaceholderText("Select input")
 
         active_index = -1
-        for label, uri, _favorite in inputs:
+        for label, uri in inputs:
             self.input_combo.addItem(label, uri)
             self.input_combo.setItemData(
                 self.input_combo.count() - 1, Qt.AlignCenter, Qt.TextAlignmentRole
@@ -1552,6 +1738,9 @@ class SonyRemote(QMainWindow):
         self.input_combo.blockSignals(False)
 
     def poll_status(self):
+        if (self._shutting_down or missing_config_settings(self.config)
+                or not self.isVisible() or self.isMinimized()):
+            return
         if self.poll_running:
             return
         self.poll_running = True
@@ -1564,17 +1753,18 @@ class SonyRemote(QMainWindow):
             if power == "active" and self.config["InputControls"]:
                 try:
                     data["inputs"] = self.api.get_inputs()
-                except Exception:
-                    pass
+                except Exception as error:
+                    record_unexpected_exception(error, "Optional input status", background=True)
             return data
 
         def done(data):
+            self.power_button.setToolTip("")
             self.last_power = data.get("power")
 
             if not self.initialized:
                 self.power_button.setText("Connecting...")
                 self.set_controls_enabled(False, power_enabled=False)
-                QTimer.singleShot(0, self.initialize_tv)
+                QTimer.singleShot(0, self.initialize)
                 return
 
             is_active = self.last_power == "active"
@@ -1592,14 +1782,132 @@ class SonyRemote(QMainWindow):
             if "inputs" in data:
                 self.update_active_input(data["inputs"])
 
-        def failed(_message):
-            self.last_power = None
-            self.power_button.setText("TV unavailable")
-            self.set_controls_enabled(False, power_enabled=False)
-            if self.config["VolumeControls"]:
-                self.volume_value.setText("—")
+        def failed(error):
+            self.handle_request_error(error, background=True)
 
         self.run_worker(query, done, failed, lambda: setattr(self, "poll_running", False))
+
+    def _update_polling_state(self, refresh=False):
+        if self._shutting_down or not hasattr(self, "poll_timer"):
+            return
+
+        should_poll = (
+            self.isVisible() and not self.isMinimized()
+            and not missing_config_settings(self.config)
+        )
+
+        if should_poll:
+            if refresh:
+                self.poll_status()
+            if not self.poll_timer.isActive():
+                self.poll_timer.start()
+        else:
+            self.poll_timer.stop()
+
+    # ----------------------------
+    # State and request errors
+    # ----------------------------
+
+    def set_controls_enabled(
+        self,
+        enabled,
+        power_enabled=None,
+        app_enabled=None,
+    ):
+        if power_enabled is None:
+            power_enabled = enabled
+        if app_enabled is None:
+            app_enabled = enabled
+
+        self.power_button.setEnabled(power_enabled)
+
+        for widget in (
+            getattr(self, "text_input", None),
+            getattr(self, "input_combo", None),
+            getattr(self, "mute_button", None),
+            getattr(self, "volume_down", None),
+            getattr(self, "volume_up", None),
+        ):
+            if widget is not None:
+                widget.setEnabled(enabled)
+
+        # Start from the general state for all ordinary buttons.
+        for button in self.findChildren(QPushButton):
+            if button is self.power_button:
+                continue
+            button.setEnabled(enabled)
+
+        # App launching works while the TV is in standby and can wake it, so
+        # App controls have their own availability state.
+        if hasattr(self, "app_combo"):
+            self.app_combo.setEnabled(app_enabled)
+
+        if hasattr(self, "app_favorites_layout"):
+            for index in range(self.app_favorites_layout.count()):
+                item = self.app_favorites_layout.itemAt(index)
+                button = item.widget()
+                if isinstance(button, QPushButton):
+                    button.setEnabled(app_enabled)
+
+        # Channel commands vary between Sony models/regions. Keep unsupported
+        # commands disabled even when the rest of the connected UI is active.
+        self._update_channel_button_availability(enabled)
+
+    def _update_channel_button_availability(self, enabled):
+        if not hasattr(self, "channel_buttons"):
+            return
+
+        remote_codes = getattr(self.api, "remote_codes", {})
+        for command, button in self.channel_buttons.items():
+            button.setEnabled(bool(enabled and command in remote_codes))
+
+    def handle_request_error(self, error, *, background=False, hint=None):
+        record_unexpected_exception(
+            error, "Background request" if background else "Command", background=background
+        )
+        if isinstance(error, DeviceConnectionError):
+            self.set_offline()
+        elif background:
+            self.set_error_status()
+        if isinstance(error, (DeviceConnectionError, DeviceResponseError)):
+            message = str(error)
+        else:
+            message = f"Unexpected request error ({type(error).__name__})."
+        self.power_button.setToolTip(message)
+        if not background:
+            if hint:
+                message += "\n\n" + hint
+            self.show_error(message)
+
+    def show_error(self, message):
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Warning)
+        box.setWindowTitle(APP_NAME)
+        box.setText(message)
+        box.setStandardButtons(QMessageBox.Ok)
+        box.setDefaultButton(QMessageBox.Ok)
+
+        button_box = box.findChild(QDialogButtonBox)
+        if button_box is not None:
+            # Use the normal platform button placement instead of centering.
+            button_box.setCenterButtons(False)
+
+        box.exec()
+
+    def set_offline(self):
+        self.last_power = None
+        self.last_volume = None
+        self._desired_volume = None
+        self._volume_rate_loop_running = False
+        self.volume_rate_timer.stop()
+        self.power_button.setText("Offline")
+        self.set_controls_enabled(False, power_enabled=False, app_enabled=False)
+        if self.config["VolumeControls"]:
+            self.volume_value.setText("—")
+
+    def set_error_status(self):
+        self.set_offline()
+        self.power_button.setText("Error")
 
     def update_power_ui(self, status):
         if status == "active":
@@ -1623,96 +1931,26 @@ class SonyRemote(QMainWindow):
                     self.input_combo.blockSignals(False)
                 break
 
-    def send_text_input(self):
-        if not hasattr(self, "text_input"):
-            return
-
-        text = self.text_input.toPlainText()
-        if not text:
-            return
-
-        self.run_worker(
-            lambda: self.api.set_text_form(text),
-            on_error=lambda _message: self.show_error(
-                "Could not send text to the TV.\n\n"
-                "Make sure a TV software keyboard or text field is currently active."
-            ),
-        )
-
-    def send_text_input_and_confirm(self):
-        if not hasattr(self, "text_input"):
-            return
-
-        text = self.text_input.toPlainText()
-        if not text:
-            return
-
-        def send_and_confirm():
-            # When automated submit is disabled, Ctrl+Enter falls back to the
-            # same send-only behavior as Enter.
-            if not self.config["TextInputSubmit"]:
-                self.api.set_text_form(text)
-                return
-
-            submit_sequence = self.config["TextInputSubmitSequence"]
-            self.api.validate_remote_commands(["Return", "Confirm", *submit_sequence])
-
-            # Reset the keyboard selection before using the configurable
-            # submit sequence. If the keyboard is already open, Return closes
-            # it while leaving the text field focused.
-            if self.api.is_text_input_active():
-                self.api.ircc("Return")
-                if not self.api.wait_for_text_input_state(False):
-                    raise RuntimeError("Software keyboard did not close.")
-
-            # Confirm on the still-focused text field reopens the software
-            # keyboard. Wait for Sony's status API rather than relying on a
-            # fixed UI delay.
-            self.api.ircc("Confirm")
-            if not self.api.wait_for_text_input_state(True):
-                raise RuntimeError("Software keyboard did not become active.")
-
-            # setTextForm now doubles as the final readiness check.
-            self.api.set_text_form(text)
-
-            for command in submit_sequence:
-                self.api.ircc(command)
-
-        self.run_worker(
-            send_and_confirm,
-            on_error=lambda _message: self.show_error(
-                "Could not send or submit the text on the TV.\n\n"
-                "Make sure a TV software keyboard or text field is currently active."
-            ),
-        )
+    # ----------------------------
+    # Device actions and shortcuts
+    # ----------------------------
 
     def toggle_power(self):
         turn_on = self.last_power != "active"
         self.power_button.setEnabled(False)
         self.run_worker(
             lambda: self.api.set_power(turn_on),
-            on_finished=lambda: (self.power_button.setEnabled(True), QTimer.singleShot(300, self.poll_status)),
+            on_finished=lambda: (
+                self.power_button.setEnabled(self.last_power is not None),
+                QTimer.singleShot(300, self.poll_status),
+            ),
         )
 
-    def launch_selected_app(self, index):
-        uri = self.app_combo.itemData(index)
-        if uri:
-            self.launch_app_by_uri(uri)
-            self.app_combo.setCurrentIndex(-1)
-
-    def launch_app_by_uri(self, uri):
-        self.run_worker(lambda: self.api.launch_app(uri), on_finished=lambda: QTimer.singleShot(300, self.poll_status))
-
-    def select_input(self, index):
-        uri = self.input_combo.itemData(index)
-        if uri:
-            self.set_input_by_uri(uri)
-
-    def set_input_by_uri(self, uri):
-        self.run_worker(lambda: self.api.set_input(uri), on_finished=lambda: QTimer.singleShot(300, self.poll_status))
-
-    def send_ircc(self, command):
-        self.run_worker(lambda: self.api.ircc(command))
+    def toggle_mute(self):
+        if not self.last_volume:
+            return
+        target = not bool(self.last_volume.get("mute"))
+        self.run_worker(lambda: self.api.set_mute(target), on_finished=lambda: QTimer.singleShot(200, self.poll_status))
 
     def adjust_volume(self, amount):
         if not self.last_volume:
@@ -1786,96 +2024,95 @@ class SonyRemote(QMainWindow):
                 return
             self._schedule_volume_rate_step()
 
-        def failed(message):
+        def failed(error):
             self._volume_rate_step_running = False
             self._volume_rate_loop_running = False
             self._desired_volume = None
-            self.show_error(message)
+            self.handle_request_error(error)
             QTimer.singleShot(200, self.poll_status)
 
         self.run_worker(step, on_result=done, on_error=failed)
 
-    def toggle_mute(self):
-        if not self.last_volume:
-            return
-        target = not bool(self.last_volume.get("mute"))
-        self.run_worker(lambda: self.api.set_mute(target), on_finished=lambda: QTimer.singleShot(200, self.poll_status))
+    def launch_selected_app(self, index):
+        uri = self.app_combo.itemData(index)
+        if uri:
+            self.launch_app(uri)
+            self.app_combo.setCurrentIndex(-1)
 
-    def _update_polling_state(self, refresh=False):
-        if self._shutting_down or not hasattr(self, "poll_timer"):
-            return
+    def launch_app(self, uri):
+        self.run_worker(lambda: self.api.launch_app(uri), on_finished=lambda: QTimer.singleShot(300, self.poll_status))
 
-        should_poll = self.isVisible() and not self.isMinimized()
+    def select_input(self, index):
+        uri = self.input_combo.itemData(index)
+        if uri:
+            self.set_input(uri)
 
-        if should_poll:
-            if refresh:
-                self.poll_status()
-            if not self.poll_timer.isActive():
-                self.poll_timer.start()
-        else:
-            self.poll_timer.stop()
+    def set_input(self, uri):
+        self.run_worker(lambda: self.api.set_input(uri), on_finished=lambda: QTimer.singleShot(300, self.poll_status))
 
-    def _setup_tray(self):
-        self.tray = None
-        if not self.config["SystemTray"] or not QSystemTrayIcon.isSystemTrayAvailable():
-            return
-        self.tray = QSystemTrayIcon(self.windowIcon(), self)
-        self.tray.setToolTip("Sony Remote")
+    def send_ircc(self, command):
+        self.run_worker(lambda: self.api.ircc(command))
 
-        menu = QMenu()
-        show_action = QAction("Show", self)
-        quit_action = QAction("Exit", self)
-        show_action.triggered.connect(self.show_from_tray)
-        quit_action.triggered.connect(self.quit_from_tray)
-        menu.addAction(show_action)
-        menu.addSeparator()
-        menu.addAction(quit_action)
-        self.tray.setContextMenu(menu)
-        self.tray.activated.connect(self.tray_activated)
-        self.tray.show()
-
-    def tray_activated(self, reason):
-        if reason == QSystemTrayIcon.DoubleClick:
-            self.show_from_tray()
-
-    def show_from_tray(self):
-        self.showNormal()
-        self.raise_()
-        self.activateWindow()
-        self._update_polling_state(refresh=True)
-
-    def _shutdown(self):
-        if self._shutting_down:
+    def send_text_input(self):
+        if not hasattr(self, "text_input"):
             return
 
-        self._shutting_down = True
-        app = QApplication.instance()
-        if app is not None:
-            app.removeEventFilter(self)
-        self._remove_windows_keyboard_hook()
-        self._really_close = True
+        text = self.text_input.toPlainText()
+        if not text:
+            return
 
-        # Stop anything that can schedule more background work.
-        self.poll_timer.stop()
-        self.volume_rate_timer.stop()
-        if hasattr(self, "config_restart_timer"):
-            self.config_restart_timer.stop()
-        if hasattr(self, "config_watcher"):
-            self.config_watcher.blockSignals(True)
+        self.run_worker(
+            lambda: self.api.set_text_form(text),
+            on_error=lambda error: self.handle_request_error(
+                error, hint="Make sure a TV software keyboard or text field is currently active."
+            ),
+        )
 
-        # Remove the tray icon before Qt exits.
-        if self.tray:
-            self.tray.hide()
+    def send_text_input_and_confirm(self):
+        if not hasattr(self, "text_input"):
+            return
 
-        # Prevent queued jobs from starting, then let already-running jobs
-        # finish cleanly before QObject/QRunnable state is torn down.
-        self.pool.clear()
-        self.pool.waitForDone()
-        self._workers.clear()
+        text = self.text_input.toPlainText()
+        if not text:
+            return
 
-    def quit_from_tray(self):
-        self._shutdown()
-        QApplication.quit()
+        def send_and_confirm():
+            # When automated submit is disabled, Ctrl+Enter falls back to the
+            # same send-only behavior as Enter.
+            if not self.config["TextInputSubmit"]:
+                self.api.set_text_form(text)
+                return
+
+            submit_sequence = self.config["TextInputSubmitSequence"]
+            self.api.validate_remote_commands(["Return", "Confirm", *submit_sequence])
+
+            # Reset the keyboard selection before using the configurable
+            # submit sequence. If the keyboard is already open, Return closes
+            # it while leaving the text field focused.
+            if self.api.is_text_input_active():
+                self.api.ircc("Return")
+                if not self.api.wait_for_text_input_state(False):
+                    raise DeviceResponseError("Software keyboard did not close.")
+
+            # Confirm on the still-focused text field reopens the software
+            # keyboard. Wait for Sony's status API rather than relying on a
+            # fixed UI delay.
+            self.api.ircc("Confirm")
+            if not self.api.wait_for_text_input_state(True):
+                raise DeviceResponseError("Software keyboard did not become active.")
+
+            # setTextForm now doubles as the final readiness check.
+            self.api.set_text_form(text)
+
+            for command in submit_sequence:
+                self.api.ircc(command)
+
+        self.run_worker(
+            send_and_confirm,
+            on_error=lambda error: self.handle_request_error(
+                error, hint="Make sure a TV software keyboard or text field is currently active."
+            ),
+        )
 
     def _dispatch_shortcut(self, command):
         resolved = self.api.resolve_remote_command(command)
@@ -1884,63 +2121,6 @@ class SonyRemote(QMainWindow):
 
         self.send_ircc(command)
         return True
-
-    def eventFilter(self, watched, event):
-        if sys.platform == "win32":
-            return super().eventFilter(watched, event)
-
-        if event.type() != QEvent.KeyPress or not self.isActiveWindow():
-            return super().eventFilter(watched, event)
-
-        # Keep normal editing behavior while Text Input owns keyboard focus.
-        if hasattr(self, "text_input") and self.text_input.hasFocus():
-            return super().eventFilter(watched, event)
-
-        key = event.key()
-        modifiers = event.modifiers()
-        command = None
-
-        if modifiers & Qt.KeypadModifier:
-            keypad_map = {
-                Qt.Key_0: "Num0",
-                Qt.Key_1: "Num1",
-                Qt.Key_2: "Num2",
-                Qt.Key_3: "Num3",
-                Qt.Key_4: "Num4",
-                Qt.Key_5: "Num5",
-                Qt.Key_6: "Num6",
-                Qt.Key_7: "Num7",
-                Qt.Key_8: "Num8",
-                Qt.Key_9: "Num9",
-                Qt.Key_Plus: "ChannelUp",
-                Qt.Key_Minus: "ChannelDown",
-            }
-            command = keypad_map.get(key)
-
-        if command is None:
-            key_map = {
-                Qt.Key_Left: "Left",
-                Qt.Key_Right: "Right",
-                Qt.Key_Up: "Up",
-                Qt.Key_Down: "Down",
-                Qt.Key_Return: "Confirm",
-                Qt.Key_Enter: "Confirm",
-                Qt.Key_Backspace: "Return",
-                Qt.Key_Home: "Home",
-                Qt.Key_MediaTogglePlayPause: "PlayPause",
-                Qt.Key_MediaPlay: "Play",
-                Qt.Key_MediaPause: "Pause",
-                Qt.Key_MediaStop: "Stop",
-                Qt.Key_MediaNext: "Next",
-                Qt.Key_MediaPrevious: "Prev",
-            }
-            command = key_map.get(key)
-
-        if command is not None and self._dispatch_shortcut(command):
-            event.accept()
-            return True
-
-        return super().eventFilter(watched, event)
 
     def _install_windows_keyboard_hook(self):
         if sys.platform != "win32" or self._keyboard_hook:
@@ -2031,10 +2211,214 @@ class SonyRemote(QMainWindow):
             l_param,
         )
 
-    def mousePressEvent(self, event):
-        if hasattr(self, "text_input") and self.text_input.hasFocus():
-            self.text_input.clearFocus()
-        super().mousePressEvent(event)
+    # ----------------------------
+    # Configuration watching and restart
+    # ----------------------------
+
+    def _get_config_digest(self):
+        return _file_sha256(CONFIG_PATH)
+
+    def _setup_config_watcher(self):
+        self.config_watcher = QFileSystemWatcher(self)
+        self._watch_config_paths()
+
+        self.config_watcher.fileChanged.connect(self._config_path_changed)
+        self.config_watcher.directoryChanged.connect(self._config_path_changed)
+
+        self.config_restart_timer = QTimer(self)
+        self.config_restart_timer.setSingleShot(True)
+        self.config_restart_timer.setInterval(CONFIG_RESTART_DEBOUNCE_MS)
+        self.config_restart_timer.timeout.connect(self._check_external_config_change)
+
+    def _watch_config_paths(self):
+        config_path = str(CONFIG_PATH)
+        if CONFIG_PATH.exists() and config_path not in self.config_watcher.files():
+            self.config_watcher.addPath(config_path)
+        parent = str(CONFIG_PATH.parent)
+        if parent not in self.config_watcher.directories():
+            self.config_watcher.addPath(parent)
+
+    def _config_path_changed(self, _path):
+        if self._shutting_down or self._config_restart_pending:
+            return
+
+        # Many editors save by replacing the file, which removes a direct
+        # QFileSystemWatcher file watch. The directory watch lets us re-arm it.
+        self._watch_config_paths()
+        self.config_restart_timer.start()
+
+    def _check_external_config_change(self):
+        if self._shutting_down or self._config_restart_pending:
+            return
+
+        digest = self._get_config_digest()
+        if digest is None or digest == self._config_digest:
+            return
+
+        try:
+            with CONFIG_PATH.open("r", encoding="utf-8") as f:
+                candidate = json.load(f)
+            validate_config(candidate)
+        except (OSError, ValueError) as ex:
+            if digest != getattr(self, "_invalid_config_digest", None):
+                self._invalid_config_digest = digest
+                QMessageBox.warning(
+                    self, "Sony Remote - Configuration Error",
+                    f"The configuration change was not applied:\n{ex}\n\n"
+                    "Correct the JSON settings and save again. The current instance remains running.",
+                )
+            return
+
+        self._invalid_config_digest = None
+        self._restart_for_config_change()
+
+    def _save_config_without_restart(self):
+        # Preserve unapplied user edits after a failed restart.
+        if self._restart_failed:
+            return
+        save_config(self.config)
+        self._config_digest = self._get_config_digest()
+
+        # Re-arm the file watch after atomic replacement.
+        self._watch_config_paths()
+
+    def _restart_for_config_change(self):
+        if self._shutting_down or self._config_restart_pending:
+            return
+        self._config_restart_pending = True
+        active_timers = self._pause_background_work()
+        release_single_instance()
+        try:
+            launch_replacement()
+        except Exception as exc:
+            try:
+                if not acquire_single_instance():
+                    raise RuntimeError("Another instance may already be running.")
+            except Exception as lock_error:
+                QMessageBox.critical(
+                    self, "Sony Remote - Restart Error",
+                    f"Could not restart: {exc}\nCould not restore the instance lock: "
+                    f"{lock_error}\nThis instance will close.",
+                )
+                self._shutdown()
+                QApplication.quit()
+                return
+            self._config_digest = self._get_config_digest()
+            self._restart_failed = True
+            self._resume_background_work(active_timers)
+            QMessageBox.warning(
+                self, "Sony Remote - Restart Error",
+                f"Could not restart: {exc}\n\nThe current instance is still running "
+                "with its previous settings. Edit and save the JSON again to retry.",
+            )
+            return
+        self._shutdown()
+        QApplication.quit()
+
+    # ----------------------------
+    # Tray and shutdown lifecycle
+    # ----------------------------
+
+    def _setup_tray(self):
+        self.tray = None
+        if not self.config["SystemTray"] or not QSystemTrayIcon.isSystemTrayAvailable():
+            return
+        self.tray = QSystemTrayIcon(self.windowIcon(), self)
+        self.tray.setToolTip("Sony Remote")
+
+        menu = QMenu()
+        show_action = QAction("Show", self)
+        quit_action = QAction("Exit", self)
+        show_action.triggered.connect(self.show_from_tray)
+        quit_action.triggered.connect(self.quit_from_tray)
+        menu.addAction(show_action)
+        menu.addSeparator()
+        menu.addAction(quit_action)
+        self.tray.setContextMenu(menu)
+        self.tray.activated.connect(self.tray_activated)
+        self.tray.show()
+
+    def tray_activated(self, reason):
+        if reason == QSystemTrayIcon.DoubleClick:
+            self.show_from_tray()
+
+    def show_from_tray(self):
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+        self._update_polling_state(refresh=True)
+
+    def quit_from_tray(self):
+        self._shutdown()
+        QApplication.quit()
+
+    def _pause_background_work(self):
+        self._shutting_down = True
+        self._worker_generation += 1
+        timers = (self.poll_timer, self.volume_rate_timer, self.config_restart_timer)
+        active_timers = [timer for timer in timers if timer.isActive()]
+        for timer in timers:
+            timer.stop()
+        self.config_watcher.blockSignals(True)
+        self.pool.clear()
+        self.pool.waitForDone()
+        self._workers.clear()
+        self.poll_running = False
+        self.initialization_running = False
+        self._volume_rate_step_running = False
+        return active_timers
+
+    def _resume_background_work(self, active_timers):
+        self._shutting_down = False
+        self._config_restart_pending = False
+        self.config_watcher.blockSignals(False)
+        self._config_path_changed(str(CONFIG_PATH))
+        for timer in active_timers:
+            timer.start()
+        if missing_config_settings(self.config):
+            return
+        self.set_controls_enabled(
+            self.last_power == "active", power_enabled=self.initialized,
+            app_enabled=self.initialized,
+        )
+        if self._volume_rate_loop_running and self._desired_volume is not None:
+            self._schedule_volume_rate_step(0)
+        if not self.initialized:
+            self.initialize()
+        self._update_polling_state(refresh=True)
+
+    def _shutdown(self):
+        if getattr(self, "_shutdown_complete", False):
+            return
+        self._pause_background_work()
+        self._shutdown_complete = True
+        self._really_close = True
+        self._volume_rate_loop_running = False
+        app = QApplication.instance()
+        if app is not None:
+            app.removeEventFilter(self)
+        self._remove_windows_keyboard_hook()
+        if self.tray:
+            self.tray.hide()
+        release_single_instance()
+
+    # ----------------------------
+    # Qt events
+    # ----------------------------
+
+    def showEvent(self, event):
+        super().showEvent(event)
+
+        if self.mica_enabled:
+            apply_mica(int(self.winId()))
+
+        if self.config["DarkMode"] and sys.platform == "win32":
+            set_dark_titlebar(int(self.winId()))
+        self._update_polling_state(refresh=True)
+
+    def hideEvent(self, event):
+        super().hideEvent(event)
+        self._update_polling_state()
 
     def changeEvent(self, event):
         super().changeEvent(event)
@@ -2048,7 +2432,8 @@ class SonyRemote(QMainWindow):
             )
 
     def closeEvent(self, event):
-        if self.tray and self.config["CloseToTray"] and not self._really_close:
+        if (self.tray and self.config["CloseToTray"] and not self._really_close
+                and QSystemTrayIcon.isSystemTrayAvailable()):
             event.ignore()
             self.hide()
             self._update_polling_state()
@@ -2058,61 +2443,132 @@ class SonyRemote(QMainWindow):
         event.accept()
         QApplication.quit()
 
-    def show_error(self, message):
-        box = QMessageBox(self)
-        box.setIcon(QMessageBox.Warning)
-        box.setWindowTitle(APP_NAME)
-        box.setText(message)
-        box.setStandardButtons(QMessageBox.Ok)
-        box.setDefaultButton(QMessageBox.Ok)
+    def mousePressEvent(self, event):
+        if hasattr(self, "text_input") and self.text_input.hasFocus():
+            self.text_input.clearFocus()
+        super().mousePressEvent(event)
 
-        button_box = box.findChild(QDialogButtonBox)
-        if button_box is not None:
-            # Use the normal platform button placement instead of centering.
-            button_box.setCenterButtons(False)
+    def eventFilter(self, watched, event):
+        if sys.platform == "win32":
+            return super().eventFilter(watched, event)
 
-        box.exec()
+        if event.type() != QEvent.KeyPress or not self.isActiveWindow():
+            return super().eventFilter(watched, event)
+
+        # Keep normal editing behavior while Text Input owns keyboard focus.
+        if hasattr(self, "text_input") and self.text_input.hasFocus():
+            return super().eventFilter(watched, event)
+
+        key = event.key()
+        modifiers = event.modifiers()
+        command = None
+
+        if modifiers & Qt.KeypadModifier:
+            keypad_map = {
+                Qt.Key_0: "Num0",
+                Qt.Key_1: "Num1",
+                Qt.Key_2: "Num2",
+                Qt.Key_3: "Num3",
+                Qt.Key_4: "Num4",
+                Qt.Key_5: "Num5",
+                Qt.Key_6: "Num6",
+                Qt.Key_7: "Num7",
+                Qt.Key_8: "Num8",
+                Qt.Key_9: "Num9",
+                Qt.Key_Plus: "ChannelUp",
+                Qt.Key_Minus: "ChannelDown",
+            }
+            command = keypad_map.get(key)
+
+        if command is None:
+            key_map = {
+                Qt.Key_Left: "Left",
+                Qt.Key_Right: "Right",
+                Qt.Key_Up: "Up",
+                Qt.Key_Down: "Down",
+                Qt.Key_Return: "Confirm",
+                Qt.Key_Enter: "Confirm",
+                Qt.Key_Backspace: "Return",
+                Qt.Key_Home: "Home",
+                Qt.Key_MediaTogglePlayPause: "PlayPause",
+                Qt.Key_MediaPlay: "Play",
+                Qt.Key_MediaPause: "Pause",
+                Qt.Key_MediaStop: "Stop",
+                Qt.Key_MediaNext: "Next",
+                Qt.Key_MediaPrevious: "Prev",
+            }
+            command = key_map.get(key)
+
+        if command is not None and self._dispatch_shortcut(command):
+            event.accept()
+            return True
+
+        return super().eventFilter(watched, event)
 
 
-def main():
-    if not acquire_single_instance():
-        return 0
+# ----------------------------
+# Application entry points
+# ----------------------------
 
-    set_windows_app_id("Sony.Remote")
 
-    log_path = Path(__file__).with_name("SonyRemote-crash.log")
-    crash_file = open(log_path, "a", encoding="utf-8")
-    try:
-        faulthandler.enable(crash_file)
-    except Exception:
-        pass
+def launch_replacement():
+    script_path = Path(__file__).resolve()
+    arguments = list(sys.argv[1:])
+    if not getattr(sys, "frozen", False):
+        arguments.insert(0, str(script_path))
+    result = QProcess.startDetached(sys.executable, arguments, str(script_path.parent))
+    started = result[0] if isinstance(result, tuple) else bool(result)
+    if not started:
+        raise OSError("The replacement process could not be started.")
 
-    def exception_hook(exc_type, exc_value, exc_tb):
-        timestamp = datetime.now().astimezone().isoformat(timespec="seconds")
-        crash_file.write(f"\n[{timestamp}] {APP_NAME} {__version__}\n")
-        traceback.print_exception(exc_type, exc_value, exc_tb, file=crash_file)
-        crash_file.flush()
-        sys.__excepthook__(exc_type, exc_value, exc_tb)
 
-    sys.excepthook = exception_hook
-
+def _run_application():
     app = QApplication(sys.argv)
+    try:
+        if not acquire_single_instance():
+            return 0
+    except Exception as exc:
+        QMessageBox.critical(None, APP_NAME, f"Could not acquire the instance lock:\n{exc}")
+        return 1
+
+    set_app_user_model_id("Sony.Remote")
+
     app.setApplicationName(APP_NAME)
 
     # Use the same native-looking monitor/computer icon for the whole
     # application, including the Windows taskbar.
-    app.setWindowIcon(app.style().standardIcon(QStyle.SP_ComputerIcon))
+    app.setWindowIcon(get_app_icon())
     try:
         config = load_config()
     except Exception as exc:
         QMessageBox.critical(None, APP_NAME, f"Could not load SonyRemote.json:\n\n{exc}")
         return 1
+    configure_diagnostics(config)
     window = SonyRemote(config)
+    show_missing_config_settings(config)
     app.setQuitOnLastWindowClosed(window.tray is None)
     app.aboutToQuit.connect(window._shutdown)
     window._fit_and_lock_window()
     window.show()
-    return app.exec()
+    try:
+        return app.exec()
+    finally:
+        window._shutdown()
+
+
+def main():
+    try:
+        return _run_application()
+    except Exception as error:
+        record_exception(error, "Application")
+        if QApplication.instance() is not None:
+            QMessageBox.critical(
+                None, "Sony Remote", f"Unexpected application error ({type(error).__name__})."
+            )
+        return 1
+    finally:
+        release_single_instance()
+        close_diagnostics()
 
 
 if __name__ == "__main__":

@@ -22,6 +22,8 @@
     "Active": false,
     "RateMs": 300
   },
+  "DiagnosticsEnabled": false,
+  "SortByName": false,
   "Apps": {},
   "Inputs": {},
   "SystemTray": false,

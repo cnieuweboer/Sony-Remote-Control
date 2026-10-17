@@ -62,6 +62,8 @@ Set:
   "InputControls": false,
   "VolumeControls": true,
   "PlaybackControls": true,
+  "DiagnosticsEnabled": false,
+  "SortByName": false,
   "Apps": {},
   "Inputs": {},
   "SystemTray": false,
@@ -81,6 +83,8 @@ Set:
 - `InputControls` — show the input selector and favorite input buttons.
 - `VolumeControls` — show volume and mute controls.
 - `PlaybackControls` — show media playback controls.
+- `DiagnosticsEnabled` — `false` by default. Set to `true` to append unexpected errors and crash diagnostics to `SonyRemote-crash.log` beside the script. Logs contain the app version, exception types, and stack locations; exception messages, source lines, request data, and local variable values are omitted. If the log cannot be opened or written, the app continues without logging.
+- `SortByName` — `false` (default) keeps favorites and dropdown entries in JSON insertion order; `true` sorts them alphabetically by `NameOverride`, falling back to `Name`, ignoring case. Apps and inputs are ordered separately.
 - `Apps` — settings for applications discovered from the Sony TV.
   - `Name` — name reported by the TV. This is updated automatically.
   - `NameOverride` — optional replacement name shown in the dropdown and on favorite buttons.
@@ -91,15 +95,17 @@ Set:
   - `NameOverride` — optional replacement name shown in the dropdown and on favorite buttons.
   - `Hidden` — hide the input from the dropdown menu. Hidden inputs can still be favorites.
   - `Favorite` — show a button for the input directly in the remote.
-- `SystemTray` — show a system tray icon.
-- `CloseToTray` — clicking the window close button hides the app to the tray instead of exiting.
+- `SystemTray` — show a system tray icon when the desktop supports it. If unavailable, the app runs as an ordinary window.
+- `CloseToTray` — clicking the window close button hides the app to the tray instead of exiting. If no tray is available, closing the window exits normally.
 - `DropdownAnimationWorkaround` — suppress a Qt/Windows repaint glitch where controls underneath an opening dropdown can briefly show through the menu animation. Usually only needed on Windows.
 
-SonyRemote automatically adds newly discovered applications and inputs to `Apps` and `Inputs` with default settings. Existing `NameOverride`, `Hidden`, and `Favorite` values are preserved.
+SonyRemote automatically adds newly discovered applications and inputs to `Apps` and `Inputs` with default settings. Existing `NameOverride`, `Hidden`, and `Favorite` values are preserved. Existing entries keep their JSON positions; newly discovered entries append in device discovery order. Dropdowns only include currently discovered, non-hidden entries. Favorite buttons remain independent of `Hidden`. Name sorting affects display only and does not reorder the JSON file.
 
 The app automatically restarts when it detects that `SonyRemote.json` has changed.
 
 Only one instance of SonyRemote can run at a time.
+
+Regular status polling pauses while the window is hidden or minimized and refreshes immediately when restored. Active requests finish normally; configuration file watching remains enabled.
 
 ## Text input
 
