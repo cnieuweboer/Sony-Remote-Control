@@ -1,4 +1,5 @@
 import ctypes
+from collections import deque
 from datetime import datetime
 import faulthandler
 import hashlib
@@ -200,7 +201,7 @@ class AmplifierClient(QObject):
 APP_NAME = "Sony Remote"
 
 
-__version__ = "2026.10.18.2"
+__version__ = "2026.10.18.3"
 
 
 CONFIG_PATH = Path(__file__).with_name("SonyRemote.json")
@@ -553,62 +554,243 @@ _instance_mutex_handle = None
 _instance_lock_file = None
 
 
-if sys.platform == "win32":
-    _user32 = ctypes.windll.user32
+_SHORTCUT_KEYS = {
+    0xAF: 'volume_up',
+    0xAE: 'volume_down',
+    0xAD: 'mute',
+    0x25: 'Left',
+    0x27: 'Right',
+    0x26: 'Up',
+    0x28: 'Down',
+    0x0D: 'Confirm',
+    0x08: 'Return',
+    0x24: 'Home',
+    0x60: 'Num0',
+    0x61: 'Num1',
+    0x62: 'Num2',
+    0x63: 'Num3',
+    0x64: 'Num4',
+    0x65: 'Num5',
+    0x66: 'Num6',
+    0x67: 'Num7',
+    0x68: 'Num8',
+    0x69: 'Num9',
+    0x6B: 'ChannelUp',
+    0x6D: 'ChannelDown',
+    0xB3: 'PlayPause',
+    0xB2: 'Stop',
+    0xB0: 'Next',
+    0xB1: 'Prev',
+}
+_RETAINED_SHORTCUT_HOOKS = []
 
-    WH_KEYBOARD_LL = 13
-    WM_KEYDOWN = 0x0100
-    WM_SYSKEYDOWN = 0x0104
 
-    VK_BACK = 0x08
-    VK_RETURN = 0x0D
-    VK_HOME = 0x24
-    VK_LEFT = 0x25
-    VK_UP = 0x26
-    VK_RIGHT = 0x27
-    VK_DOWN = 0x28
+class _ShortcutKeyState:
+    """Keep a physical press with its original owner until release."""
 
-    VK_NUMPAD0 = 0x60
-    VK_NUMPAD1 = 0x61
-    VK_NUMPAD2 = 0x62
-    VK_NUMPAD3 = 0x63
-    VK_NUMPAD4 = 0x64
-    VK_NUMPAD5 = 0x65
-    VK_NUMPAD6 = 0x66
-    VK_NUMPAD7 = 0x67
-    VK_NUMPAD8 = 0x68
-    VK_NUMPAD9 = 0x69
-    VK_ADD = 0x6B
-    VK_SUBTRACT = 0x6D
+    def __init__(self):
+        self.pressed = {}
 
-    VK_MEDIA_NEXT_TRACK = 0xB0
-    VK_MEDIA_PREV_TRACK = 0xB1
-    VK_MEDIA_STOP = 0xB2
-    VK_MEDIA_PLAY_PAUSE = 0xB3
+    def press(self, key, command, accept):
+        if key in self.pressed:
+            owned = self.pressed[key]
+            if owned and command != "mute":
+                accept(command)
+            return owned
+        owned = bool(accept(command))
+        self.pressed[key] = owned
+        return owned
 
-    VK_VOLUME_MUTE = 0xAD
-    VK_VOLUME_DOWN = 0xAE
-    VK_VOLUME_UP = 0xAF
+    def release(self, key):
+        return self.pressed.pop(key, False)
 
-    _LowLevelKeyboardProc = ctypes.WINFUNCTYPE(
-        ctypes.c_long,
-        ctypes.c_int,
-        ctypes.c_ulong,
-        ctypes.c_void_p,
+
+class _LowLevelKey(ctypes.Structure):
+    _fields_ = [
+        ("vkCode", ctypes.c_uint32), ("scanCode", ctypes.c_uint32),
+        ("flags", ctypes.c_uint32), ("time", ctypes.c_uint32),
+        ("dwExtraInfo", ctypes.c_size_t),
+    ]
+
+
+class _NativePoint(ctypes.Structure):
+    _fields_ = [("x", ctypes.c_int32), ("y", ctypes.c_int32)]
+
+
+class _NativeMessage(ctypes.Structure):
+    _fields_ = [
+        ("hwnd", ctypes.c_void_p), ("message", ctypes.c_uint32),
+        ("wParam", ctypes.c_size_t), ("lParam", ctypes.c_ssize_t),
+        ("time", ctypes.c_uint32), ("pt", _NativePoint),
+        ("lPrivate", ctypes.c_uint32),
+    ]
+
+
+_HookProc = getattr(ctypes, "WINFUNCTYPE", ctypes.CFUNCTYPE)(
+    ctypes.c_ssize_t, ctypes.c_int, ctypes.c_size_t, ctypes.c_ssize_t
+)
+
+
+def _load_shortcut_hook_api():
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    signatures = (
+        (user32.SetWindowsHookExW, [ctypes.c_int, _HookProc, ctypes.c_void_p, ctypes.c_uint32], ctypes.c_void_p),
+        (user32.UnhookWindowsHookEx, [ctypes.c_void_p], ctypes.c_int),
+        (user32.CallNextHookEx, [ctypes.c_void_p, ctypes.c_int, ctypes.c_size_t, ctypes.c_ssize_t], ctypes.c_ssize_t),
+        (user32.GetForegroundWindow, [], ctypes.c_void_p),
+        (user32.GetAsyncKeyState, [ctypes.c_int], ctypes.c_int16),
+        (user32.PeekMessageW, [ctypes.POINTER(_NativeMessage), ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32], ctypes.c_int),
+        (user32.GetMessageW, [ctypes.POINTER(_NativeMessage), ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32], ctypes.c_int),
+        (user32.PostThreadMessageW, [ctypes.c_uint32, ctypes.c_uint32, ctypes.c_size_t, ctypes.c_ssize_t], ctypes.c_int),
+        (kernel32.GetModuleHandleW, [ctypes.c_wchar_p], ctypes.c_void_p),
+        (kernel32.GetCurrentThreadId, [], ctypes.c_uint32),
     )
+    for function, arguments, result in signatures:
+        function.argtypes = arguments
+        function.restype = result
+    return user32, kernel32
 
-    class _KBDLLHOOKSTRUCT(ctypes.Structure):
-        _fields_ = [
-            ("vkCode", ctypes.c_ulong),
-            ("scanCode", ctypes.c_ulong),
-            ("flags", ctypes.c_ulong),
-            ("time", ctypes.c_ulong),
-            ("dwExtraInfo", ctypes.c_void_p),
-        ]
-else:
-    _user32 = None
-    _LowLevelKeyboardProc = None
-    _KBDLLHOOKSTRUCT = None
+
+class _WindowsShortcutHook(QObject):
+    changed = Signal(bool, object)
+
+    def __init__(self, accept, parent=None):
+        super().__init__(parent)
+        self._accept = accept
+        self._keys = _ShortcutKeyState()
+        self._hook = None
+        self._callback = None
+        self._user32 = None
+        self._thread_id = None
+        self._thread = None
+        self._stopping = threading.Event()
+        self._faulted = False
+
+    @property
+    def installed(self):
+        return bool(self._hook and not self._faulted and not self._stopping.is_set())
+
+    def start(self):
+        # A separate native message loop keeps the hook responsive even while
+        # the GUI waits for workers during restart/shutdown. No Qt UI calls or
+        # network/file operations run inside the native callback.
+        if self._thread is not None:
+            return
+        self._thread = threading.Thread(target=self._run, name="RemoteShortcuts", daemon=True)
+        self._thread.start()
+
+    def _notify(self, installed, error=None):
+        try:
+            self.changed.emit(installed, error)
+        except RuntimeError:
+            pass  # The Qt parent may already be closing.
+
+    def _run(self):
+        error = None
+        try:
+            self._user32, kernel32 = _load_shortcut_hook_api()
+            message = _NativeMessage()
+            self._user32.PeekMessageW(ctypes.byref(message), None, 0, 0, 0)
+            self._thread_id = kernel32.GetCurrentThreadId()
+            # Do not seize keys that were already held when the app started.
+            self._keys.pressed = {
+                key: False for key in _SHORTCUT_KEYS
+                if self._user32.GetAsyncKeyState(key) & 0x8000
+            }
+            self._callback = _HookProc(self._handle_key)
+            self._hook = self._user32.SetWindowsHookExW(
+                13, self._callback, kernel32.GetModuleHandleW(None), 0
+            )
+            if not self._hook:
+                raise ctypes.WinError()
+            self._notify(True)
+            while not self._stopping.is_set():
+                result = self._user32.GetMessageW(ctypes.byref(message), None, 0, 0)
+                if result == 0:
+                    break
+                if result == -1:
+                    raise ctypes.WinError()
+        except Exception as exc:
+            error = exc
+            self._faulted = True
+        finally:
+            if self._hook:
+                try:
+                    if not self._user32.UnhookWindowsHookEx(self._hook):
+                        raise ctypes.WinError()
+                    self._hook = None
+                except Exception as exc:
+                    error = error or exc
+                    self._faulted = True
+            # Keep the C callback alive if native unregistration failed.
+            if self._hook is None:
+                self._callback = None
+            elif self not in _RETAINED_SHORTCUT_HOOKS:
+                _RETAINED_SHORTCUT_HOOKS.append(self)
+            self._thread_id = None
+            self._notify(False, error)
+
+    def _handle_key(self, code, message, address):
+        key = None
+        if code == 0 and message in (0x100, 0x101, 0x104, 0x105):
+            try:
+                data = ctypes.cast(address, ctypes.POINTER(_LowLevelKey)).contents
+                key = data.vkCode
+                command = _SHORTCUT_KEYS.get(key)
+                # Remappers can generate injected volume-key events. They are
+                # safe to handle too: this remote never synthesizes key events.
+                if command:
+                    if message in (0x101, 0x105):
+                        owned = self._keys.release(data.vkCode)
+                    else:
+                        foreground = self._user32.GetForegroundWindow()
+                        owned = self._keys.press(
+                            data.vkCode, command,
+                            lambda value: (
+                                not self._faulted and not self._stopping.is_set()
+                                and self._accept(value, foreground)
+                            ),
+                        )
+                    if owned:
+                        return 1
+            except Exception as error:
+                if not self._faulted:
+                    self._faulted = True
+                    self._notify(False, error)
+                if self._keys.pressed.get(key, False):
+                    return 1
+        try:
+            return self._user32.CallNextHookEx(self._hook, code, message, address)
+        except Exception as error:
+            if not self._faulted:
+                self._faulted = True
+                self._notify(False, error)
+            return 0  # Never let a Python exception escape a native callback.
+
+    def stop(self):
+        self._stopping.set()
+        if self._thread is not None and self._thread.is_alive() and self._thread_id and self._user32:
+            try:
+                if not self._user32.PostThreadMessageW(self._thread_id, 0x12, 0, 0):  # WM_QUIT
+                    raise ctypes.WinError()
+            except Exception as error:
+                record_exception(error, "Hotkey shutdown")
+        if self._thread is not None and self._thread.ident is not None:
+            self._thread.join(timeout=2)
+        if self._thread is not None and self._thread.is_alive():
+            # Never free a live C callback. Disable interception even if the
+            # native message thread cannot be stopped normally.
+            try:
+                if self._hook and self._user32.UnhookWindowsHookEx(self._hook):
+                    self._hook = None
+            except Exception as error:
+                record_exception(error, "Hotkey shutdown")
+            if self._hook and self not in _RETAINED_SHORTCUT_HOOKS:
+                _RETAINED_SHORTCUT_HOOKS.append(self)
+            record_exception(RuntimeError("Shortcut hook thread did not stop."), "Hotkey shutdown")
+
+
 
 
 def acquire_single_instance():
@@ -1242,6 +1424,7 @@ class CenteredComboDelegate(QStyledItemDelegate):
 
 
 class SonyRemote(QMainWindow):
+    _shortcut_ready = Signal()
 
     # ----------------------------
     # Initialization
@@ -1296,15 +1479,16 @@ class SonyRemote(QMainWindow):
         self.volume_rate_timer.timeout.connect(self._volume_rate_step)
 
     def _setup_shortcuts(self):
-        # On Windows the native low-level keyboard hook captures shortcuts
-        # reliably. Other platforms use Qt's event filter as a fallback.
-        if sys.platform != "win32":
-            app = QApplication.instance()
-            if app is not None:
-                app.installEventFilter(self)
-
+        # Qt observes focus/modal changes only on Windows; keys stay native.
+        self._shortcut_lock = threading.Lock()
+        self._shortcut_state = (0, False, frozenset(), 0)
+        self._shortcut_refresh_pending = False
+        self._shortcut_queue = deque()
+        self._shortcut_drain_pending = False
         self._keyboard_hook = None
-        self._keyboard_hook_proc = None
+        QApplication.instance().installEventFilter(self)
+        self._shortcut_ready.connect(self._drain_shortcuts, Qt.QueuedConnection)
+        self._publish_shortcut_state()
         if sys.platform == "win32":
             self._install_windows_keyboard_hook()
 
@@ -2030,6 +2214,7 @@ class SonyRemote(QMainWindow):
         # commands disabled even when the rest of the connected UI is active.
         self._update_channel_button_availability(enabled)
         self._update_volume_controls()
+        self._publish_shortcut_state()
 
     def _update_channel_button_availability(self, enabled):
         if not hasattr(self, "channel_buttons"):
@@ -2154,6 +2339,7 @@ class SonyRemote(QMainWindow):
             self._volume_rate_loop_running = False
             self.volume_rate_timer.stop()
         self._amplifier_routed = routed
+        self._publish_shortcut_state()
         self._update_volume_controls()
         if self.config["VolumeControls"]:
             self.update_volume_ui(self.last_volume or {})
@@ -2355,96 +2541,80 @@ class SonyRemote(QMainWindow):
         return True
 
     def _install_windows_keyboard_hook(self):
-        if sys.platform != "win32" or self._keyboard_hook:
+        if self._keyboard_hook is not None:
             return
-
-        self._keyboard_hook_proc = _LowLevelKeyboardProc(
-            self._windows_keyboard_hook
-        )
-        self._keyboard_hook = _user32.SetWindowsHookExW(
-            WH_KEYBOARD_LL,
-            self._keyboard_hook_proc,
-            None,
-            0,
-        )
-        if not self._keyboard_hook:
-            self._keyboard_hook_proc = None
-            raise ctypes.WinError()
+        self._keyboard_hook = _WindowsShortcutHook(self._accept_native_shortcut, self)
+        self._keyboard_hook.changed.connect(self._shortcut_hook_changed)
+        try:
+            self._keyboard_hook.start()
+        except Exception as error:
+            QTimer.singleShot(0, lambda error=error: self._shortcut_hook_changed(False, error))
 
     def _remove_windows_keyboard_hook(self):
-        if sys.platform == "win32" and self._keyboard_hook:
-            _user32.UnhookWindowsHookEx(self._keyboard_hook)
-            self._keyboard_hook = None
-            self._keyboard_hook_proc = None
+        if self._keyboard_hook is not None:
+            self._keyboard_hook.stop()
 
-    def _windows_keyboard_hook(self, n_code, w_param, l_param):
-        if n_code >= 0 and w_param in (WM_KEYDOWN, WM_SYSKEYDOWN):
-            data = ctypes.cast(
-                l_param,
-                ctypes.POINTER(_KBDLLHOOKSTRUCT),
-            ).contents
+    def _shortcut_hook_changed(self, installed, error):
+        if error is not None and not self._shutting_down:
+            record_exception(error, "Windows shortcut hook")
+            self.show_error("Windows keyboard interception is unavailable. Use the remote's buttons.")
 
-            if _user32.GetForegroundWindow() == int(self.winId()):
-                vk = data.vkCode
+    def _publish_shortcut_state(self):
+        if not hasattr(self, "_shortcut_lock"):
+            return
+        window = int(self.winId()) if self.isVisible() and not self.isMinimized() else 0
+        blocked = self._shutting_down or QApplication.activeModalWidget() is not None
+        text_focused = hasattr(self, "text_input") and self.text_input.hasFocus()
+        allowed = {"volume_up", "volume_down", "mute"}
+        if not text_focused:
+            allowed.update(command for command in _SHORTCUT_KEYS.values()
+                           if self.api.resolve_remote_command(command) in self.api.remote_codes)
+        # A deadline is checked in the native thread, independent of GUI timers.
+        owner_deadline = (self.amplifier_client.state_deadline
+                          if self._amplifier_owns_hotkeys() else 0)
+        with self._shortcut_lock:
+            self._shortcut_state = (window, blocked, frozenset(allowed), owner_deadline)
+            if blocked or not window:
+                self._shortcut_queue.clear()
 
-                # Keep ordinary typing/editing untouched while the text box
-                # owns focus. Volume keys remain remote controls, matching the
-                # previous Windows behavior.
-                text_input_focused = (
-                    hasattr(self, "text_input") and self.text_input.hasFocus()
-                )
+    def _refresh_shortcut_state(self):
+        self._shortcut_refresh_pending = False
+        self._publish_shortcut_state()
 
-                if vk in (VK_VOLUME_UP, VK_VOLUME_DOWN, VK_VOLUME_MUTE) and self._amplifier_owns_hotkeys():
-                    return _user32.CallNextHookEx(self._keyboard_hook, n_code, w_param, l_param)
+    def _accept_native_shortcut(self, command, foreground):
+        # No Qt, device requests, or IPC operations in the native callback.
+        with self._shortcut_lock:
+            window, blocked, allowed, owner_deadline = self._shortcut_state
+            if blocked or not window or foreground != window or command not in allowed:
+                return False
+            if command in ("volume_up", "volume_down", "mute") and time.monotonic() < owner_deadline:
+                return False
+            if len(self._shortcut_queue) >= 32:
+                return False
+            self._shortcut_queue.append(command)
+            if not self._shortcut_drain_pending:
+                self._shortcut_drain_pending = True
+                self._shortcut_ready.emit()
+            return True
 
-                if vk == VK_VOLUME_UP:
-                    self.adjust_volume(1)
-                    return 1
-
-                if vk == VK_VOLUME_DOWN:
-                    self.adjust_volume(-1)
-                    return 1
-
-                if vk == VK_VOLUME_MUTE:
-                    self.toggle_mute()
-                    return 1
-
-                if not text_input_focused:
-                    key_map = {
-                        VK_LEFT: "Left",
-                        VK_RIGHT: "Right",
-                        VK_UP: "Up",
-                        VK_DOWN: "Down",
-                        VK_RETURN: "Confirm",
-                        VK_BACK: "Return",
-                        VK_HOME: "Home",
-                        VK_NUMPAD0: "Num0",
-                        VK_NUMPAD1: "Num1",
-                        VK_NUMPAD2: "Num2",
-                        VK_NUMPAD3: "Num3",
-                        VK_NUMPAD4: "Num4",
-                        VK_NUMPAD5: "Num5",
-                        VK_NUMPAD6: "Num6",
-                        VK_NUMPAD7: "Num7",
-                        VK_NUMPAD8: "Num8",
-                        VK_NUMPAD9: "Num9",
-                        VK_ADD: "ChannelUp",
-                        VK_SUBTRACT: "ChannelDown",
-                        VK_MEDIA_PLAY_PAUSE: "PlayPause",
-                        VK_MEDIA_STOP: "Stop",
-                        VK_MEDIA_NEXT_TRACK: "Next",
-                        VK_MEDIA_PREV_TRACK: "Prev",
-                    }
-                    command = key_map.get(vk)
-                    if command is not None and self._dispatch_shortcut(command):
-                        return 1
-
-        return _user32.CallNextHookEx(
-            self._keyboard_hook,
-            n_code,
-            w_param,
-            l_param,
-        )
+    def _drain_shortcuts(self):
+        with self._shortcut_lock:
+            commands = list(self._shortcut_queue)
+            self._shortcut_queue.clear()
+            self._shortcut_drain_pending = False
+        if self._shutting_down or QApplication.activeModalWidget() is not None:
+            return
+        for command in commands:
+            # A command already accepted belongs to this app, even if IPC
+            # ownership changes before its queued GUI delivery.
+            if command == "volume_up":
+                self.adjust_volume(1)
+            elif command == "volume_down":
+                self.adjust_volume(-1)
+            elif command == "mute":
+                self.toggle_mute()
+            else:
+                self._dispatch_shortcut(command)
 
     # ----------------------------
     # Configuration watching and restart
@@ -2589,6 +2759,7 @@ class SonyRemote(QMainWindow):
 
     def _pause_background_work(self):
         self._shutting_down = True
+        self._publish_shortcut_state()
         self.amplifier_client.stop()
         self._worker_generation += 1
         timers = (self.poll_timer, self.volume_rate_timer, self.config_restart_timer)
@@ -2686,6 +2857,12 @@ class SonyRemote(QMainWindow):
         super().mousePressEvent(event)
 
     def eventFilter(self, watched, event):
+        if (hasattr(self, "_shortcut_lock") and event.type() in
+                (QEvent.Show, QEvent.Hide, QEvent.WindowActivate, QEvent.WindowDeactivate,
+                 QEvent.FocusIn, QEvent.FocusOut)):
+            if not self._shortcut_refresh_pending:
+                self._shortcut_refresh_pending = True
+                QTimer.singleShot(0, self._refresh_shortcut_state)
         if sys.platform == "win32":
             return super().eventFilter(watched, event)
 
