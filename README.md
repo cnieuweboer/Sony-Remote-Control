@@ -131,6 +131,30 @@ A routing change cancels pending TV volume rate-limit targets. An already-runnin
 
 The amplifier's reported raw maximum is an API ceiling, not its physical volume limit. This release deliberately uses raw amplifier values directly; it does not normalize to the TV's scale or write a converted value to the TV. Calibration, caps, and alternative volume mappings are reserved for the later calibration/helper step.
 
+## Calibration helper — session and restoration stage
+
+Release `2026.10.18.5` adds exclusive calibration sessions. Update **both** remotes before using `VolumeCalibration.pyw`, available in the Sony Remote repository. The helper is a separate, self-contained PySide6 application and communicates only through generic local IPC endpoints. It does not read either remote's settings or credentials.
+
+During a session, both remotes reuse their existing polling timers at 250 ms, including while hidden. Ordinary controls are disabled and pending volume targets are cleared. Yamaha's Windows hook consumes volume/mute media keys without issuing device commands, so they cannot unmute Windows or change volume during the test. Config-driven restarts wait until the session ends. A socket-owned eight-second lease, renewed by the helper, restores normal polling and controls on release, disconnect, or helper failure. Only the owner can perform calibration operations; API work stays in the existing device workers.
+
+The helper first captures the selected amplifier input through IPC. This stage does not change `AmplifierTVInput`, save a volume mapping, or apply a new routing configuration. Existing routing remains unchanged. The next stage will save the verified input, device pairing, usable range, and mapping in the separate calibration JSON.
+
+### Running the first-stage helper
+
+1. Place `VolumeCalibration.pyw` in a writable folder and run it on Windows with the same Python/PySide6 installation as the remotes.
+2. Start both updated remotes. Select the amplifier input physically connected to the TV, stop other audio playback, and start at a comfortable volume **below** the amplifier's reported API ceiling. TV and amplifier mute should initially agree.
+3. Keep the same Windows output selected and do not use physical device controls during the check. Optionally select a safe TV restore volume no higher than the starting TV volume.
+4. Click **Run muted CEC check**. The helper saves original states before changing anything, mutes Windows and then the TV, verifies both devices report mute, and tests one TV volume step through CEC. It prefers a downward step, using an upward step only at the TV's minimum.
+5. The helper restores TV volume while muted, verifies the corresponding amplifier volume has settled, restores and verifies both device mute states, and restores Windows mute last. **Cancel and restore**, or closing the helper while running, requests this same cleanup rather than terminating its worker.
+
+Each verification allows five seconds for CEC response. A result must remain stable across at least three distinct observations from **both** devices, following at least a one-second settling period. Repeated reads of one snapshot do not count. The helper stops on missing mute propagation, missing volume response, stale/offline devices, a changed amplifier input, or lost session ownership. No sweep or mapping is performed yet.
+
+`VolumeCalibration.json` is generated next to the helper. It is separate from `SonyRemote.json` and contains a versioned `recovery` record plus a `last_session` report. The `calibration` field is reserved for the next-stage mapping; an existing mapping is preserved. Recovery records contain the captured input, configured-device fingerprints, original mute/volume states, Windows endpoint ID, and requested restore volume—never device credentials. Configured-host fingerprints identify the remote configuration, rather than proving a device's hardware serial number.
+
+If restoration cannot be verified, Windows remains muted where possible and the recovery record is retained. Keep devices muted, restore the original amplifier input and Windows output, start both remotes, and click **Recover saved states**. A new test is blocked until recovery succeeds. Do not delete or edit the recovery record to bypass this. Ordinary cancellation and exceptions attempt restoration; killing the helper, remote, or computer can interrupt it. The remote leases still release automatically, while the durable JSON permits a later recovery attempt.
+
+The helper's Windows Core Audio integration uses the standard library's COM bindings; no extra package beyond PySide6 is required. Real Windows audio and physical CEC behavior still need testing on your devices. The helper intentionally fails closed when it cannot verify restoration.
+
 ## Text input
 
 - **Enter** — Sends the text to the TV.

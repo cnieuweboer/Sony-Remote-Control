@@ -1,0 +1,5 @@
+# Per-user calibration data and interrupted-session recovery journal.
+VolumeCalibration.json
+VolumeCalibration.json.tmp
+VolumeCalibration.json.lock
+__pycache__/

@@ -19,7 +19,7 @@ from urllib.error import HTTPError, URLError
 from pathlib import Path
 from xml.sax.saxutils import escape
 from PySide6.QtCore import QEvent, QFileSystemWatcher, QLockFile, QObject, QProcess, QRunnable, Qt, QThreadPool, QTimer, Signal
-from PySide6.QtNetwork import QLocalSocket
+from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtGui import QAction, QColor, QPalette
 from PySide6.QtWidgets import (
     QApplication, QComboBox, QDialogButtonBox, QFrame, QGridLayout, QHBoxLayout, QLabel,
@@ -194,6 +194,139 @@ class AmplifierClient(QObject):
 
 
 # ----------------------------
+# Exclusive calibration sessions (generic role-local protocol)
+# ----------------------------
+
+
+class CalibrationServer(QObject):
+    """A socket-owned, expiring lease. No device I/O in protocol callbacks."""
+
+    def __init__(self, role, snapshot, changed, perform, parent=None):
+        super().__init__(parent)
+        self.snapshot, self.changed, self.perform = snapshot, changed, perform
+        self.owner = None
+        self.token = None
+        self.busy = False
+        self.sockets = {}
+        self.name = IPC_SERVER_NAME.replace(".amplifier.v1.", f".{role}.calibration.v1.")
+        self.lock = QLockFile(str(Path(tempfile.gettempdir()) / (self.name + ".lock")))
+        self.lock.setStaleLockTime(0)
+        self.server = QLocalServer(self)
+        self.server.setSocketOptions(QLocalServer.UserAccessOption)
+        self.server.setMaxPendingConnections(4)
+        self.lease = QTimer(self)
+        self.lease.setSingleShot(True)
+        self.lease.setInterval(8000)
+        self.lease.timeout.connect(self._expire)
+        self.available = self.lock.tryLock(0)
+        if self.available:
+            QLocalServer.removeServer(self.name)
+            self.available = self.server.listen(self.name)
+            if not self.available:
+                self.lock.unlock()
+        self.server.newConnection.connect(self._accept)
+
+    @property
+    def active(self):
+        return self.owner is not None
+
+    def _accept(self):
+        while self.server.hasPendingConnections():
+            socket = self.server.nextPendingConnection()
+            if len(self.sockets) >= 4:
+                socket.abort()
+                socket.deleteLater()
+                continue
+            socket.setReadBufferSize(IPC_MAX_FRAME + 1)
+            self.sockets[socket] = bytearray()
+            socket.readyRead.connect(lambda socket=socket: self._read(socket))
+            socket.disconnected.connect(lambda socket=socket: self._lost(socket))
+            self._send(socket, self.snapshot())
+
+    def _send(self, socket, message):
+        if socket not in self.sockets:
+            return
+        if socket.bytesToWrite() > IPC_MAX_FRAME * 4:
+            socket.abort()
+        else:
+            socket.write(_ipc_encode(message))
+
+    def _reply(self, socket, request_id, ok, error=""):
+        self._send(socket, {"version": 1, "type": "result", "id": request_id,
+                            "ok": bool(ok), "error": str(error)[:200]})
+
+    def _read(self, socket):
+        try:
+            for message in _ipc_frames(socket, self.sockets[socket]):
+                request_id, action, token = (message.get(key) for key in ("id", "action", "token"))
+                if (message.get("type") != "calibration" or type(request_id) is not int
+                        or not isinstance(action, str) or not isinstance(token, str)
+                        or not 16 <= len(token) <= 80 or not isinstance(message.get("args", {}), dict)):
+                    raise ValueError("Invalid calibration request")
+                if action == "acquire":
+                    if self.active:
+                        self._reply(socket, request_id, False, "Another calibration session is active.")
+                        continue
+                    self.owner, self.token = socket, token
+                    self.lease.start()
+                    self.changed(True)
+                elif socket is not self.owner or token != self.token:
+                    self._reply(socket, request_id, False, "Calibration session is not owned by this connection.")
+                    continue
+                if action == "renew":
+                    self.lease.start()
+                    self._reply(socket, request_id, True)
+                    continue
+                if action == "release":
+                    if self.busy:
+                        self._reply(socket, request_id, False, "A device operation is still running.")
+                    else:
+                        self._expire()
+                        self._reply(socket, request_id, True)
+                    continue
+                if self.busy:
+                    self._reply(socket, request_id, False, "A device operation is still running.")
+                    continue
+                self.busy = True
+                def done(ok, error="", socket=socket, request_id=request_id, token=token, action=action):
+                    if socket is self.owner and token == self.token:
+                        self.busy = False
+                        self._reply(socket, request_id, ok, error)
+                        if action == "acquire" and not ok:
+                            self._expire()
+                self.perform(action, message.get("args", {}), done)
+        except (ValueError, UnicodeError, KeyError):
+            socket.abort()
+
+    def publish(self):
+        state = self.snapshot()
+        for socket in list(self.sockets):
+            self._send(socket, state)
+
+    def _expire(self):
+        was_active = self.active
+        self.owner = self.token = None
+        self.busy = False
+        self.lease.stop()
+        if was_active:
+            self.changed(False)
+
+    def _lost(self, socket):
+        if socket is self.owner:
+            self._expire()
+        if socket in self.sockets:
+            del self.sockets[socket]
+            socket.deleteLater()
+
+    def close(self):
+        self._expire()
+        for socket in list(self.sockets):
+            socket.abort()
+        self.server.close()
+        self.lock.unlock()
+
+
+# ----------------------------
 # Application constants
 # ----------------------------
 
@@ -201,7 +334,7 @@ class AmplifierClient(QObject):
 APP_NAME = "Sony Remote"
 
 
-__version__ = "2026.10.18.3"
+__version__ = "2026.10.18.5"
 
 
 CONFIG_PATH = Path(__file__).with_name("SonyRemote.json")
@@ -1433,6 +1566,11 @@ class SonyRemote(QMainWindow):
     def __init__(self, config):
         super().__init__()
         self.config = config
+        self.calibration_active = False
+        self._calibration_operation = False
+        self._status_sequence = 0
+        self._status_observed_at = 0
+        self.calibration_server = None
         self.mica_enabled = bool(config["Mica"] and supports_mica())
         self.api = SonyApi(config["Host"], config["PreSharedKey"], timeout=NETWORK_TIMEOUT_SECONDS)
         self.pool = QThreadPool(self)
@@ -1465,9 +1603,84 @@ class SonyRemote(QMainWindow):
         self._setup_config_watcher()
         self._setup_tray()
         self._setup_shortcuts()
+        self._setup_calibration()
         self.set_controls_enabled(False)
         self.amplifier_client.start()
         QTimer.singleShot(0, self.initialize)
+
+    def _setup_calibration(self):
+        if self.calibration_server is not None:
+            self.calibration_server.deleteLater()
+        self.calibration_server = CalibrationServer(
+            "tv", self._calibration_snapshot, self._calibration_changed,
+            self._calibration_perform, self,
+        )
+
+    def _calibration_snapshot(self):
+        volume = self.last_volume or {}
+        age = time.monotonic() - self._status_observed_at
+        state = {"version": 1, "type": "state", "role": "tv",
+                 "online": self.last_power is not None, "power": self.last_power,
+                 "volume": volume.get("volume"), "mute": volume.get("mute"),
+                 "minimum": volume.get("minVolume"), "maximum": volume.get("maxVolume"),
+                 "sample_id": self._status_sequence,
+                 "valid_for_ms": max(0, min(6000, int((6 - age) * 1000)))}
+        state.update(calibration_active=self.calibration_active,
+                     device_id=hashlib.sha256(self.config["Host"].casefold().encode()).hexdigest())
+        return state
+
+    def _calibration_changed(self, active):
+        self.calibration_active = active
+        self.setEnabled(not active)
+        self.poll_timer.setInterval(250 if active else POLL_INTERVAL_MS)
+        self._desired_volume = None
+        self._volume_rate_loop_running = False
+        self.volume_rate_timer.stop()
+        self._publish_shortcut_state()
+        self._update_polling_state(refresh=True)
+
+    def _calibration_perform(self, action, args, done):
+        if self._shutting_down or missing_config_settings(self.config):
+            done(False, "Device configuration is missing or the app is shutting down.")
+            return
+        if action not in ("acquire", "set_mute", "set_volume"):
+            done(False, "Unsupported calibration operation.")
+            return
+        if action == "set_mute" and type(args.get("value")) is not bool:
+            done(False, "Mute must be true or false.")
+            return
+        if action == "set_volume":
+            info = self.last_volume or {}
+            value = args.get("value")
+            if (type(value) is not int or type(info.get("minVolume")) is not int
+                    or type(info.get("maxVolume")) is not int
+                    or not info["minVolume"] <= value <= info["maxVolume"]):
+                done(False, "Volume is outside the TV's reported range.")
+                return
+        self._calibration_operation = True
+        token = self.calibration_server.token
+        deadline = time.monotonic() + 5
+        def finish(ok, error=""):
+            self._calibration_operation = False
+            done(ok, error)
+            self._update_polling_state(refresh=True)
+        def ready():
+            if self._shutting_down or self.calibration_server.token != token:
+                finish(False, "Calibration session ended.")
+                return
+            if self._workers or self.pool.activeThreadCount():
+                if time.monotonic() >= deadline:
+                    finish(False, "Device requests did not finish in time.")
+                else:
+                    QTimer.singleShot(25, ready)
+                return
+            if action == "acquire":
+                finish(True)
+                return
+            function = (lambda: self.api.set_mute(args["value"])) if action == "set_mute" else (lambda: self.api.set_volume(args["value"]))
+            self.run_worker(function, on_result=lambda _: finish(True),
+                            on_error=lambda error: finish(False, f"{type(error).__name__}: {error}"))
+        ready()
 
     def _setup_timers(self):
         self.poll_timer = QTimer(self)
@@ -2099,8 +2312,8 @@ class SonyRemote(QMainWindow):
         self.input_combo.blockSignals(False)
 
     def poll_status(self):
-        if (self._shutting_down or missing_config_settings(self.config)
-                or not self.isVisible() or self.isMinimized()):
+        if (self._shutting_down or self._calibration_operation or missing_config_settings(self.config)
+                or (not self.calibration_active and (not self.isVisible() or self.isMinimized()))):
             return
         if self.poll_running:
             return
@@ -2109,16 +2322,19 @@ class SonyRemote(QMainWindow):
         def query():
             power = self.api.get_power()
             data = {"power": power}
-            if power == "active" and self.config["VolumeControls"]:
+            if power == "active" and (self.config["VolumeControls"] or self.calibration_active):
                 data["volume"] = self.api.get_volume()
             if power == "active" and self.config["InputControls"]:
                 try:
                     data["inputs"] = self.api.get_inputs()
                 except Exception as error:
                     record_unexpected_exception(error, "Optional input status", background=True)
+            data["observed_at"] = time.monotonic()
             return data
 
         def done(data):
+            self._status_sequence += 1
+            self._status_observed_at = data["observed_at"]
             self.power_button.setToolTip("")
             self.last_power = data.get("power")
 
@@ -2139,7 +2355,10 @@ class SonyRemote(QMainWindow):
                 self.last_volume = data["volume"]
                 if not self._volume_rate_loop_running:
                     self._desired_volume = None
-                    self.update_volume_ui(self.last_volume)
+                    if self.config["VolumeControls"]:
+                        self.update_volume_ui(self.last_volume)
+            if self.calibration_server is not None:
+                self.calibration_server.publish()
             if "inputs" in data:
                 self.update_active_input(data["inputs"])
 
@@ -2153,7 +2372,7 @@ class SonyRemote(QMainWindow):
             return
 
         should_poll = (
-            self.isVisible() and not self.isMinimized()
+            (self.calibration_active or (self.isVisible() and not self.isMinimized()))
             and not missing_config_settings(self.config)
         )
 
@@ -2304,6 +2523,8 @@ class SonyRemote(QMainWindow):
     # ----------------------------
 
     def toggle_power(self):
+        if self.calibration_active or (self.amplifier_state or {}).get("calibration_active", False):
+            return
         turn_on = self.last_power != "active"
         self.power_button.setEnabled(False)
         self.run_worker(
@@ -2358,6 +2579,8 @@ class SonyRemote(QMainWindow):
         return True
 
     def toggle_mute(self):
+        if self.calibration_active or (self.amplifier_state or {}).get("calibration_active", False):
+            return
         if self._route_volume_command("mute"):
             return
         if not self.last_volume:
@@ -2366,6 +2589,8 @@ class SonyRemote(QMainWindow):
         self.run_worker(lambda: self.api.set_mute(target), on_finished=lambda: QTimer.singleShot(200, self.poll_status))
 
     def adjust_volume(self, amount):
+        if self.calibration_active or (self.amplifier_state or {}).get("calibration_active", False):
+            return
         if self._route_volume_command("volume_up" if amount > 0 else "volume_down"):
             return
         if not self.last_volume:
@@ -2458,6 +2683,8 @@ class SonyRemote(QMainWindow):
             self.app_combo.setCurrentIndex(-1)
 
     def launch_app(self, uri):
+        if self.calibration_active or (self.amplifier_state or {}).get("calibration_active", False):
+            return
         self.run_worker(lambda: self.api.launch_app(uri), on_finished=lambda: QTimer.singleShot(300, self.poll_status))
 
     def select_input(self, index):
@@ -2466,12 +2693,18 @@ class SonyRemote(QMainWindow):
             self.set_input(uri)
 
     def set_input(self, uri):
+        if self.calibration_active or (self.amplifier_state or {}).get("calibration_active", False):
+            return
         self.run_worker(lambda: self.api.set_input(uri), on_finished=lambda: QTimer.singleShot(300, self.poll_status))
 
     def send_ircc(self, command):
+        if self.calibration_active or (self.amplifier_state or {}).get("calibration_active", False):
+            return
         self.run_worker(lambda: self.api.ircc(command))
 
     def send_text_input(self):
+        if self.calibration_active or (self.amplifier_state or {}).get("calibration_active", False):
+            return
         if not hasattr(self, "text_input"):
             return
 
@@ -2487,6 +2720,8 @@ class SonyRemote(QMainWindow):
         )
 
     def send_text_input_and_confirm(self):
+        if self.calibration_active or (self.amplifier_state or {}).get("calibration_active", False):
+            return
         if not hasattr(self, "text_input"):
             return
 
@@ -2563,7 +2798,9 @@ class SonyRemote(QMainWindow):
         if not hasattr(self, "_shortcut_lock"):
             return
         window = int(self.winId()) if self.isVisible() and not self.isMinimized() else 0
-        blocked = self._shutting_down or QApplication.activeModalWidget() is not None
+        blocked = (self._shutting_down or self.calibration_active
+                   or (self.amplifier_state or {}).get("calibration_active", False)
+                   or QApplication.activeModalWidget() is not None)
         text_focused = hasattr(self, "text_input") and self.text_input.hasFocus()
         allowed = {"volume_up", "volume_down", "mute"}
         if not text_focused:
@@ -2653,6 +2890,9 @@ class SonyRemote(QMainWindow):
         self.config_restart_timer.start()
 
     def _check_external_config_change(self):
+        if self.calibration_active:
+            self.config_restart_timer.start(1000)
+            return
         if self._shutting_down or self._config_restart_pending:
             return
 
@@ -2688,6 +2928,10 @@ class SonyRemote(QMainWindow):
         self._watch_config_paths()
 
     def _restart_for_config_change(self):
+        if self.calibration_active:
+            self._config_restart_pending = False
+            self.config_restart_timer.start(1000)
+            return
         if self._shutting_down or self._config_restart_pending:
             return
         self._config_restart_pending = True
@@ -2759,6 +3003,8 @@ class SonyRemote(QMainWindow):
 
     def _pause_background_work(self):
         self._shutting_down = True
+        if self.calibration_server is not None:
+            self.calibration_server.close()
         self._publish_shortcut_state()
         self.amplifier_client.stop()
         self._worker_generation += 1
@@ -2777,6 +3023,7 @@ class SonyRemote(QMainWindow):
 
     def _resume_background_work(self, active_timers):
         self._shutting_down = False
+        self._setup_calibration()
         self.amplifier_client.start()
         self._config_restart_pending = False
         self.config_watcher.blockSignals(False)
