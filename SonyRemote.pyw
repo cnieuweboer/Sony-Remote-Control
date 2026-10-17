@@ -5,6 +5,7 @@ import hashlib
 import html
 import ipaddress
 import json
+import math
 import os
 import re
 import sys
@@ -17,6 +18,7 @@ from urllib.error import HTTPError, URLError
 from pathlib import Path
 from xml.sax.saxutils import escape
 from PySide6.QtCore import QEvent, QFileSystemWatcher, QLockFile, QObject, QProcess, QRunnable, Qt, QThreadPool, QTimer, Signal
+from PySide6.QtNetwork import QLocalSocket
 from PySide6.QtGui import QAction, QColor, QPalette
 from PySide6.QtWidgets import (
     QApplication, QComboBox, QDialogButtonBox, QFrame, QGridLayout, QHBoxLayout, QLabel,
@@ -27,6 +29,170 @@ from PySide6.QtWidgets import (
 
 
 # ----------------------------
+# Local amplifier protocol (newline-delimited JSON, version 1)
+# ----------------------------
+
+
+IPC_SERVER_NAME = "remote-control.amplifier.v1." + hashlib.sha256(
+    str(Path.home()).encode("utf-8")
+).hexdigest()[:16]
+IPC_MAX_FRAME = 4096
+
+
+def _ipc_encode(message):
+    return (json.dumps(message, allow_nan=False, separators=(",", ":")) + "\n").encode("utf-8")
+
+
+def _ipc_frames(socket, buffer):
+    # Bound reads even if another local process sends an oversized frame.
+    buffer.extend(bytes(socket.read(IPC_MAX_FRAME + 1)))
+    messages = []
+    while b"\n" in buffer:
+        frame, _, tail = buffer.partition(b"\n")
+        buffer[:] = tail
+        if len(frame) > IPC_MAX_FRAME:
+            raise ValueError("Local protocol frame too large")
+        try:
+            message = json.loads(frame)
+        except RecursionError as error:
+            raise ValueError("Local protocol nesting too deep") from error
+        if (not isinstance(message, dict) or type(message.get("version")) is not int
+                or message["version"] != 1):
+            raise ValueError("Unsupported local protocol message")
+        messages.append(message)
+    if len(buffer) > IPC_MAX_FRAME:
+        raise ValueError("Local protocol frame too large")
+    return messages
+
+
+class AmplifierClient(QObject):
+    state_changed = Signal(object)
+    command_failed = Signal(str)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.socket = QLocalSocket(self)
+        self.socket.setReadBufferSize(IPC_MAX_FRAME + 1)
+        self.buffer = bytearray()
+        self.state = None
+        self.state_deadline = 0
+        self.sequence = 0
+        self.pending = {}
+        self.stopped = True
+        self.retry = QTimer(self)
+        self.retry.setSingleShot(True)
+        self.retry.setInterval(2000)
+        self.retry.timeout.connect(self._connect)
+        self.lease = QTimer(self)
+        self.lease.setSingleShot(True)
+        self.lease.timeout.connect(self._expire)
+        self.socket.readyRead.connect(self._read)
+        self.socket.disconnected.connect(self._lost)
+        self.socket.errorOccurred.connect(lambda _error: self._lost())
+
+    def start(self):
+        self.stopped = False
+        self._connect()
+
+    def _connect(self):
+        if not self.stopped and self.socket.state() == QLocalSocket.UnconnectedState:
+            self.socket.connectToServer(IPC_SERVER_NAME)
+
+    @property
+    def state_is_fresh(self):
+        return self.state is not None and time.monotonic() < self.state_deadline
+
+    def _expire(self):
+        self.state_deadline = 0
+        self.state = None
+        self.state_changed.emit(None)
+
+    def _lost(self):
+        self.lease.stop()
+        self.buffer.clear()
+        self._expire()
+        for timer in self.pending.values():
+            timer.stop()
+            timer.deleteLater()
+        had_pending = bool(self.pending)
+        self.pending.clear()
+        if had_pending and not self.stopped:
+            self.command_failed.emit("Amplifier connection lost. Command was not retried.")
+        if not self.stopped and not self.retry.isActive():
+            self.retry.start()
+
+    def _read(self):
+        try:
+            for message in _ipc_frames(self.socket, self.buffer):
+                if message.get("type") == "state":
+                    self._validate_state(message)
+                    self.state = message
+                    self.state_deadline = time.monotonic() + message["valid_for_ms"] / 1000
+                    self.lease.start(max(1, message["valid_for_ms"]))
+                    self.state_changed.emit(message)
+                elif message.get("type") == "ack":
+                    if type(message.get("id")) is not int or type(message.get("accepted")) is not bool:
+                        raise ValueError("Invalid command acknowledgement")
+                    timer = self.pending.pop(message["id"], None)
+                    if timer is not None:
+                        timer.stop()
+                        timer.deleteLater()
+                        if not message["accepted"]:
+                            self.command_failed.emit("Amplifier command rejected; state changed or command queue is full.")
+                else:
+                    raise ValueError("Unknown local message")
+        except (ValueError, UnicodeError, TypeError, OverflowError):
+            self.socket.abort()
+            self._lost()
+
+    @staticmethod
+    def _validate_state(message):
+        required = {"online", "power", "input", "raw_volume", "raw_max_volume", "mute",
+                    "global_hotkeys_enabled", "global_hotkeys_active", "valid_for_ms"}
+        if (not required <= message.keys() or type(message.get("valid_for_ms")) is not int
+                or not 0 <= message["valid_for_ms"] <= 6000
+                or any(type(message.get(key)) is not bool for key in
+                       ("online", "global_hotkeys_enabled", "global_hotkeys_active"))
+                or message.get("power") not in (None, "on", "standby")
+                or not isinstance(message.get("input"), (str, type(None)))
+                or not isinstance(message.get("mute"), (bool, type(None)))):
+            raise ValueError("Invalid amplifier state")
+        for key in ("raw_volume", "raw_max_volume"):
+            value = message.get(key)
+            if value is not None and (type(value) not in (int, float) or not math.isfinite(value)):
+                raise ValueError("Invalid raw volume")
+
+    def send_command(self, command, input_id):
+        # Never replay a non-idempotent volume command or fall back on ambiguity.
+        if self.stopped or not self.state_is_fresh or len(self.pending) >= 8:
+            return False
+        if self.socket.state() != QLocalSocket.ConnectedState:
+            return False
+        self.sequence += 1
+        request_id = self.sequence
+        payload = _ipc_encode({"version": 1, "type": "command", "id": request_id,
+                               "command": command, "input": input_id})
+        if self.socket.bytesToWrite() > IPC_MAX_FRAME * 4 or self.socket.write(payload) != len(payload):
+            return False
+        timer = QTimer(self)
+        timer.setSingleShot(True)
+        def expired():
+            self.pending.pop(request_id, None)
+            timer.deleteLater()
+            self.command_failed.emit("Amplifier command acknowledgement timed out. Command was not retried.")
+        timer.timeout.connect(expired)
+        self.pending[request_id] = timer
+        timer.start(2500)
+        return True
+
+    def stop(self):
+        self.stopped = True
+        self.retry.stop()
+        self.socket.abort()
+        self._lost()
+
+
+# ----------------------------
 # Application constants
 # ----------------------------
 
@@ -34,7 +200,7 @@ from PySide6.QtWidgets import (
 APP_NAME = "Sony Remote"
 
 
-__version__ = "2026.10.17.7"
+__version__ = "2026.10.18.2"
 
 
 CONFIG_PATH = Path(__file__).with_name("SonyRemote.json")
@@ -89,6 +255,7 @@ DEFAULT_CONFIG = {
     "NavigationControls": True,
     "PlaybackControls": True,
     "VolumeControls": True,
+    "AmplifierTVInput": "",
     "VolumeRateLimit": {
         "Active": True,
         "RateMs": 500,
@@ -300,6 +467,10 @@ def validate_config(raw_config, *, allow_incomplete=False):
         raise ConfigError('"CloseToTray" can only be true when "SystemTray" is also true.')
     for key in ("Apps", "Inputs"):
         config[key] = _validate_entries(config[key], key)
+
+    if not isinstance(config["AmplifierTVInput"], str):
+        raise ConfigError('"AmplifierTVInput" must be a string (the amplifier input ID, or empty to disable routing).')
+    config["AmplifierTVInput"] = config["AmplifierTVInput"].strip()
 
     rate_limit = config["VolumeRateLimit"]
     if not isinstance(rate_limit, dict):
@@ -1100,6 +1271,11 @@ class SonyRemote(QMainWindow):
         self._volume_rate_loop_running = False
         self._volume_rate_step_running = False
 
+        self.amplifier_state = None
+        self._amplifier_routed = False
+        self.amplifier_client = AmplifierClient(self)
+        self.amplifier_client.state_changed.connect(self._amplifier_state_changed)
+        self.amplifier_client.command_failed.connect(self.show_error)
         self._build_ui()
         self._apply_style()
         self._setup_timers()
@@ -1107,6 +1283,7 @@ class SonyRemote(QMainWindow):
         self._setup_tray()
         self._setup_shortcuts()
         self.set_controls_enabled(False)
+        self.amplifier_client.start()
         QTimer.singleShot(0, self.initialize)
 
     def _setup_timers(self):
@@ -1852,6 +2029,7 @@ class SonyRemote(QMainWindow):
         # Channel commands vary between Sony models/regions. Keep unsupported
         # commands disabled even when the rest of the connected UI is active.
         self._update_channel_button_availability(enabled)
+        self._update_volume_controls()
 
     def _update_channel_button_availability(self, enabled):
         if not hasattr(self, "channel_buttons"):
@@ -1903,7 +2081,7 @@ class SonyRemote(QMainWindow):
         self.power_button.setText("Offline")
         self.set_controls_enabled(False, power_enabled=False, app_enabled=False)
         if self.config["VolumeControls"]:
-            self.volume_value.setText("—")
+            self.update_volume_ui({})
 
     def set_error_status(self):
         self.set_offline()
@@ -1916,6 +2094,11 @@ class SonyRemote(QMainWindow):
             self.power_button.setText("Power On")
 
     def update_volume_ui(self, volume):
+        if self._use_amplifier():
+            volume = {"volume": self.amplifier_state["raw_volume"], "mute": self.amplifier_state["mute"]}
+            self.volume_value.setToolTip("Amplifier raw volume (TV-scale calibration is not configured)")
+        else:
+            self.volume_value.setToolTip("TV volume")
         self.volume_value.setText(str(volume.get("volume", "—")))
         self.mute_button.setText("Unmute" if volume.get("mute") else "Mute")
 
@@ -1946,13 +2129,59 @@ class SonyRemote(QMainWindow):
             ),
         )
 
+    def _use_amplifier(self):
+        state = self.amplifier_state
+        return bool(not self._shutting_down and state and self.amplifier_client.state_is_fresh
+                    and self.config["AmplifierTVInput"]
+                    and state["online"] and state["power"] == "on" and state["valid_for_ms"] > 0
+                    and state["input"] == self.config["AmplifierTVInput"]
+                    and state["raw_volume"] is not None and type(state["mute"]) is bool)
+
+    def _amplifier_owns_hotkeys(self):
+        # Ownership is independent of the TV input: a functioning global hook
+        # must receive the key even while the amplifier uses a PC input.
+        return bool(not self._shutting_down and self.amplifier_state
+                    and self.amplifier_client.state_is_fresh
+                    and self.amplifier_state["online"] and self.amplifier_state["power"] == "on"
+                    and self.amplifier_state["valid_for_ms"] > 0
+                    and self.amplifier_state["global_hotkeys_active"])
+
+    def _amplifier_state_changed(self, state):
+        self.amplifier_state = state
+        routed = self._use_amplifier()
+        if routed != self._amplifier_routed:
+            self._desired_volume = None
+            self._volume_rate_loop_running = False
+            self.volume_rate_timer.stop()
+        self._amplifier_routed = routed
+        self._update_volume_controls()
+        if self.config["VolumeControls"]:
+            self.update_volume_ui(self.last_volume or {})
+
+    def _update_volume_controls(self):
+        if self.config["VolumeControls"]:
+            enabled = not self._shutting_down and (self._use_amplifier() or (self.initialized and self.last_power == "active"))
+            for widget in (self.volume_up, self.volume_down, self.mute_button):
+                widget.setEnabled(enabled)
+
+    def _route_volume_command(self, command):
+        if not self._use_amplifier():
+            return False
+        if not self.amplifier_client.send_command(command, self.config["AmplifierTVInput"]):
+            self.show_error("Amplifier command could not be queued. Command was not sent to the TV.")
+        return True
+
     def toggle_mute(self):
+        if self._route_volume_command("mute"):
+            return
         if not self.last_volume:
             return
         target = not bool(self.last_volume.get("mute"))
         self.run_worker(lambda: self.api.set_mute(target), on_finished=lambda: QTimer.singleShot(200, self.poll_status))
 
     def adjust_volume(self, amount):
+        if self._route_volume_command("volume_up" if amount > 0 else "volume_down"):
+            return
         if not self.last_volume:
             return
 
@@ -1992,6 +2221,7 @@ class SonyRemote(QMainWindow):
     def _volume_rate_step(self):
         if (
             self._shutting_down
+            or self._use_amplifier()
             or not self._volume_rate_loop_running
             or self._volume_rate_step_running
             or self._desired_volume is None
@@ -2012,6 +2242,8 @@ class SonyRemote(QMainWindow):
 
         def done(result):
             self._volume_rate_step_running = False
+            if self._use_amplifier():
+                return
             info = result.get("info")
             if info:
                 self.last_volume = info
@@ -2161,6 +2393,9 @@ class SonyRemote(QMainWindow):
                 text_input_focused = (
                     hasattr(self, "text_input") and self.text_input.hasFocus()
                 )
+
+                if vk in (VK_VOLUME_UP, VK_VOLUME_DOWN, VK_VOLUME_MUTE) and self._amplifier_owns_hotkeys():
+                    return _user32.CallNextHookEx(self._keyboard_hook, n_code, w_param, l_param)
 
                 if vk == VK_VOLUME_UP:
                     self.adjust_volume(1)
@@ -2354,6 +2589,7 @@ class SonyRemote(QMainWindow):
 
     def _pause_background_work(self):
         self._shutting_down = True
+        self.amplifier_client.stop()
         self._worker_generation += 1
         timers = (self.poll_timer, self.volume_rate_timer, self.config_restart_timer)
         active_timers = [timer for timer in timers if timer.isActive()]
@@ -2370,6 +2606,7 @@ class SonyRemote(QMainWindow):
 
     def _resume_background_work(self, active_timers):
         self._shutting_down = False
+        self.amplifier_client.start()
         self._config_restart_pending = False
         self.config_watcher.blockSignals(False)
         self._config_path_changed(str(CONFIG_PATH))
@@ -2454,6 +2691,18 @@ class SonyRemote(QMainWindow):
 
         if event.type() != QEvent.KeyPress or not self.isActiveWindow():
             return super().eventFilter(watched, event)
+
+        volume_keys = (Qt.Key_VolumeUp, Qt.Key_VolumeDown, Qt.Key_VolumeMute)
+        if event.key() in volume_keys:
+            if self._amplifier_owns_hotkeys():
+                return super().eventFilter(watched, event)
+            if event.key() == Qt.Key_VolumeMute:
+                if not event.isAutoRepeat():
+                    self.toggle_mute()
+            else:
+                self.adjust_volume(1 if event.key() == Qt.Key_VolumeUp else -1)
+            event.accept()
+            return True
 
         # Keep normal editing behavior while Text Input owns keyboard focus.
         if hasattr(self, "text_input") and self.text_input.hasFocus():

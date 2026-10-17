@@ -61,6 +61,7 @@ Set:
   "NavigationControls": true,
   "InputControls": false,
   "VolumeControls": true,
+  "AmplifierTVInput": "",
   "PlaybackControls": true,
   "DiagnosticsEnabled": false,
   "SortByName": false,
@@ -83,6 +84,7 @@ Set:
 - `InputControls` — show the input selector and favorite input buttons.
 - `VolumeControls` — show volume and mute controls.
 - `PlaybackControls` — show media playback controls.
+- `AmplifierTVInput` — empty by default, which disables amplifier routing. Set the exact amplifier input ID used by the TV (for example `hdmi1`, `optical1`, or `tv`). Use the input ID, not its display name.
 - `DiagnosticsEnabled` — `false` by default. Set to `true` to append unexpected errors and crash diagnostics to `SonyRemote-crash.log` beside the script. Logs contain the app version, exception types, and stack locations; exception messages, source lines, request data, and local variable values are omitted. If the log cannot be opened or written, the app continues without logging.
 - `SortByName` — `false` (default) keeps favorites and dropdown entries in JSON insertion order; `true` sorts them alphabetically by `NameOverride`, falling back to `Name`, ignoring case. Apps and inputs are ordered separately.
 - `Apps` — settings for applications discovered from the Sony TV.
@@ -106,6 +108,20 @@ The app automatically restarts when it detects that `SonyRemote.json` has change
 Only one instance of SonyRemote can run at a time.
 
 Regular status polling pauses while the window is hidden or minimized and refreshes immediately when restored. Active requests finish normally; configuration file watching remains enabled.
+
+## Local amplifier routing
+
+Version `2026.10.18.2` can cooperate with Yamaha Remote of the same version over a user-local Qt socket. Both apps remain self-contained; neither reads the other's JSON. No additional dependencies are needed.
+
+Set, for example, `"AmplifierTVInput": "hdmi1"` in `SonyRemote.json`. Use the corresponding key from Yamaha Remote's `Inputs` setting, not a `NameOverride`. While the amplifier is reachable, on, and using that input, Sony's volume/mute buttons and focused volume keys send commands directly to it. While routing, the volume number and mute label follow the amplifier's published raw state, including changes made directly through Yamaha Remote. The number's tooltip identifies the amplifier source. The TV's own stored volume remains separate.
+
+Standby, another amplifier input, offline state, a disconnected socket, or expired status automatically restores ordinary TV volume control. When Yamaha's global volume hook is actually active, Sony passes its focused volume/mute keys through so Yamaha handles each press. This hotkey ownership applies on every amplifier input, independently of whether Sony's volume buttons route to it. Disabling global hotkeys, losing the connection, or losing valid ownership restores Sony's focused shortcuts. Other shortcuts retain their existing behavior.
+
+Connection attempts are asynchronous and silent when no amplifier app is running. A two-second reconnect timer runs only while disconnected; no periodic IPC state requests are sent. Connected clients receive state updates from existing device polls and state events. A freshness deadline prevents continued use of stale state if the amplifier app stops responding. If Sony starts first, routing becomes available automatically after the amplifier app starts.
+
+A routing change cancels pending TV volume rate-limit targets. An already-running TV request may still finish. Amplifier commands use its existing serialized worker and bounded queue, bypassing Sony's TV/CEC rate limiter. Rejected commands and acknowledgement failures are reported without retrying against either device, because a retry could apply a volume step twice. Acknowledgements confirm queue acceptance rather than completed device execution.
+
+The amplifier's reported raw maximum is an API ceiling, not its physical volume limit. This release deliberately uses raw amplifier values directly; it does not normalize to the TV's scale or write a converted value to the TV. Calibration, caps, and alternative volume mappings are reserved for the later calibration/helper step.
 
 ## Text input
 

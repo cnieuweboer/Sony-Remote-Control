@@ -28,5 +28,6 @@
   "Inputs": {},
   "SystemTray": false,
   "CloseToTray": false,
-  "DropdownAnimationWorkaround": true
+  "DropdownAnimationWorkaround": true,
+  "AmplifierTVInput": ""
 }
