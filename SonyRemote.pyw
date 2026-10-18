@@ -29,6 +29,10 @@ from PySide6.QtWidgets import (
 )
 
 
+# Device requests connect directly; never forward LAN traffic or credentials to a proxy.
+DEVICE_HTTP_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
 # ----------------------------
 # Local amplifier protocol (newline-delimited JSON, version 1)
 # ----------------------------
@@ -345,7 +349,7 @@ class CalibrationServer(QObject):
 APP_NAME = "Sony Remote"
 
 
-__version__ = "2026.10.18.27"
+__version__ = "2026.10.18.28"
 
 
 CONFIG_PATH = Path(__file__).with_name("SonyRemote.json")
@@ -1314,7 +1318,7 @@ class SonyApi:
 
     def _read_response(self, request):
         try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+            with DEVICE_HTTP_OPENER.open(request, timeout=self.timeout) as response:
                 return response.read()
         except HTTPError as ex:
             raise DeviceResponseError(f"Sony returned HTTP {ex.code}.") from ex

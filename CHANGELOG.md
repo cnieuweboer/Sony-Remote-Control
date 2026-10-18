@@ -4,6 +4,8 @@ Release identifiers below come from the corresponding commits. Some releases upd
 
 ## 2026-10-18
 
+- 2026.10.18.28 — Bypass system/environment proxies for device requests using a dedicated direct-connection opener.
+
 - 2026.10.18.27 — Reject invalid numeric IP-like hosts during configuration validation; correct the Sony sample address.
 
 - 2026.10.18.26 — Silently drop amplifier IPC queue overflow and report other IPC failures non-modally. Update both remotes together.
