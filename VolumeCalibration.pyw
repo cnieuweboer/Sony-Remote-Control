@@ -17,7 +17,7 @@ from PySide6.QtWidgets import (
     QProgressBar, QTextEdit, QVBoxLayout, QWidget,
 )
 
-__version__ = "2026.10.18.35"
+__version__ = "2026.10.19.5"
 DATA_PATH = Path(__file__).resolve().with_name("VolumeCalibration.json")
 IPC_USER_SUFFIX = hashlib.sha256(str(Path.home()).encode("utf-8")).hexdigest()[:16]
 
@@ -173,6 +173,7 @@ def build_canonical_mapping(observations, checks, saved, ceiling, top, tv_min):
     measured = {raw: min(levels) for raw, levels in candidates.items()}
     rounding = {"nearest-half-up": lambda x: math.floor(x + 0.5),
                 "floor": math.floor, "ceil": math.ceil}
+    gap_rounding = {}
     lookup = []
     for raw in range(top + 1):
         if raw in measured:
@@ -184,18 +185,23 @@ def build_canonical_mapping(observations, checks, saved, ceiling, top, tv_min):
         else:
             lower = max(value for value in known if value < raw)
             upper = min(value for value in known if value > raw)
-            # Select rounding from nearby measured transitions using held-out
-            # middle observations. Ties use nearest-half-up deterministically.
-            triples = list(zip(known, known[1:], known[2:]))
-            triples.sort(key=lambda triple: abs(triple[1] - raw))
-            scores = {}
-            for name, rule in rounding.items():
-                errors = []
-                for a, b, c in triples[:8]:
-                    predicted = measured[a] + (measured[c] - measured[a]) * (b - a) / (c - a)
-                    errors.append(abs(rule(predicted) - measured[b]))
-                scores[name] = sum(errors) / len(errors) if errors else 0
-            selected = min(rounding, key=lambda name: scores[name])
+            anchors = (lower, upper)
+            if anchors not in gap_rounding:
+                # Score nearby held-out observations around the gap midpoint.
+                # One rule per gap keeps its interpolated values monotonic;
+                # ties still prefer nearest-half-up deterministically.
+                midpoint = (lower + upper) / 2
+                triples = sorted(zip(known, known[1:], known[2:]),
+                                 key=lambda triple: abs(triple[1] - midpoint))
+                scores = {}
+                for name, rule in rounding.items():
+                    errors = []
+                    for a, b, c in triples[:8]:
+                        predicted = measured[a] + (measured[c] - measured[a]) * (b - a) / (c - a)
+                        errors.append(abs(rule(predicted) - measured[b]))
+                    scores[name] = sum(errors) / len(errors) if errors else 0
+                gap_rounding[anchors] = min(rounding, key=lambda name: scores[name])
+            selected = gap_rounding[anchors]
             estimate = measured[lower] + (measured[upper] - measured[lower]) * (raw - lower) / (upper - lower)
             tv = max(measured[lower], min(measured[upper], rounding[selected](estimate)))
             entry = {"raw": raw, "tv": tv, "source": "interpolated",

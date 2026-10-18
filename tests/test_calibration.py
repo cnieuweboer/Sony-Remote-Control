@@ -537,6 +537,54 @@ class MappingTests(unittest.TestCase):
                                         'amplifier_tv_input', 'tv_volume_by_amplifier_raw_volume',
                                         'estimated_amplifier_raw_volumes'})
 
+    def mapping_with_gaps(self, levels, missing):
+        known = [raw for raw in range(len(levels)) if raw not in missing]
+        checks = {}
+        for raw in missing:
+            lower = max(value for value in known if value < raw)
+            upper = min(value for value in known if value > raw)
+            checks[str(raw)] = [
+                {'direction': direction, 'from': lower if direction > 0 else upper,
+                 'to': upper if direction > 0 else lower}
+                for direction in (1, -1, 1, -1)]
+        saved = {'input': 'tv', 'tv_id': 'tv-id', 'amplifier_id': 'amp-id'}
+        observations = [{'raw': raw, 'tv': levels[raw]} for raw in known]
+        return HELPER['build_canonical_mapping'](
+            observations, checks, saved, len(levels) - 1, len(levels) - 1, levels[0])
+
+    def test_wide_gap_uses_one_rule_and_cannot_make_the_lookup_decrease(self):
+        levels = [(raw + 1) // 4 for raw in range(41)]
+        missing = set(range(12, 18))
+        # Previously per-value rule selection produced TV 3, 3, 4, 3, 3, 3
+        # inside this gap, causing the complete calibration to be rejected.
+        mapping = self.mapping_with_gaps(levels, missing)
+        gap = mapping['lookup'][12:18]
+        self.assertEqual(len({row['rounding'] for row in gap}), 1)
+        self.assertTrue(all(row['anchors'] == [11, 18] for row in gap))
+        result = [row['tv'] for row in mapping['lookup']]
+        self.assertEqual(result, sorted(result))
+        for raw in set(range(len(levels))) - missing:
+            self.assertEqual(result[raw], levels[raw])
+        document = HELPER['runtime_document'](mapping)
+        REMOTE['prepare_volume_mapping'](document)
+        self.assertEqual(document['estimated_amplifier_raw_volumes'], sorted(missing))
+
+    def test_separate_gaps_can_still_select_all_three_rounding_methods(self):
+        levels = [raw // 4 for raw in range(41)]
+        missing = {raw for raw in range(1, 40) if raw % 5 not in (0, 2, 3)}
+        mapping = self.mapping_with_gaps(levels, missing)
+        self.assertEqual({row['rounding'] for row in mapping['lookup'] if row['raw'] in missing},
+                         {'nearest-half-up', 'floor', 'ceil'})
+        # Floor still retains the more accurate estimate in the reviewed
+        # example: raw 39 is TV 9, whereas nearest-only would yield TV 10.
+        self.assertEqual(mapping['lookup'][39]['tv'], 9)
+        self.assertEqual(mapping['lookup'][39]['rounding'], 'floor')
+
+    def test_gap_without_middle_observations_defaults_to_nearest(self):
+        mapping = self.mapping_with_gaps([0, 0, 0, 1, 1, 2], {1, 2, 3, 4})
+        self.assertEqual([row['tv'] for row in mapping['lookup']], [0, 0, 1, 1, 2, 2])
+        self.assertEqual({row['rounding'] for row in mapping['lookup'][1:5]}, {'nearest-half-up'})
+
     def test_incomplete_crossing_evidence_cannot_be_saved_as_interpolation(self):
         for evidence in ([], [{'direction': 1, 'from': 2, 'to': 4}] * 4,
                          [{'direction': d, 'from': 2, 'to': 2} for d in (1, -1, 1, -1)]):

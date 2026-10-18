@@ -4,6 +4,8 @@ Release identifiers below come from the corresponding commits. Some releases upd
 
 ## 2026-10-19
 
+- Helper 2026.10.19.5 — Select one rounding method per gap between measured anchors. Retain all three methods and nearest-half-up tie-breaking while preventing per-value rule switches from making an interpolated gap decrease. Add mapping regression tests; remote versions and JSON format are unchanged.
+
 - 2026.10.19.3 — Preserve newer TV volume targets when an older rate-limiter completion reaches the GUI. Stop only when the current target matches the observed volume; add deterministic volume-key timing regression tests.
 
 - 2026.10.19.2 — Preserve unapplied JSON edits when saving discovered inputs/applications. Compare the accepted file digest immediately before replacement and track the exact saved bytes so later edits still trigger validation. Add discovery-save regression tests.

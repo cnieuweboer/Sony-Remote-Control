@@ -185,3 +185,9 @@ Successful saves return the digest of the exact UTF-8 bytes written, rather than
 The TV volume rate limiter checks a worker's completed reading against the latest requested target before clearing it. A keypress received after the worker finishes but before its GUI callback runs therefore continues through the existing rate-limited relative-step loop. A worker that sent a volume command still requires a later observation to confirm completion. Rate settings and amplifier routing are unchanged.
 
 `tests/test_volume_limiter.py` separates fake-device execution from GUI result delivery to force the lost-key timing. It covers up/down presses, coalesced bursts, a new target during an issued step, returning to the current volume, a TV command that does not move volume, and switching away from TV routing. It performs no real device requests.
+
+## Interpolation rounding within a gap
+
+For each gap between measured amplifier values, the calibration helper scores nearest-half-up, floor, and ceil against up to eight nearby held-out measured transitions, centered on the gap midpoint. It selects once and reuses that method throughout the gap; ties prefer nearest-half-up. Interpolation stays between its measured anchors, so nondecreasing anchors produce nondecreasing estimates. Different gaps can select different methods, and measured values are unchanged.
+
+The selected rules remain temporary sweep evidence, not additional runtime JSON fields. `tests/test_calibration.py` covers the former decreasing wide-gap failure, retention of all three methods across separate gaps, and the nearest default when there are no middle observations. Existing sweep validation, gap verification, and restoration checks remain in place.
