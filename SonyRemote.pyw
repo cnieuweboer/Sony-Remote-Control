@@ -349,7 +349,7 @@ class CalibrationServer(QObject):
 APP_NAME = "Sony Remote"
 
 
-__version__ = "2026.10.18.28"
+__version__ = "2026.10.18.29"
 
 
 CONFIG_PATH = Path(__file__).with_name("SonyRemote.json")
@@ -362,6 +362,9 @@ NETWORK_TIMEOUT_SECONDS = 2.0
 
 
 POLL_INTERVAL_MS = 2000
+
+
+MAX_PENDING_COMMANDS = 16
 
 
 CONFIG_RESTART_DEBOUNCE_MS = 250
@@ -1657,7 +1660,10 @@ class SonyRemote(QMainWindow):
         self.mica_enabled = bool(config["Mica"] and supports_mica())
         self.api = SonyApi(config["Host"], config["PreSharedKey"], timeout=NETWORK_TIMEOUT_SECONDS)
         self.pool = QThreadPool(self)
+        self.command_pool = QThreadPool(self)
+        self.command_pool.setMaxThreadCount(1)
         self._workers = set()
+        self._command_workers = set()
         self.poll_running = False
         self.initialized = False
         self.tray = None
@@ -1747,7 +1753,8 @@ class SonyRemote(QMainWindow):
             if self._shutting_down or self.calibration_server.token != token:
                 finish(False, "Calibration session ended.")
                 return
-            if self._workers or self.pool.activeThreadCount():
+            if (self._workers or self.pool.activeThreadCount()
+                    or self.command_pool.activeThreadCount()):
                 if time.monotonic() >= deadline:
                     finish(False, "Device requests did not finish in time.")
                 else:
@@ -1757,8 +1764,9 @@ class SonyRemote(QMainWindow):
                 finish(True)
                 return
             function = (lambda: self.api.set_mute(args["value"])) if action == "set_mute" else (lambda: self.api.adjust_volume(args["value"]))
-            self.run_worker(function, on_result=lambda _: finish(True),
-                            on_error=lambda error: finish(False, f"{type(error).__name__}: {error}"))
+            if not self.run_command(function, on_result=lambda _: finish(True),
+                                    on_error=lambda error: finish(False, f"{type(error).__name__}: {error}")):
+                finish(False, "Device command queue is unavailable.")
         ready()
 
     def _setup_timers(self):
@@ -2199,11 +2207,19 @@ class SonyRemote(QMainWindow):
     # Background work
     # ----------------------------
 
-    def run_worker(self, function, on_result=None, on_error=None, on_finished=None):
+    def run_command(self, function, on_result=None, on_error=None, on_finished=None):
+        return self.run_worker(function, on_result, on_error, on_finished, command=True)
+
+    def run_worker(self, function, on_result=None, on_error=None, on_finished=None, *, command=False):
         if self._shutting_down or missing_config_settings(self.config):
-            return
+            return False
+        if command and len(self._command_workers) >= MAX_PENDING_COMMANDS:
+            # Keep key repeats from creating an unbounded delayed command ramp.
+            return False
         worker = Worker(function)
         self._workers.add(worker)
+        if command:
+            self._command_workers.add(worker)
         generation = self._worker_generation
 
         def deliver_result(result):
@@ -2216,13 +2232,15 @@ class SonyRemote(QMainWindow):
 
         def finished():
             self._workers.discard(worker)
+            self._command_workers.discard(worker)
             if not self._shutting_down and generation == self._worker_generation and on_finished:
                 on_finished()
 
         worker.signals.result.connect(deliver_result)
         worker.signals.error.connect(deliver_error)
         worker.signals.finished.connect(finished)
-        self.pool.start(worker)
+        (self.command_pool if command else self.pool).start(worker)
+        return True
 
     # ----------------------------
     # Discovery and polling
@@ -2650,13 +2668,15 @@ class SonyRemote(QMainWindow):
             return
         turn_on = self.last_power != "active"
         self.power_button.setEnabled(False)
-        self.run_worker(
+        accepted = self.run_command(
             lambda: self.api.set_power(turn_on),
             on_finished=lambda: (
                 self.power_button.setEnabled(self.last_power is not None),
                 QTimer.singleShot(300, self.poll_status),
             ),
         )
+        if not accepted:
+            self.power_button.setEnabled(self.last_power is not None)
 
     def _matched_volume_mapping(self):
         mapping = self.volume_mapping
@@ -2747,7 +2767,7 @@ class SonyRemote(QMainWindow):
         if not self.last_volume:
             return
         target = not bool(self.last_volume.get("mute"))
-        self.run_worker(lambda: self.api.set_mute(target), on_finished=lambda: QTimer.singleShot(200, self.poll_status))
+        self.run_command(lambda: self.api.set_mute(target), on_finished=lambda: QTimer.singleShot(200, self.poll_status))
 
     def adjust_volume(self, amount):
         if self.calibration_active or (self.amplifier_state or {}).get("calibration_active", False):
@@ -2773,8 +2793,8 @@ class SonyRemote(QMainWindow):
 
         rate_limit = self.config["VolumeRateLimit"]
         if not rate_limit["Active"]:
-            self.run_worker(
-                lambda: self.api.adjust_volume(1 if amount > 0 else -1),
+            self.run_command(
+                lambda: None if self._amplifier_routed else self.api.adjust_volume(1 if amount > 0 else -1),
                 on_finished=lambda: QTimer.singleShot(200, self.poll_status),
             )
             return
@@ -2835,7 +2855,9 @@ class SonyRemote(QMainWindow):
             self.handle_request_error(error)
             QTimer.singleShot(200, self.poll_status)
 
-        self.run_worker(step, on_result=done, on_error=failed)
+        if not self.run_command(step, on_result=done, on_error=failed):
+            self._volume_rate_step_running = False
+            self._schedule_volume_rate_step()
 
     def launch_selected_app(self, index):
         uri = self.app_combo.itemData(index)
@@ -2846,7 +2868,7 @@ class SonyRemote(QMainWindow):
     def launch_app(self, uri):
         if self.calibration_active or (self.amplifier_state or {}).get("calibration_active", False):
             return
-        self.run_worker(lambda: self.api.launch_app(uri), on_finished=lambda: QTimer.singleShot(300, self.poll_status))
+        self.run_command(lambda: self.api.launch_app(uri), on_finished=lambda: QTimer.singleShot(300, self.poll_status))
 
     def select_input(self, index):
         uri = self.input_combo.itemData(index)
@@ -2856,12 +2878,12 @@ class SonyRemote(QMainWindow):
     def set_input(self, uri):
         if self.calibration_active or (self.amplifier_state or {}).get("calibration_active", False):
             return
-        self.run_worker(lambda: self.api.set_input(uri), on_finished=lambda: QTimer.singleShot(300, self.poll_status))
+        self.run_command(lambda: self.api.set_input(uri), on_finished=lambda: QTimer.singleShot(300, self.poll_status))
 
     def send_ircc(self, command):
         if self.calibration_active or (self.amplifier_state or {}).get("calibration_active", False):
             return
-        self.run_worker(lambda: self.api.ircc(command))
+        self.run_command(lambda: self.api.ircc(command))
 
     def send_text_input(self):
         if self.calibration_active or (self.amplifier_state or {}).get("calibration_active", False):
@@ -2873,7 +2895,7 @@ class SonyRemote(QMainWindow):
         if not text:
             return
 
-        self.run_worker(
+        self.run_command(
             lambda: self.api.set_text_form(text),
             on_error=lambda error: self.handle_request_error(
                 error, hint="Make sure a TV software keyboard or text field is currently active."
@@ -2921,7 +2943,7 @@ class SonyRemote(QMainWindow):
             for command in submit_sequence:
                 self.api.ircc(command)
 
-        self.run_worker(
+        self.run_command(
             send_and_confirm,
             on_error=lambda error: self.handle_request_error(
                 error, hint="Make sure a TV software keyboard or text field is currently active."
@@ -3179,8 +3201,11 @@ class SonyRemote(QMainWindow):
             timer.stop()
         self.config_watcher.blockSignals(True)
         self.pool.clear()
+        self.command_pool.clear()
         self.pool.waitForDone()
+        self.command_pool.waitForDone()
         self._workers.clear()
+        self._command_workers.clear()
         self.poll_running = False
         self.initialization_running = False
         self._volume_rate_step_running = False

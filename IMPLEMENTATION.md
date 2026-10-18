@@ -104,3 +104,7 @@ Acknowledgements include a generic `reason`: empty on acceptance, `queue_full` f
 ## Device HTTP transport
 
 Device requests use a dedicated urllib opener with `ProxyHandler({})`, bypassing system and environment proxies. This keeps LAN device traffic and TV authentication headers off configured proxies without modifying urllib’s global opener. Existing request timeouts and HTTP/connection exception handling are unchanged.
+
+## TV command ordering
+
+All TV-changing operations use a dedicated single-thread pool, with at most 16 queued/running operations. Accepted commands execute in submission order; excess commands are dropped quietly. Text submission and its navigation sequence remain one operation. Polling/discovery use the separate background pool, so command ordering does not imply TV UI completion or prevent transient stale status readings. Calibration waits for both pools to become idle, and restart/shutdown clear queued work in both pools before waiting for active requests. Failed restarts reuse the drained pools with fresh worker bookkeeping.
