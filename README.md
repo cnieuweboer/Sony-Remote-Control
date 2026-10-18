@@ -105,6 +105,8 @@ Set:
 
 SonyRemote automatically adds newly discovered applications and inputs to `Apps` and `Inputs` with default settings. Existing `NameOverride`, `Hidden`, and `Favorite` values are preserved. Existing entries keep their JSON positions; newly discovered entries append in device discovery order. Dropdowns only include currently discovered, non-hidden entries. Favorite buttons remain independent of `Hidden`. Name sorting affects display only and does not reorder the JSON file.
 
+Failed discovery disables only its associated controls and retries automatically; power and volume remain usable when TV status is available.
+
 The app automatically restarts when it detects that `SonyRemote.json` has changed.
 
 Only one instance of SonyRemote can run at a time.

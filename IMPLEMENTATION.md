@@ -147,3 +147,11 @@ IPC frame readers drain available socket data in bounded chunks, preserving inco
 Windows mutex creation uses `WinDLL(..., use_last_error=True)` and the ctypes cached last-error value immediately after `CreateMutexW`. Handle release retains pointer-sized signatures. Yamaha’s published freshness uses its existing hotkey age constant; no protocol or freshness-policy change is introduced.
 
 `tests/test_reliability.py` covers fragmented UTF-8, multi-read bursts, frame-size boundaries, invalid frames, changing/unreadable configuration files, and mocked Win32 mutex success/existing/error paths. Native Windows mutex behavior still requires Windows testing.
+
+## Independent discovery and availability
+
+Successful power/status polling establishes core availability independently of remote-code, application, and input discovery. Each enabled discovery feature has separate ready/pending/error state and its own background worker. Successful discoveries are cached; the existing status cycle retries only failed or unfinished discovery, without a new periodic timer. Active-input refresh uses a separate bounded-in-flight worker so it cannot hold up core status.
+
+Buttons, dropdowns, favorites, and keyboard shortcuts use the availability of their required feature. IRCC buttons also check whether their command is advertised. Applications can remain available in standby. Discovery failures are non-modal and appear in the power/dropdown tooltips; unavailable sections recover automatically after successful retry. Text entry and direct volume/power operations do not depend on remote-code discovery. Calibration pauses discovery retries, and restart/shutdown clear pending-discovery bookkeeping after draining workers.
+
+`tests/test_graceful_failures.py` uses offscreen Qt windows and fake devices to check isolated and combined discovery failures, delayed discovery/input refresh, feature recovery, standby, connection loss, and restart recovery. Tests disable IPC endpoints and native keyboard-hook installation.

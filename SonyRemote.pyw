@@ -360,7 +360,7 @@ class CalibrationServer(QObject):
 APP_NAME = "Sony Remote"
 
 
-__version__ = "2026.10.18.33"
+__version__ = "2026.10.18.34"
 
 
 CONFIG_PATH = Path(__file__).with_name("SonyRemote.json")
@@ -1690,7 +1690,11 @@ class SonyRemote(QMainWindow):
         self._workers = set()
         self._command_workers = set()
         self.poll_running = False
+        self._input_status_running = False
         self.initialized = False
+        self._discovery_ready = set()
+        self._discovery_pending = set()
+        self._discovery_errors = {}
         self.tray = None
         self._really_close = False
         self._shutting_down = False
@@ -1701,7 +1705,6 @@ class SonyRemote(QMainWindow):
         self._config_digest = self._get_config_digest()
         self._config_restart_pending = False
 
-        self.initialization_running = False
         self.last_power = None
         self.last_volume = None
         self._desired_volume = None
@@ -1909,6 +1912,7 @@ class SonyRemote(QMainWindow):
                 lambda checked=False, c=command: self.send_ircc(c)
             )
             button.setToolTip("Shortcut: " + _SHORTCUT_LABELS[command])
+            button.setProperty("remoteCommand", command)
             self.channel_buttons[command] = button
             grid.addWidget(button, row, column)
 
@@ -1931,15 +1935,13 @@ class SonyRemote(QMainWindow):
     def _build_navigation_controls(self):
         layout = self._section("Navigation")
         compact = self.config["NavigationControlsCompact"]
-        self.navigation_menu_buttons = {}
 
         def make_button(text, command):
             button = QPushButton(text)
             button.setMinimumHeight(36)
             button.clicked.connect(lambda checked=False: self.send_ircc(command))
             button.setToolTip("Shortcut: " + _SHORTCUT_LABELS[command])
-            if command in ("TvInput", "Settings"):
-                self.navigation_menu_buttons[command] = button
+            button.setProperty("remoteCommand", command)
             return button
 
         def add_menu_row(entries):
@@ -2011,6 +2013,7 @@ class SonyRemote(QMainWindow):
         ):
             button = QPushButton(text)
             button.clicked.connect(lambda checked=False, c=command: self.send_ircc(c))
+            button.setProperty("remoteCommand", command)
             if command in _SHORTCUT_LABELS:
                 button.setToolTip("Shortcut: " + _SHORTCUT_LABELS[command])
             row.addWidget(button)
@@ -2275,70 +2278,84 @@ class SonyRemote(QMainWindow):
     # ----------------------------
 
     def initialize(self):
-        if self._shutting_down or self.initialization_running:
+        if self._shutting_down or self.calibration_active:
             return
         if missing_config_settings(self.config):
             self.power_button.setText("Configure device")
             return
 
-        self.initialization_running = True
+        tasks = {}
+        if ((self.config["TextInputControls"] and self.config["TextInputSubmit"])
+                or self.config["ChannelControls"] or self.config["NavigationControls"]
+                or self.config["PlaybackControls"]):
+            tasks["remote_codes"] = self.api.load_remote_codes
+        if self.config["AppControls"]:
+            tasks["apps"] = self.api.get_apps
+        if self.config["InputControls"]:
+            tasks["inputs"] = self.api.get_inputs
 
-        def initialize():
-            data = {}
+        for feature, function in tasks.items():
+            if feature in self._discovery_ready or feature in self._discovery_pending:
+                continue
+            self._discovery_pending.add(feature)
+            accepted = self.run_worker(
+                function,
+                on_result=lambda result, feature=feature: self._discovery_succeeded(feature, result),
+                on_error=lambda error, feature=feature: self._discovery_failed(feature, error),
+                on_finished=lambda feature=feature: self._discovery_pending.discard(feature),
+            )
+            if not accepted:
+                self._discovery_pending.discard(feature)
+        self._update_polling_state()
 
-            # Only discover IRCC codes when the enabled UI actually needs them.
-            if (
-                (self.config["TextInputControls"] and self.config["TextInputSubmit"])
-                or self.config["ChannelControls"]
-                or self.config["NavigationControls"]
-                or self.config["PlaybackControls"]
-            ):
-                self.api.load_remote_codes()
-
-            if self.config["AppControls"]:
-                data["apps"] = self.api.get_apps()
-            if self.config["InputControls"]:
-                data["inputs"] = self.api.get_inputs()
-            return data
-
-        def done(data):
-            config_changed = False
-
-            if "apps" in data:
-                config_changed |= self._sync_discovered_config("Apps", data["apps"])
-                self.populate_apps(data["apps"])
-
-            if "inputs" in data:
-                config_changed |= self._sync_discovered_config("Inputs", data["inputs"])
-                self.populate_inputs(data["inputs"])
-
-            if config_changed:
+    def _discovery_succeeded(self, feature, result):
+        if feature in ("apps", "inputs"):
+            collection = "Apps" if feature == "apps" else "Inputs"
+            try:
+                changed = self._sync_discovered_config(collection, result)
+                if feature == "apps":
+                    self.populate_apps(result)
+                else:
+                    self.populate_inputs(result)
+            except Exception as error:
+                self._discovery_failed(feature, error)
+                return
+            if changed:
                 try:
                     self._save_config_without_restart()
-                except Exception as exc:
-                    record_exception(exc, "Configuration save")
-                    self.show_error(f"Could not update SonyRemote.json:\n\n{exc}")
-
+                except Exception as error:
+                    record_exception(error, "Configuration save")
+                    self.show_error(f"Could not update SonyRemote.json:\n\n{error}")
             self._build_favorites_from_config()
             self._configure_combo_popup_guards()
             self._fit_and_lock_window()
-            self.initialized = True
-            self.set_controls_enabled(
-                False,
-                power_enabled=True,
-                app_enabled=True,
-            )
-            self._update_polling_state(refresh=True)
+        self._discovery_ready.add(feature)
+        self._discovery_errors.pop(feature, None)
+        self.set_controls_enabled(self.last_power == "active",
+                                  power_enabled=self.last_power is not None,
+                                  app_enabled=self.last_power is not None)
+        self._update_discovery_feedback()
 
-        def failed(error):
-            self.initialized = False
-            self.handle_request_error(error, background=True)
-            self._update_polling_state()
+    def _discovery_failed(self, feature, error):
+        record_unexpected_exception(error, f"Optional {feature} discovery", background=True)
+        self._discovery_ready.discard(feature)
+        self._discovery_errors[feature] = (str(error) if isinstance(error, (DeviceConnectionError, DeviceResponseError))
+                                           else f"Unexpected discovery error ({type(error).__name__}).")
+        self.set_controls_enabled(self.last_power == "active",
+                                  power_enabled=self.last_power is not None,
+                                  app_enabled=self.last_power is not None)
+        self._update_discovery_feedback()
 
-        def finished():
-            self.initialization_running = False
-
-        self.run_worker(initialize, done, failed, finished)
+    def _update_discovery_feedback(self):
+        labels = {"remote_codes": "Remote buttons", "apps": "Apps", "inputs": "Inputs"}
+        self.power_button.setToolTip("\n".join(
+            f"{labels[feature]} unavailable; retrying. {message}"
+            for feature, message in self._discovery_errors.items()))
+        for feature, name in (("apps", "app_combo"), ("inputs", "input_combo")):
+            widget = getattr(self, name, None)
+            if widget is not None:
+                error = self._discovery_errors.get(feature)
+                widget.setToolTip(f"{labels[feature]} unavailable; retrying. {error}" if error else "")
 
     def _sync_discovered_config(self, collection, entries):
         changed = False
@@ -2443,26 +2460,18 @@ class SonyRemote(QMainWindow):
             data = {"power": power}
             if power == "active" and (self.config["VolumeControls"] or self.calibration_active):
                 data["volume"] = self.api.get_volume()
-            if power == "active" and self.config["InputControls"]:
-                try:
-                    data["inputs"] = self.api.get_inputs()
-                except Exception as error:
-                    record_unexpected_exception(error, "Optional input status", background=True)
             data["observed_at"] = time.monotonic()
             return data
 
         def done(data):
             self._status_sequence += 1
             self._status_observed_at = data["observed_at"]
-            self.power_button.setToolTip("")
+            self._update_discovery_feedback()
             self.last_power = data.get("power")
 
-            if not self.initialized:
-                self.power_button.setText("Connecting...")
-                self.set_controls_enabled(False, power_enabled=False)
-                QTimer.singleShot(0, self.initialize)
-                return
-
+            self.initialized = True
+            # Retry only missing discovery, independently of successful status.
+            QTimer.singleShot(0, self.initialize)
             is_active = self.last_power == "active"
             self.set_controls_enabled(
                 is_active,
@@ -2478,13 +2487,26 @@ class SonyRemote(QMainWindow):
                         self.update_volume_ui(self.last_volume)
             if self.calibration_server is not None:
                 self.calibration_server.publish()
-            if "inputs" in data:
-                self.update_active_input(data["inputs"])
+            if is_active and self.config["InputControls"]:
+                self._poll_input_status()
 
         def failed(error):
             self.handle_request_error(error, background=True)
 
         self.run_worker(query, done, failed, lambda: setattr(self, "poll_running", False))
+
+    def _poll_input_status(self):
+        if (self._shutting_down or self.calibration_active or self._input_status_running
+                or "inputs" not in self._discovery_ready or "inputs" in self._discovery_pending):
+            return
+        self._input_status_running = True
+        accepted = self.run_worker(
+            self.api.get_inputs, self.update_active_input,
+            lambda error: record_unexpected_exception(error, "Optional input status", background=True),
+            lambda: setattr(self, "_input_status_running", False),
+        )
+        if not accepted:
+            self._input_status_running = False
 
     def _update_polling_state(self, refresh=False):
         if self._shutting_down or not hasattr(self, "poll_timer"):
@@ -2530,40 +2552,31 @@ class SonyRemote(QMainWindow):
             if widget is not None:
                 widget.setEnabled(enabled)
 
-        # Start from the general state for all ordinary buttons.
         for button in self.findChildren(QPushButton):
             if button is self.power_button:
                 continue
-            button.setEnabled(enabled)
+            command = button.property("remoteCommand")
+            supported = (command is None or ("remote_codes" in self._discovery_ready
+                         and self.api.resolve_remote_command(command) in self.api.remote_codes))
+            button.setEnabled(bool(enabled and supported))
 
-        # App launching works while the TV is in standby and can wake it, so
-        # App controls have their own availability state.
+        # App launching can wake the TV, so it retains standby availability.
+        apps_enabled = bool(app_enabled and "apps" in self._discovery_ready)
+        inputs_enabled = bool(enabled and "inputs" in self._discovery_ready)
         if hasattr(self, "app_combo"):
-            self.app_combo.setEnabled(app_enabled)
-
-        if hasattr(self, "app_favorites_layout"):
-            for index in range(self.app_favorites_layout.count()):
-                item = self.app_favorites_layout.itemAt(index)
-                button = item.widget()
-                if isinstance(button, QPushButton):
-                    button.setEnabled(app_enabled)
-
-        # Channel commands vary between Sony models/regions. Keep unsupported
-        # commands disabled even when the rest of the connected UI is active.
-        self._update_channel_button_availability(enabled)
-        for command, button in getattr(self, "navigation_menu_buttons", {}).items():
-            button.setEnabled(bool(enabled and self.api.resolve_remote_command(command)
-                                   in self.api.remote_codes))
+            self.app_combo.setEnabled(apps_enabled)
+        if hasattr(self, "input_combo"):
+            self.input_combo.setEnabled(inputs_enabled)
+        for name, available in (("app_favorites_layout", apps_enabled),
+                                ("input_favorites_layout", inputs_enabled)):
+            layout = getattr(self, name, None)
+            if layout is not None:
+                for index in range(layout.count()):
+                    button = layout.itemAt(index).widget()
+                    if isinstance(button, QPushButton):
+                        button.setEnabled(available)
         self._update_volume_controls()
         self._publish_shortcut_state()
-
-    def _update_channel_button_availability(self, enabled):
-        if not hasattr(self, "channel_buttons"):
-            return
-
-        remote_codes = getattr(self.api, "remote_codes", {})
-        for command, button in self.channel_buttons.items():
-            button.setEnabled(bool(enabled and command in remote_codes))
 
     def handle_request_error(self, error, *, background=False, hint=None):
         record_unexpected_exception(
@@ -2950,6 +2963,8 @@ class SonyRemote(QMainWindow):
         )
 
     def _dispatch_shortcut(self, command):
+        if "remote_codes" not in self._discovery_ready:
+            return False
         resolved = self.api.resolve_remote_command(command)
         if resolved not in self.api.remote_codes:
             return False
@@ -2985,7 +3000,7 @@ class SonyRemote(QMainWindow):
                    or QApplication.activePopupWidget() is not None)
         text_focused = hasattr(self, "text_input") and self.text_input.hasFocus()
         allowed = {"volume_up", "volume_down", "mute"}
-        if not text_focused:
+        if not text_focused and "remote_codes" in self._discovery_ready:
             allowed.update(command for command in _SHORTCUT_KEYS.values()
                            if self.api.resolve_remote_command(command) in self.api.remote_codes)
         # A deadline is checked in the native thread, independent of GUI timers.
@@ -3206,7 +3221,8 @@ class SonyRemote(QMainWindow):
         self._workers.clear()
         self._command_workers.clear()
         self.poll_running = False
-        self.initialization_running = False
+        self._input_status_running = False
+        self._discovery_pending.clear()
         self._volume_rate_step_running = False
         return active_timers
 
@@ -3222,8 +3238,8 @@ class SonyRemote(QMainWindow):
         if missing_config_settings(self.config):
             return
         self.set_controls_enabled(
-            self.last_power == "active", power_enabled=self.initialized,
-            app_enabled=self.initialized,
+            self.last_power == "active", power_enabled=self.last_power is not None,
+            app_enabled=self.last_power is not None,
         )
         if self._volume_rate_loop_running and self._desired_volume is not None:
             self._schedule_volume_rate_step(0)
