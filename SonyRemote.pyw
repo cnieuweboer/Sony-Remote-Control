@@ -134,12 +134,14 @@ class AmplifierClient(QObject):
                 elif message.get("type") == "ack":
                     if type(message.get("id")) is not int or type(message.get("accepted")) is not bool:
                         raise ValueError("Invalid command acknowledgement")
+                    if message.get("reason") not in ("", "queue_full", "state_changed"):
+                        raise ValueError("Invalid command rejection reason")
                     timer = self.pending.pop(message["id"], None)
                     if timer is not None:
                         timer.stop()
                         timer.deleteLater()
-                        if not message["accepted"]:
-                            self.command_failed.emit("Amplifier command rejected; state changed or command queue is full.")
+                        if not message["accepted"] and message["reason"] != "queue_full":
+                            self.command_failed.emit("Amplifier command rejected because its state changed. Command was not retried.")
                 else:
                     raise ValueError("Unknown local message")
         except (ValueError, UnicodeError, TypeError, OverflowError):
@@ -170,15 +172,19 @@ class AmplifierClient(QObject):
 
     def send_command(self, command, input_id):
         # Never replay a non-idempotent volume command or fall back on ambiguity.
-        if self.stopped or not self.state_is_fresh or len(self.pending) >= 8:
+        if self.stopped or not self.state_is_fresh:
             return False
+        if len(self.pending) >= 8:
+            return None  # Backpressure: silently drop, without retry or TV fallback.
         if self.socket.state() != QLocalSocket.ConnectedState:
             return False
         self.sequence += 1
         request_id = self.sequence
         payload = _ipc_encode({"version": 1, "type": "command", "id": request_id,
                                "command": command, "input": input_id})
-        if self.socket.bytesToWrite() > IPC_MAX_FRAME * 4 or self.socket.write(payload) != len(payload):
+        if self.socket.bytesToWrite() > IPC_MAX_FRAME * 4:
+            return None  # Bound outgoing traffic during a burst.
+        if self.socket.write(payload) != len(payload):
             return False
         timer = QTimer(self)
         timer.setSingleShot(True)
@@ -339,7 +345,7 @@ class CalibrationServer(QObject):
 APP_NAME = "Sony Remote"
 
 
-__version__ = "2026.10.18.25"
+__version__ = "2026.10.18.26"
 
 
 CONFIG_PATH = Path(__file__).with_name("SonyRemote.json")
@@ -1664,7 +1670,7 @@ class SonyRemote(QMainWindow):
         self._amplifier_routed = False
         self.amplifier_client = AmplifierClient(self)
         self.amplifier_client.state_changed.connect(self._amplifier_state_changed)
-        self.amplifier_client.command_failed.connect(self.show_error)
+        self.amplifier_client.command_failed.connect(self._show_amplifier_error)
         self._build_ui()
         self._apply_style()
         self._setup_timers()
@@ -2713,11 +2719,15 @@ class SonyRemote(QMainWindow):
             for widget in (self.volume_up, self.volume_down, self.mute_button):
                 widget.setEnabled(enabled)
 
+    def _show_amplifier_error(self, message):
+        # Match background feedback without changing the TV state or opening a dialog.
+        self.power_button.setToolTip("Amplifier control: " + message)
+
     def _route_volume_command(self, command):
         if not self._use_amplifier():
             return False
-        if not self.amplifier_client.send_command(command, self._amplifier_tv_input()):
-            self.show_error("Amplifier command could not be queued. Command was not sent to the TV.")
+        if self.amplifier_client.send_command(command, self._amplifier_tv_input()) is False:
+            self._show_amplifier_error("Command could not be sent. Command was not sent to the TV or retried.")
         return True
 
     def toggle_mute(self):

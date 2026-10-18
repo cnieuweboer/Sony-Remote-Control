@@ -4,6 +4,8 @@ Release identifiers below come from the corresponding commits. Some releases upd
 
 ## 2026-10-18
 
+- 2026.10.18.26 — Silently drop amplifier IPC queue overflow and report other IPC failures non-modally. Update both remotes together.
+
 - 2026.10.18.25 — Require one second of hovering before showing tooltips, including when moving between controls.
 
 - 2026.10.18.24 — Show keyboard shortcuts in button hover tooltips.
