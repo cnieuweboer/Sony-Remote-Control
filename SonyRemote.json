@@ -1,5 +1,5 @@
 {
-  "Host": "192.168.1.1000",
+  "Host": "192.168.1.100",
   "PreSharedKey": "1234",
   "DarkMode": true,
   "Mica": true,

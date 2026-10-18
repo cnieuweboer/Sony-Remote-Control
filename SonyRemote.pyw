@@ -345,7 +345,7 @@ class CalibrationServer(QObject):
 APP_NAME = "Sony Remote"
 
 
-__version__ = "2026.10.18.26"
+__version__ = "2026.10.18.27"
 
 
 CONFIG_PATH = Path(__file__).with_name("SonyRemote.json")
@@ -510,6 +510,11 @@ def _validate_host(value):
         )
 
     labels = host.rstrip(".").split(".")
+    if all(label.isdigit() for label in labels):
+        raise ConfigError(
+            '"Host" looks like an IP address but is not a valid one.'
+        )
+
     hostname_label = re.compile(
         r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$"
     )
