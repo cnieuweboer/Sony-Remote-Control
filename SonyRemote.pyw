@@ -38,9 +38,15 @@ DEVICE_HTTP_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({})
 # ----------------------------
 
 
-IPC_SERVER_NAME = "remote-control.amplifier.v1." + hashlib.sha256(
-    str(Path.home()).encode("utf-8")
-).hexdigest()[:16]
+IPC_USER_SUFFIX = hashlib.sha256(str(Path.home()).encode("utf-8")).hexdigest()[:16]
+
+
+def ipc_server_name(role, *, calibration=False):
+    channel = f"{role}.calibration" if calibration else role
+    return f"remote-control.{channel}.v1.{IPC_USER_SUFFIX}"
+
+
+IPC_SERVER_NAME = ipc_server_name("amplifier")
 IPC_MAX_FRAME = 4096
 
 
@@ -223,7 +229,7 @@ class CalibrationServer(QObject):
         self.token = None
         self.busy = False
         self.sockets = {}
-        self.name = IPC_SERVER_NAME.replace(".amplifier.v1.", f".{role}.calibration.v1.")
+        self.name = ipc_server_name(role, calibration=True)
         self.lock = QLockFile(str(Path(tempfile.gettempdir()) / (self.name + ".lock")))
         self.lock.setStaleLockTime(0)
         self.server = QLocalServer(self)
@@ -349,7 +355,7 @@ class CalibrationServer(QObject):
 APP_NAME = "Sony Remote"
 
 
-__version__ = "2026.10.18.30"
+__version__ = "2026.10.18.31"
 
 
 CONFIG_PATH = Path(__file__).with_name("SonyRemote.json")
@@ -464,7 +470,14 @@ def validate_runtime_mapping(document):
             or any(type(raw) is not int or not 0 <= raw < len(levels) for raw in estimated)
             or len(set(estimated)) != len(estimated)):
         raise ValueError("Invalid estimated amplifier raw volumes.")
-    estimated = set(estimated)
+    return document
+
+
+def prepare_volume_mapping(document):
+    """Build Sony's display lookup from a validated runtime document."""
+    validate_runtime_mapping(document)
+    levels = document["tv_volume_by_amplifier_raw_volume"]
+    estimated = set(document.get("estimated_amplifier_raw_volumes", []))
     return {"input": document["amplifier_tv_input"],
             "tv_id": document["tv_device_id"], "amplifier_id": document["amplifier_device_id"],
             "raw_min": 0, "raw_max": len(levels) - 1, "tv_min": levels[0], "tv_max": levels[-1],
@@ -1669,6 +1682,8 @@ class SonyRemote(QMainWindow):
         self.tray = None
         self._really_close = False
         self._shutting_down = False
+        self._shutdown_complete = False
+        self._invalid_config_digest = None
         self._worker_generation = 0
         self._restart_failed = False
         self._config_digest = self._get_config_digest()
@@ -2278,11 +2293,11 @@ class SonyRemote(QMainWindow):
             config_changed = False
 
             if "apps" in data:
-                config_changed |= self.sync_app_config(data["apps"])
+                config_changed |= self._sync_discovered_config("Apps", data["apps"])
                 self.populate_apps(data["apps"])
 
             if "inputs" in data:
-                config_changed |= self.sync_input_config(data["inputs"])
+                config_changed |= self._sync_discovered_config("Inputs", data["inputs"])
                 self.populate_inputs(data["inputs"])
 
             if config_changed:
@@ -2313,9 +2328,9 @@ class SonyRemote(QMainWindow):
 
         self.run_worker(initialize, done, failed, finished)
 
-    def sync_app_config(self, entries):
+    def _sync_discovered_config(self, collection, entries):
         changed = False
-        apps_config = self.config.setdefault("Apps", {})
+        settings = self.config.setdefault(collection, {})
 
         for entry in entries:
             uri = str(entry.get("uri", "")).strip()
@@ -2323,41 +2338,10 @@ class SonyRemote(QMainWindow):
             if not uri or not name:
                 continue
 
-            item = apps_config.get(uri)
+            item = settings.get(uri)
             if not isinstance(item, dict):
                 item = {}
-                apps_config[uri] = item
-                changed = True
-
-            if item.get("Name") != name:
-                item["Name"] = name
-                changed = True
-            if "NameOverride" not in item:
-                item["NameOverride"] = ""
-                changed = True
-            if "Hidden" not in item:
-                item["Hidden"] = False
-                changed = True
-            if "Favorite" not in item:
-                item["Favorite"] = False
-                changed = True
-
-        return changed
-
-    def sync_input_config(self, entries):
-        changed = False
-        inputs_config = self.config.setdefault("Inputs", {})
-
-        for entry in entries:
-            uri = str(entry.get("uri", "")).strip()
-            name = html.unescape(str(entry.get("title", ""))).strip()
-            if not uri or not name:
-                continue
-
-            item = inputs_config.get(uri)
-            if not isinstance(item, dict):
-                item = {}
-                inputs_config[uri] = item
+                settings[uri] = item
                 changed = True
 
             if item.get("Name") != name:
@@ -2664,8 +2648,11 @@ class SonyRemote(QMainWindow):
     # Device actions and shortcuts
     # ----------------------------
 
+    def _calibration_blocked(self):
+        return bool(self.calibration_active or (self.amplifier_state or {}).get("calibration_active", False))
+
     def toggle_power(self):
-        if self.calibration_active or (self.amplifier_state or {}).get("calibration_active", False):
+        if self._calibration_blocked():
             return
         turn_on = self.last_power != "active"
         self.power_button.setEnabled(False)
@@ -2704,14 +2691,13 @@ class SonyRemote(QMainWindow):
                 if path.stat().st_size > 2 * 1024 * 1024:
                     raise ValueError("Volume calibration JSON exceeds the 2 MiB limit.")
                 document = json.loads(path.read_text(encoding="utf-8"))
-                self.volume_mapping = validate_runtime_mapping(document)
+                self.volume_mapping = prepare_volume_mapping(document)
             except (OSError, ValueError, TypeError, OverflowError, RecursionError) as error:
                 # Keep the last valid mapping after a bad edit. On first load
                 # the configured input and raw-volume display remain available.
                 record_exception(error, "Volume calibration JSON")
                 return
-        if hasattr(self, "amplifier_client"):
-            self._amplifier_state_changed(self.amplifier_state)
+        self._amplifier_state_changed(self.amplifier_state)
 
     def _use_amplifier(self):
         state = self.amplifier_state
@@ -2761,7 +2747,7 @@ class SonyRemote(QMainWindow):
         return True
 
     def toggle_mute(self):
-        if self.calibration_active or (self.amplifier_state or {}).get("calibration_active", False):
+        if self._calibration_blocked():
             return
         if self._route_volume_command("mute"):
             return
@@ -2771,7 +2757,7 @@ class SonyRemote(QMainWindow):
         self.run_command(lambda: self.api.set_mute(target), on_finished=lambda: QTimer.singleShot(200, self.poll_status))
 
     def adjust_volume(self, amount):
-        if self.calibration_active or (self.amplifier_state or {}).get("calibration_active", False):
+        if self._calibration_blocked():
             return
         if self._route_volume_command("volume_up" if amount > 0 else "volume_down"):
             return
@@ -2867,7 +2853,7 @@ class SonyRemote(QMainWindow):
             self.app_combo.setCurrentIndex(-1)
 
     def launch_app(self, uri):
-        if self.calibration_active or (self.amplifier_state or {}).get("calibration_active", False):
+        if self._calibration_blocked():
             return
         self.run_command(lambda: self.api.launch_app(uri), on_finished=lambda: QTimer.singleShot(300, self.poll_status))
 
@@ -2877,17 +2863,17 @@ class SonyRemote(QMainWindow):
             self.set_input(uri)
 
     def set_input(self, uri):
-        if self.calibration_active or (self.amplifier_state or {}).get("calibration_active", False):
+        if self._calibration_blocked():
             return
         self.run_command(lambda: self.api.set_input(uri), on_finished=lambda: QTimer.singleShot(300, self.poll_status))
 
     def send_ircc(self, command):
-        if self.calibration_active or (self.amplifier_state or {}).get("calibration_active", False):
+        if self._calibration_blocked():
             return
         self.run_command(lambda: self.api.ircc(command))
 
     def send_text_input(self):
-        if self.calibration_active or (self.amplifier_state or {}).get("calibration_active", False):
+        if self._calibration_blocked():
             return
         if not hasattr(self, "text_input"):
             return
@@ -2904,7 +2890,7 @@ class SonyRemote(QMainWindow):
         )
 
     def send_text_input_and_confirm(self):
-        if self.calibration_active or (self.amplifier_state or {}).get("calibration_active", False):
+        if self._calibration_blocked():
             return
         if not hasattr(self, "text_input"):
             return
@@ -2982,8 +2968,7 @@ class SonyRemote(QMainWindow):
         if not hasattr(self, "_shortcut_lock"):
             return
         window = int(self.winId()) if self.isVisible() and not self.isMinimized() else 0
-        blocked = (self._shutting_down or self.calibration_active
-                   or (self.amplifier_state or {}).get("calibration_active", False)
+        blocked = (self._shutting_down or self._calibration_blocked()
                    or QApplication.activeModalWidget() is not None
                    or QApplication.activePopupWidget() is not None)
         text_focused = hasattr(self, "text_input") and self.text_input.hasFocus()
@@ -3095,7 +3080,7 @@ class SonyRemote(QMainWindow):
                 candidate = json.load(f)
             validate_config(candidate)
         except (OSError, ValueError) as ex:
-            if digest != getattr(self, "_invalid_config_digest", None):
+            if digest != self._invalid_config_digest:
                 self._invalid_config_digest = digest
                 QMessageBox.warning(
                     self, "Sony Remote - Configuration Error",
@@ -3236,7 +3221,7 @@ class SonyRemote(QMainWindow):
         self._update_polling_state(refresh=True)
 
     def _shutdown(self):
-        if getattr(self, "_shutdown_complete", False):
+        if self._shutdown_complete:
             return
         self._pause_background_work()
         self._shutdown_complete = True

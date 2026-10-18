@@ -4,6 +4,8 @@ Release identifiers below come from the corresponding commits. Some releases upd
 
 ## 2026-10-18
 
+- 2026.10.18.31 — Clean up local configuration/state helpers and endpoint naming, reduce Sony duplication, and add development-only regression tests. Scripts remain self-contained; IPC names and calibration file format are unchanged.
+
 - 2026.10.18.30 — Suspend focused TV shortcuts while dropdowns or other popups are open, preserving list navigation and selection.
 
 - 2026.10.18.29 — Serialize TV-changing commands on a bounded single-thread pool while polling stays separate; include both pools in calibration and lifecycle handling.

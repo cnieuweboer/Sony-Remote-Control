@@ -108,3 +108,15 @@ Device requests use a dedicated urllib opener with `ProxyHandler({})`, bypassing
 ## TV command ordering
 
 All TV-changing operations use a dedicated single-thread pool, with at most 16 queued/running operations. Accepted commands execute in submission order; excess commands are dropped quietly. Text submission and its navigation sequence remain one operation. Polling/discovery use the separate background pool, so command ordering does not imply TV UI completion or prevent transient stale status readings. Calibration waits for both pools to become idle, and restart/shutdown clear queued work in both pools before waiting for active requests. Failed restarts reuse the drained pools with fresh worker bookkeeping.
+
+## Development checks
+
+Install PySide6, then run from the repository root:
+
+```sh
+python -m unittest discover -s tests -v
+```
+
+These development-only tests do not require real devices and are not imported by the applications. Each script remains independently runnable without the tests or a shared module. Endpoint naming is centralized locally in `ipc_server_name`; the user-local socket names and wire protocol are unchanged.
+
+Local cleanup separates runtime-document validation (`validate_runtime_mapping`) from display preparation (`prepare_volume_mapping`). The remote and helper validate the same document structure; only Sony builds its internal display lookup. `_calibration_blocked` centralizes ordinary-command guards, and `_sync_discovered_config` preserves discovered Apps/Inputs settings and JSON order through one implementation.
