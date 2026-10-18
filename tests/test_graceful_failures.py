@@ -82,6 +82,7 @@ class DiscoveryTests(unittest.TestCase):
         # Tests neither bind production IPC names nor connect to another app.
         with patch.object(REMOTE['AmplifierClient'], 'start', lambda client: None), \
              patch.object(REMOTE['SonyRemote'], '_setup_calibration', lambda window: None), \
+             patch.object(REMOTE['SonyRemote'], '_setup_activation', lambda window: None), \
              patch.object(REMOTE['SonyRemote'], '_install_windows_keyboard_hook', lambda window: None):
             self.window = REMOTE['SonyRemote'](config)
         self.window.api = self.device
@@ -270,7 +271,8 @@ class DiscoveryTests(unittest.TestCase):
         self.assertFalse(self.window._discovery_pending)
         self.assertFalse(self.window._input_status_running)
         with patch.object(REMOTE['AmplifierClient'], 'start', lambda client: None), \
-             patch.object(REMOTE['SonyRemote'], '_setup_calibration', lambda window: None):
+             patch.object(REMOTE['SonyRemote'], '_setup_calibration', lambda window: None), \
+             patch.object(REMOTE['SonyRemote'], '_setup_activation', lambda window: None):
             self.window._resume_background_work(timers)
         self.wait(lambda: 'apps' in self.window._discovery_ready and not self.window._discovery_pending)
         self.assertTrue(self.window.app_combo.isEnabled())

@@ -109,7 +109,7 @@ Failed discovery disables only its associated controls and retries automatically
 
 The app automatically restarts when it detects that `SonyRemote.json` has changed.
 
-Only one instance of SonyRemote can run at a time.
+Only one instance of SonyRemote can run at a time. Launching it again restores the existing window, including from the system tray.
 
 Regular status polling pauses while the window is hidden or minimized and refreshes immediately when restored. Active requests finish normally; configuration file watching remains enabled.
 

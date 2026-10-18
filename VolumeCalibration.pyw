@@ -17,13 +17,13 @@ from PySide6.QtWidgets import (
     QProgressBar, QTextEdit, QVBoxLayout, QWidget,
 )
 
-__version__ = "2026.10.18.33"
+__version__ = "2026.10.18.35"
 DATA_PATH = Path(__file__).resolve().with_name("VolumeCalibration.json")
 IPC_USER_SUFFIX = hashlib.sha256(str(Path.home()).encode("utf-8")).hexdigest()[:16]
 
 
-def ipc_server_name(role, *, calibration=False):
-    channel = f"{role}.calibration" if calibration else role
+def ipc_server_name(role, *, channel=None):
+    channel = f"{role}.{channel}" if channel else role
     return f"remote-control.{channel}.v1.{IPC_USER_SUFFIX}"
 
 
@@ -317,7 +317,7 @@ class Peer:
         self.socket.setReadBufferSize(4097)
 
     def connect(self):
-        self.socket.connectToServer(ipc_server_name(self.role, calibration=True))
+        self.socket.connectToServer(ipc_server_name(self.role, channel="calibration"))
         if not self.socket.waitForConnected(2000):
             raise CalibrationError(f"Start an updated {self.role} remote before running calibration.")
 

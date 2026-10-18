@@ -41,8 +41,8 @@ DEVICE_HTTP_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({})
 IPC_USER_SUFFIX = hashlib.sha256(str(Path.home()).encode("utf-8")).hexdigest()[:16]
 
 
-def ipc_server_name(role, *, calibration=False):
-    channel = f"{role}.calibration" if calibration else role
+def ipc_server_name(role, *, channel=None):
+    channel = f"{role}.{channel}" if channel else role
     return f"remote-control.{channel}.v1.{IPC_USER_SUFFIX}"
 
 
@@ -224,6 +224,131 @@ class AmplifierClient(QObject):
 # ----------------------------
 
 
+class ActivationServer(QObject):
+    """User-local window activation, separate from device commands and leases."""
+
+    def __init__(self, role, activate, parent=None):
+        super().__init__(parent)
+        self.role, self.activate = role, activate
+        self.name = ipc_server_name(role, channel="activation")
+        self.clients = {}
+        self.lock = QLockFile(str(Path(tempfile.gettempdir()) / (self.name + ".lock")))
+        self.lock.setStaleLockTime(0)
+        self.server = QLocalServer(self)
+        self.server.setSocketOptions(QLocalServer.UserAccessOption)
+        self.server.setMaxPendingConnections(4)
+        self.available = self.lock.tryLock(0)
+        if self.available:
+            QLocalServer.removeServer(self.name)
+            self.available = self.server.listen(self.name)
+            if not self.available:
+                self.lock.unlock()
+        self.server.newConnection.connect(self._accept)
+
+    def _accept(self):
+        while self.server.hasPendingConnections():
+            socket = self.server.nextPendingConnection()
+            if not self.available or len(self.clients) >= 4:
+                socket.abort()
+                socket.deleteLater()
+                continue
+            self.clients[socket] = bytearray()
+            socket.setReadBufferSize(IPC_MAX_FRAME + 1)
+            socket.readyRead.connect(lambda socket=socket: self._read(socket))
+            socket.disconnected.connect(lambda socket=socket: self._lost(socket))
+            timer = QTimer(socket)
+            timer.setSingleShot(True)
+            timer.timeout.connect(lambda socket=socket: socket.abort())
+            timer.start(1000)
+            socket.write(_ipc_encode({"version": 1, "type": "instance", "role": self.role,
+                                      "process_id": os.getpid()}))
+
+    def _read(self, socket):
+        try:
+            messages = _ipc_frames(socket, self.clients[socket])
+            if not messages:
+                return
+            if (not self.available or len(messages) != 1
+                    or messages[0] != {"version": 1, "type": "activate"}):
+                raise ValueError("Invalid activation request")
+            ok = bool(self.activate())
+            socket.write(_ipc_encode({"version": 1, "type": "activated", "ok": ok}))
+            socket.disconnectFromServer()
+        except (ValueError, UnicodeError, KeyError):
+            socket.abort()
+
+    def _lost(self, socket):
+        if socket in self.clients:
+            del self.clients[socket]
+            socket.deleteLater()
+
+    def close(self):
+        self.available = False
+        for socket in list(self.clients):
+            socket.abort()
+        self.server.close()
+        self.lock.unlock()
+
+
+def _allow_foreground_activation(process_id):
+    if sys.platform == "win32":
+        try:
+            user32 = ctypes.WinDLL("user32", use_last_error=True)
+            user32.AllowSetForegroundWindow.argtypes = [ctypes.c_uint32]
+            user32.AllowSetForegroundWindow.restype = ctypes.c_int
+            user32.AllowSetForegroundWindow(process_id)
+        except (OSError, AttributeError):
+            pass  # Window restoration still works if foreground permission is denied.
+
+
+def activate_existing_instance(role, timeout_ms=1500):
+    """Bound startup retries and the complete handshake to one deadline."""
+    socket = QLocalSocket()
+    socket.setReadBufferSize(IPC_MAX_FRAME + 1)
+    buffer = bytearray()
+    deadline = time.monotonic() + timeout_ms / 1000
+
+    def remaining():
+        return max(0, int((deadline - time.monotonic()) * 1000))
+
+    def receive(expected):
+        while remaining():
+            messages = _ipc_frames(socket, buffer)
+            if messages:
+                if len(messages) != 1 or messages[0].get("type") != expected:
+                    return None
+                return messages[0]
+            if not socket.waitForReadyRead(remaining()) and not socket.bytesAvailable():
+                return None
+        return None
+
+    try:
+        while remaining():
+            socket.connectToServer(ipc_server_name(role, channel="activation"))
+            if socket.waitForConnected(min(150, remaining())):
+                break
+            socket.abort()
+            time.sleep(min(0.05, remaining() / 1000))
+        else:
+            return False
+        hello = receive("instance")
+        if (not hello or hello.get("role") != role or type(hello.get("process_id")) is not int
+                or not 0 < hello["process_id"] <= 0xFFFFFFFF):
+            return False
+        _allow_foreground_activation(hello["process_id"])
+        payload = _ipc_encode({"version": 1, "type": "activate"})
+        if socket.write(payload) != len(payload):
+            return False
+        if socket.bytesToWrite() and not socket.waitForBytesWritten(remaining()):
+            return False
+        reply = receive("activated")
+        return bool(reply and reply.get("ok") is True)
+    except (ValueError, UnicodeError, OSError, TypeError):
+        return False
+    finally:
+        socket.abort()
+
+
 class CalibrationServer(QObject):
     """A socket-owned, expiring lease. No device I/O in protocol callbacks."""
 
@@ -234,7 +359,7 @@ class CalibrationServer(QObject):
         self.token = None
         self.busy = False
         self.sockets = {}
-        self.name = ipc_server_name(role, calibration=True)
+        self.name = ipc_server_name(role, channel="calibration")
         self.lock = QLockFile(str(Path(tempfile.gettempdir()) / (self.name + ".lock")))
         self.lock.setStaleLockTime(0)
         self.server = QLocalServer(self)
@@ -360,7 +485,7 @@ class CalibrationServer(QObject):
 APP_NAME = "Sony Remote"
 
 
-__version__ = "2026.10.18.34"
+__version__ = "2026.10.18.35"
 
 
 CONFIG_PATH = Path(__file__).with_name("SonyRemote.json")
@@ -1682,6 +1807,7 @@ class SonyRemote(QMainWindow):
         self._status_sequence = 0
         self._status_observed_at = 0
         self.calibration_server = None
+        self.activation_server = None
         self.mica_enabled = bool(config["Mica"] and supports_mica())
         self.api = SonyApi(config["Host"], config["PreSharedKey"], timeout=NETWORK_TIMEOUT_SECONDS)
         self.pool = QThreadPool(self)
@@ -1724,6 +1850,7 @@ class SonyRemote(QMainWindow):
         self._setup_tray()
         self._setup_shortcuts()
         self._setup_calibration()
+        self._setup_activation()
         self.set_controls_enabled(False)
         self.amplifier_client.start()
         QTimer.singleShot(0, self.initialize)
@@ -3169,6 +3296,25 @@ class SonyRemote(QMainWindow):
     # Tray and shutdown lifecycle
     # ----------------------------
 
+    def _setup_activation(self):
+        if self.activation_server is not None:
+            self.activation_server.deleteLater()
+        self.activation_server = ActivationServer(
+            "tv", self._activate_existing_window, self,
+        )
+        if not self.activation_server.available:
+            record_exception(RuntimeError("Local activation endpoint unavailable"), "Window activation")
+
+    def _activate_existing_window(self):
+        if self._shutting_down:
+            return False
+        self.show_from_tray()
+        dialog = QApplication.activeModalWidget()
+        if dialog is not None:
+            dialog.raise_()
+            dialog.activateWindow()
+        return True
+
     def _setup_tray(self):
         self.tray = None
         if not self.config["SystemTray"] or not QSystemTrayIcon.isSystemTrayAvailable():
@@ -3204,6 +3350,8 @@ class SonyRemote(QMainWindow):
 
     def _pause_background_work(self):
         self._shutting_down = True
+        if self.activation_server is not None:
+            self.activation_server.close()
         if self.calibration_server is not None:
             self.calibration_server.close()
         self._publish_shortcut_state()
@@ -3228,6 +3376,7 @@ class SonyRemote(QMainWindow):
 
     def _resume_background_work(self, active_timers):
         self._shutting_down = False
+        self._setup_activation()
         self._setup_calibration()
         self.amplifier_client.start()
         self._config_restart_pending = False
@@ -3421,10 +3570,19 @@ def _run_application():
     app = QApplication(sys.argv)
     app.setStyle(TooltipDelayStyle())
     try:
-        if not acquire_single_instance():
-            return 0
+        acquired = acquire_single_instance()
     except Exception as exc:
         QMessageBox.critical(None, APP_NAME, f"Could not acquire the instance lock:\n{exc}")
+        return 1
+
+    if not acquired:
+        if activate_existing_instance("tv"):
+            return 0
+        QMessageBox.warning(
+            None, APP_NAME,
+            "The remote is already running, but its window could not be brought forward. "
+            "Check the system tray, or wait for startup/shutdown to finish and try again.",
+        )
         return 1
 
     set_app_user_model_id("Sony.Remote")

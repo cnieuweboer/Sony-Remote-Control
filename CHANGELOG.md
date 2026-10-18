@@ -4,6 +4,8 @@ Release identifiers below come from the corresponding commits. Some releases upd
 
 ## 2026-10-18
 
+- 2026.10.18.35 — Second launches restore the existing window through a separate user-local activation endpoint, including from tray/minimized state. Add bounded startup retries, Windows foreground permission, restart recovery, and cross-process regression tests.
+
 - 2026.10.18.34 — Discover remote codes, applications, and inputs independently; keep core controls available and retry failed discovery through existing polling. Add focused graceful-failure regression tests.
 
 - 2026.10.18.33 — Drain IPC reads with frame bounds, use cached Win32 mutex errors, and hash/validate the same configuration bytes. Sony mapping reload also uses one snapshot; move the helper QLockFile import. Add focused reliability regression tests.
