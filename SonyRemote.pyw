@@ -149,6 +149,7 @@ class AmplifierClient(QObject):
     @staticmethod
     def _validate_state(message):
         required = {"online", "power", "input", "raw_volume", "raw_max_volume", "mute",
+                    "volume_display", "volume_unit",
                     "global_hotkeys_enabled", "global_hotkeys_active", "valid_for_ms"}
         if (not required <= message.keys() or type(message.get("valid_for_ms")) is not int
                 or not 0 <= message["valid_for_ms"] <= 6000
@@ -158,6 +159,10 @@ class AmplifierClient(QObject):
                 or not isinstance(message.get("input"), (str, type(None)))
                 or not isinstance(message.get("mute"), (bool, type(None)))):
             raise ValueError("Invalid amplifier state")
+        if (not isinstance(message["volume_display"], str)
+                or not 1 <= len(message["volume_display"]) <= 128
+                or message["volume_unit"] not in ("raw", "dB")):
+            raise ValueError("Invalid amplifier volume display")
         for key in ("raw_volume", "raw_max_volume"):
             value = message.get(key)
             if value is not None and (type(value) not in (int, float) or not math.isfinite(value)):
@@ -334,7 +339,7 @@ class CalibrationServer(QObject):
 APP_NAME = "Sony Remote"
 
 
-__version__ = "2026.10.18.18"
+__version__ = "2026.10.18.19"
 
 
 CONFIG_PATH = Path(__file__).with_name("SonyRemote.json")
@@ -2540,8 +2545,10 @@ class SonyRemote(QMainWindow):
                 prefix = "≈" if approximate else ""
                 self.volume_value.setToolTip("Calibrated TV scale")
             else:
-                display = raw
-                self.volume_value.setToolTip("Amplifier raw volume")
+                display = self.amplifier_state["volume_display"]
+                self.volume_value.setToolTip(
+                    "Amplifier volume (dB)" if self.amplifier_state["volume_unit"] == "dB"
+                    else "Amplifier raw volume")
             volume = {"volume": display, "mute": self.amplifier_state["mute"]}
         else:
             self.volume_value.setToolTip("TV volume")

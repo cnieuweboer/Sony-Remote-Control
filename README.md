@@ -117,7 +117,7 @@ Windows shortcuts use native key handling to stay responsive, including when bot
 
 With both remotes running, Sony can send volume/mute commands directly to the amplifier, bypassing the slower TV/CEC path. It falls back to TV control when the amplifier is unavailable, in standby, or using another input.
 
-A matching calibration automatically identifies the amplifier's TV input and displays TV-scale volume numbers. Without calibration, set `AmplifierTVInput` to the amplifier's input ID (such as `tv` or `hdmi1`); the displayed volume then uses amplifier raw values.
+A matching calibration automatically identifies the amplifier's TV input and displays TV-scale volume numbers. Without calibration, set `AmplifierTVInput` to the amplifier's input ID (such as `tv` or `hdmi1`); the displayed volume then follows Yamaha Remote’s raw/dB display setting. Update both remotes together.
 
 ## Volume calibration
 

@@ -92,3 +92,7 @@ The helper uses PySide6 plus standard-library Windows Core Audio COM bindings. S
 ## TV keyboard action
 
 Ctrl+Enter navigates the on-screen keyboard to its action button. It expects that button in the bottom right, on the fourth row.
+
+## Amplifier volume display
+
+State includes `volume_display` (the exact text from the existing amplifier formatter, including any dB suffix) and `volume_unit` (`raw` or `dB`). Sony uses these only without a matching calibration; calibrated display and calibration still use `raw_volume`. Sony validates the display fields without converting dB. Update both remotes together for these required fields.
