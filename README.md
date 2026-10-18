@@ -113,7 +113,7 @@ Regular status polling pauses while the window is hidden or minimized and refres
 
 ## Windows shortcut reliability
 
-Windows shortcuts use native key handling to stay responsive, including when both remotes run. Sony yields volume/mute keys whenever Yamaha Remote owns global volume control.
+Windows shortcuts use native key handling to stay responsive, including when both remotes run. Sony yields volume/mute keys whenever Yamaha Remote owns global volume control. While a dropdown is open, arrows and Enter operate the list instead of the TV.
 
 ## Direct amplifier volume
 

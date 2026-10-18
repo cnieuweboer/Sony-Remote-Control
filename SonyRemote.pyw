@@ -349,7 +349,7 @@ class CalibrationServer(QObject):
 APP_NAME = "Sony Remote"
 
 
-__version__ = "2026.10.18.29"
+__version__ = "2026.10.18.30"
 
 
 CONFIG_PATH = Path(__file__).with_name("SonyRemote.json")
@@ -1779,6 +1779,7 @@ class SonyRemote(QMainWindow):
         self.volume_rate_timer.timeout.connect(self._volume_rate_step)
 
     def _setup_shortcuts(self):
+        self._popup_shortcut_keys = set()
         # Qt observes focus/modal changes only on Windows; keys stay native.
         self._shortcut_lock = threading.Lock()
         self._shortcut_state = (0, False, frozenset(), 0)
@@ -2983,7 +2984,8 @@ class SonyRemote(QMainWindow):
         window = int(self.winId()) if self.isVisible() and not self.isMinimized() else 0
         blocked = (self._shutting_down or self.calibration_active
                    or (self.amplifier_state or {}).get("calibration_active", False)
-                   or QApplication.activeModalWidget() is not None)
+                   or QApplication.activeModalWidget() is not None
+                   or QApplication.activePopupWidget() is not None)
         text_focused = hasattr(self, "text_input") and self.text_input.hasFocus()
         allowed = {"volume_up", "volume_down", "mute"}
         if not text_focused:
@@ -3022,7 +3024,8 @@ class SonyRemote(QMainWindow):
             commands = list(self._shortcut_queue)
             self._shortcut_queue.clear()
             self._shortcut_drain_pending = False
-        if self._shutting_down or QApplication.activeModalWidget() is not None:
+        if (self._shutting_down or QApplication.activeModalWidget() is not None
+                or QApplication.activePopupWidget() is not None):
             return
         for command in commands:
             # A command already accepted belongs to this app, even if IPC
@@ -3303,7 +3306,22 @@ class SonyRemote(QMainWindow):
         if sys.platform == "win32":
             return super().eventFilter(watched, event)
 
-        if event.type() != QEvent.KeyPress or not self.isActiveWindow():
+        if event.type() == QEvent.KeyRelease:
+            if not event.isAutoRepeat():
+                self._popup_shortcut_keys.discard(event.key())
+            return super().eventFilter(watched, event)
+        if event.type() in (QEvent.ShortcutOverride, QEvent.KeyPress):
+            if QApplication.activePopupWidget() is not None:
+                self._popup_shortcut_keys.add(event.key())
+                return super().eventFilter(watched, event)
+            # Enter can be forwarded again after closing the popup. Keep the
+            # whole press with the popup, including repeats, until release.
+            if event.key() in self._popup_shortcut_keys:
+                return super().eventFilter(watched, event)
+
+        if (event.type() != QEvent.KeyPress or not self.isActiveWindow()
+                or QApplication.activeModalWidget() is not None
+                or QApplication.activePopupWidget() is not None):
             return super().eventFilter(watched, event)
 
         volume_keys = (Qt.Key_VolumeUp, Qt.Key_VolumeDown, Qt.Key_VolumeMute)
