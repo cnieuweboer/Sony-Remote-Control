@@ -334,7 +334,7 @@ class CalibrationServer(QObject):
 APP_NAME = "Sony Remote"
 
 
-__version__ = "2026.10.18.16"
+__version__ = "2026.10.18.18"
 
 
 CONFIG_PATH = Path(__file__).with_name("SonyRemote.json")
@@ -1599,7 +1599,6 @@ class SonyRemote(QMainWindow):
         self.calibration_active = False
         self.volume_mapping = None
         self._mapping_digest = None
-        self._mapping_error = None
         self._calibration_operation = False
         self._status_sequence = 0
         self._status_observed_at = 0
@@ -2539,17 +2538,13 @@ class SonyRemote(QMainWindow):
                 else:
                     display, approximate = mapped_tv_volume(mapping, raw)
                 prefix = "≈" if approximate else ""
-                self.volume_value.setToolTip(f"Calibrated TV scale; amplifier raw {raw}. "
-                                             "≈ marks a saved estimate or a fractional amplifier raw reading. "
-                                             "Display is capped to the calibrated range.")
+                self.volume_value.setToolTip("Calibrated TV scale")
             else:
                 display = raw
-                self.volume_value.setToolTip("Amplifier raw volume (no matching calibration)")
+                self.volume_value.setToolTip("Amplifier raw volume")
             volume = {"volume": display, "mute": self.amplifier_state["mute"]}
         else:
             self.volume_value.setToolTip("TV volume")
-        if self._mapping_error:
-            self.volume_value.setToolTip(self.volume_value.toolTip() + "\nCalibration reload failed: " + self._mapping_error)
         self.volume_value.setText(prefix + str(volume.get("volume", "—")))
         self.mute_button.setText("Unmute" if volume.get("mute") else "Mute")
 
@@ -2600,7 +2595,6 @@ class SonyRemote(QMainWindow):
         if digest == self._mapping_digest:
             return
         self._mapping_digest = digest
-        self._mapping_error = None
         if digest is None:
             self.volume_mapping = None
         else:
@@ -2612,10 +2606,7 @@ class SonyRemote(QMainWindow):
             except (OSError, ValueError, TypeError, OverflowError, RecursionError) as error:
                 # Keep the last valid mapping after a bad edit. On first load
                 # the configured input and raw-volume display remain available.
-                self._mapping_error = str(error)
                 record_exception(error, "Volume calibration JSON")
-                if hasattr(self, "volume_value"):
-                    self.volume_value.setToolTip(f"Calibration was not reloaded: {error}")
                 return
         if hasattr(self, "amplifier_client"):
             self._amplifier_state_changed(self.amplifier_state)

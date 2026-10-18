@@ -4,6 +4,8 @@ Release identifiers below come from the corresponding commits. Some releases upd
 
 ## 2026-10-18
 
+- 2026.10.18.18 — Simplify volume tooltips to TV volume, calibrated TV scale, or amplifier raw volume. Calibration reload errors remain available through optional diagnostics.
+
 - [2026.10.18.17](https://github.com/cnieuweboer/Sony-Remote-Control/commit/237c0ee) — Simplify calibration to a single-run one-button helper in 2026.10.18.17.
 - [2026.10.18.16](https://github.com/cnieuweboer/Sony-Remote-Control/commit/d90d2e1) — Save compact operational volume lookup and simplify Sony validation in 2026.10.18.16.
 - [2026.10.18.15](https://github.com/cnieuweboer/Sony-Remote-Control/commit/7a949b4) — Remove unused calibration remnants from Sony Remote 2026.10.18.15.
