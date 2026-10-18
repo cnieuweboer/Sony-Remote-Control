@@ -132,6 +132,10 @@ A matching calibration automatically identifies the amplifier's TV input and dis
 
 Sony loads a successful calibration automatically; no manual `AmplifierTVInput` edit is needed. An **≈** beside the volume marks an estimated value; calibration changes Sony's displayed number without setting the physical TV's volume.
 
+## Navigation
+
+Compact **Input** and **Settings** buttons sit beside Up, matching the physical remote layout. Input opens the TV’s input menu; the separate input dropdown remains available.
+
 ## Text input
 
 - **Enter** — Sends the text to the TV.

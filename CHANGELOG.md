@@ -4,6 +4,8 @@ Release identifiers below come from the corresponding commits. Some releases upd
 
 ## 2026-10-18
 
+- 2026.10.18.20 — Add compact Input and Settings buttons beside Up in the navigation area, using commands advertised by the TV.
+
 - 2026.10.18.19 — Share Yamaha’s formatted volume and unit over IPC; Sony mirrors them when no calibration matches. Update both remotes together.
 
 - 2026.10.18.18 — Simplify volume tooltips to TV volume, calibrated TV scale, or amplifier raw volume. Calibration reload errors remain available through optional diagnostics.

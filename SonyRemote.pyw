@@ -339,7 +339,7 @@ class CalibrationServer(QObject):
 APP_NAME = "Sony Remote"
 
 
-__version__ = "2026.10.18.19"
+__version__ = "2026.10.18.20"
 
 
 CONFIG_PATH = Path(__file__).with_name("SonyRemote.json")
@@ -1393,6 +1393,10 @@ class SonyApi:
         }
 
     def resolve_remote_command(self, name):
+        if name == "Settings":
+            for candidate in ("QuickSettings", "Settings", "ActionMenu"):
+                if candidate in self.remote_codes:
+                    return candidate
         if name == "Confirm" and name not in self.remote_codes:
             if "DpadCenter" in self.remote_codes:
                 return "DpadCenter"
@@ -1861,6 +1865,16 @@ class SonyRemote(QMainWindow):
             button.setMinimumHeight(36)
             button.clicked.connect(lambda checked=False, c=command: self.send_ircc(c))
             grid.addWidget(button, row, col)
+        self.navigation_menu_buttons = {}
+        for text, column, command, alignment in (
+            ("Input", 0, "TvInput", Qt.AlignLeft),
+            ("Settings", 2, "Settings", Qt.AlignRight),
+        ):
+            button = QPushButton(text)
+            button.setFixedHeight(28)
+            button.clicked.connect(lambda checked=False, c=command: self.send_ircc(c))
+            grid.addWidget(button, 0, column, alignment | Qt.AlignVCenter)
+            self.navigation_menu_buttons[command] = button
         layout.addLayout(grid)
         row = QHBoxLayout()
         back = QPushButton("Back")
@@ -2465,6 +2479,9 @@ class SonyRemote(QMainWindow):
         # Channel commands vary between Sony models/regions. Keep unsupported
         # commands disabled even when the rest of the connected UI is active.
         self._update_channel_button_availability(enabled)
+        for command, button in getattr(self, "navigation_menu_buttons", {}).items():
+            button.setEnabled(bool(enabled and self.api.resolve_remote_command(command)
+                                   in self.api.remote_codes))
         self._update_volume_controls()
         self._publish_shortcut_state()
 
