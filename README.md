@@ -141,7 +141,7 @@ The helper first captures the selected amplifier input through IPC. The input an
 
 ### Full calibration sweep and results — 2026.10.18.14
 
-Update **VolumeCalibration.pyw** to `2026.10.18.14`; Sony Remote can remain at `2026.10.18.11` and Yamaha Remote at `2026.10.18.10`. Keep the helper beside `SonyRemote.pyw` so its separate `VolumeCalibration.json` is in the location Sony watches. Neither remote reads the other remote's settings. Both scripts and the helper remain self-contained.
+Current scripts are **SonyRemote.pyw and YamahaRemote.pyw `2026.10.18.15`**, with **VolumeCalibration.pyw `2026.10.18.14`**. The remote cleanup release preserves existing calibration files and behavior; no recalibration is required. Keep the helper beside `SonyRemote.pyw` so its separate `VolumeCalibration.json` is in the location Sony watches. Neither remote reads the other remote's settings. Both scripts and the helper remain self-contained.
 
 1. Start both remotes and select the amplifier input physically connected to the TV. Start below the amplifier API ceiling, with TV/amplifier mute states initially agreeing.
 2. Set the **TV to a silent input/source**, stop all other playback, and keep the same Windows output selected. Volume changes may unmute the TV/amplifier. Windows mute does not silence TV-generated audio or other amplifier sources. A full sweep can reach a very loud range if the source becomes active.
@@ -172,6 +172,8 @@ When no active mapping exists, the helper results table displays saved draft obs
 - `gap_checks` preserving the verified crossings used to justify interpolated entries.
 
 Each lookup entry identifies its origin as **measured**, **boundary-clamped**, or **interpolated**. If TV zero corresponds to amplifier raw one, raw zero also maps to TV zero. When several TV levels are observed at one amplifier value, the lowest observed TV level is canonical; all observations remain available. Thus amplifier raw 154 first observed at TV 80 maps to TV 80, even if a higher TV reading is subsequently observed at that same API ceiling.
+
+The calibration helper computes all interpolation and rounding choices and saves the resulting lookup entries. Sony validates the saved mapping and looks up TV values; it does not fit a two-point conversion or calculate interpolation during normal operation. Yamaha publishes raw state and does not load or convert the TV mapping. Legacy schema-version-1 support remains available for older calibration files.
 
 For verified interior gaps, interpolation uses the nearest measured neighbors and preserves a monotonic TV scale. Integer rounding is selected using nearby measured transitions; the entry records its anchors and rounding method. This estimates a value CEC could not reach during repeated checks. Measured values are never replaced with estimates. Nonmonotonic measured conflicts prevent publication rather than silently changing measurements.
 

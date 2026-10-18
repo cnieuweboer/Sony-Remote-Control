@@ -334,7 +334,7 @@ class CalibrationServer(QObject):
 APP_NAME = "Sony Remote"
 
 
-__version__ = "2026.10.18.11"
+__version__ = "2026.10.18.15"
 
 
 CONFIG_PATH = Path(__file__).with_name("SonyRemote.json")
@@ -470,23 +470,6 @@ def validate_mapping_v1(value):
     return value
 
 
-def mapping_report_v1(mapping):
-    validate_mapping(mapping)
-    up = {row["raw"]: row["tv"] for row in mapping["up"]}
-    down = {row["raw"]: row["tv"] for row in mapping["down"]}
-    differences = sorted(raw for raw in up.keys() & down.keys() if up[raw] != down[raw])
-    unverified = sorted(up.keys() ^ down.keys())
-    rows = []
-    for tv in sorted(set(up.values()) | set(down.values())):
-        rising = sorted(raw for raw, level in up.items() if level == tv)
-        falling = sorted(raw for raw, level in down.items() if level == tv)
-        status = "Verified" if rising == falling else "Direction differs / incomplete"
-        rows.append((tv, rising, falling, status))
-    gaps = [(a, b) for a, b in zip([row[0] for row in rows], [row[0] for row in rows][1:]) if b - a > 1]
-    return {"rows": rows, "differences": differences, "unverified_raw": unverified,
-            "tv_gaps": gaps, "verified": not differences and not unverified}
-
-
 def mapped_tv_volume_v1(mapping, raw, direction="up"):
     rows = sorted(mapping[direction], key=lambda row: row["raw"])
     raw = max(mapping["raw_min"], min(mapping["raw_max"], raw))
@@ -559,19 +542,6 @@ def validate_mapping(value):
     if entries[0]["tv"] != value["tv_min"] or entries[-1]["tv"] != value["tv_max"]:
         raise ValueError("Canonical TV limits do not match lookup endpoints.")
     return value
-
-
-def mapping_report(mapping):
-    validate_mapping(mapping)
-    if mapping["schema_version"] == 1:
-        return mapping_report_v1(mapping)
-    candidates = {}
-    for row in mapping["observations"]:
-        candidates.setdefault(row["raw"], set()).add(row["tv"])
-    return {"canonical": True, "entries": mapping["lookup"],
-            "conflicts": sorted(raw for raw, levels in candidates.items() if len(levels) > 1),
-            "counts": {source: sum(entry["source"] == source for entry in mapping["lookup"])
-                       for source in ("measured", "boundary-clamped", "interpolated")}}
 
 
 def mapped_tv_volume(mapping, raw, direction="up"):
@@ -1475,12 +1445,6 @@ class SonyApi:
             if entry.get("target") == "speaker":
                 return entry
         return entries[0] if entries else None
-
-    def set_volume(self, value):
-        return self.rpc(
-            "audio", "setAudioVolume",
-            [{"target": "speaker", "volume": str(int(value))}],
-        )
 
     def adjust_volume(self, amount):
         amount = int(amount)
