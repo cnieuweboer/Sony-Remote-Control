@@ -1,4 +1,4 @@
-"""Standalone silent-source CEC preflight and restoration helper. Mapping is stage two."""
+"""Standalone silent-source CEC calibration sweep and restoration helper."""
 import ctypes
 import hashlib
 import json
@@ -14,17 +14,19 @@ from PySide6.QtCore import QThread, Signal
 from PySide6.QtNetwork import QLocalSocket
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QHBoxLayout, QLabel, QMessageBox, QPushButton,
-    QSpinBox, QTextEdit, QVBoxLayout, QWidget,
+    QSpinBox, QDoubleSpinBox, QTableWidget, QTableWidgetItem, QAbstractItemView,
+    QProgressBar, QTextEdit, QVBoxLayout, QWidget,
 )
 
-__version__ = "2026.10.18.9"
+__version__ = "2026.10.18.10"
 DATA_PATH = Path(__file__).resolve().with_name("VolumeCalibration.json")
 USER_SUFFIX = hashlib.sha256(str(Path.home()).encode()).hexdigest()[:16]
 TIMEOUT = 5.0
 TV_VOLUME_ATTEMPTS = 3
 TV_VOLUME_CONFIRM_SECONDS = 5.0
 MAX_VOLUME_STEPS = 512
-VOLUME_RESTORE_SECONDS = 120.0
+VOLUME_RESTORE_SECONDS = 900.0
+SWEEP_SECONDS = 900.0
 
 
 class CalibrationError(RuntimeError):
@@ -35,11 +37,85 @@ class Cancelled(CalibrationError):
     pass
 
 
+def validate_mapping(value):
+    """Validate observed pairs; never infer a linear scale from endpoints."""
+    if (not isinstance(value, dict) or type(value.get("schema_version")) is not int
+            or value["schema_version"] != 1):
+        raise ValueError("Unsupported volume mapping format.")
+    for key in ("input", "tv_id", "amplifier_id", "created_at"):
+        if not isinstance(value.get(key), str) or not value[key]:
+            raise ValueError(f"Missing mapping field: {key}.")
+    for key in ("raw_min", "raw_max", "api_ceiling"):
+        number = value.get(key)
+        if type(number) not in (int, float) or not math.isfinite(number):
+            raise ValueError(f"Invalid mapping field: {key}.")
+    if not 0 <= value["raw_min"] < value["raw_max"] <= value["api_ceiling"]:
+        raise ValueError("Invalid mapped amplifier range.")
+    for key in ("tv_min", "tv_max"):
+        if type(value.get(key)) is not int or value[key] < 0:
+            raise ValueError("Invalid mapped TV range.")
+    if value["tv_min"] > value["tv_max"]:
+        raise ValueError("Invalid mapped TV range.")
+    for direction in ("up", "down"):
+        rows = value.get(direction)
+        if not isinstance(rows, list) or not 2 <= len(rows) <= 513:
+            raise ValueError("Invalid mapping observations.")
+        previous = None
+        for row in rows:
+            if not isinstance(row, dict) or type(row.get("tv")) is not int:
+                raise ValueError("Invalid observed TV level.")
+            raw = row.get("raw")
+            if (type(raw) not in (int, float) or not math.isfinite(raw)
+                    or not value["raw_min"] <= raw <= value["raw_max"]
+                    or not value["tv_min"] <= row["tv"] <= value["tv_max"]):
+                raise ValueError("Observed volume is outside the mapped range.")
+            if previous is not None:
+                if ((raw - previous["raw"]) * (1 if direction == "up" else -1) <= 0
+                        or (row["tv"] - previous["tv"]) * (1 if direction == "up" else -1) < 0):
+                    raise ValueError("Mapping observations are not monotonic.")
+            previous = row
+        ends = (rows[0]["raw"], rows[-1]["raw"])
+        expected = (value["raw_min"], value["raw_max"]) if direction == "up" else (value["raw_max"], value["raw_min"])
+        if ends != expected:
+            raise ValueError("Mapping passes do not cover the same endpoints.")
+    all_tv = [row["tv"] for direction in ("up", "down") for row in value[direction]]
+    if min(all_tv) != value["tv_min"] or max(all_tv) != value["tv_max"]:
+        raise ValueError("Mapping TV limits do not match observations.")
+    return value
+
+
+def mapping_report(mapping):
+    validate_mapping(mapping)
+    up = {row["raw"]: row["tv"] for row in mapping["up"]}
+    down = {row["raw"]: row["tv"] for row in mapping["down"]}
+    differences = sorted(raw for raw in up.keys() & down.keys() if up[raw] != down[raw])
+    unverified = sorted(up.keys() ^ down.keys())
+    rows = []
+    for tv in sorted(set(up.values()) | set(down.values())):
+        rising = sorted(raw for raw, level in up.items() if level == tv)
+        falling = sorted(raw for raw, level in down.items() if level == tv)
+        status = "Verified" if rising == falling else "Direction differs / incomplete"
+        rows.append((tv, rising, falling, status))
+    gaps = [(a, b) for a, b in zip([row[0] for row in rows], [row[0] for row in rows][1:]) if b - a > 1]
+    return {"rows": rows, "differences": differences, "unverified_raw": unverified,
+            "tv_gaps": gaps, "verified": not differences and not unverified}
+
+
+def mapped_tv_volume(mapping, raw, direction="up"):
+    rows = sorted(mapping[direction], key=lambda row: row["raw"])
+    raw = max(mapping["raw_min"], min(mapping["raw_max"], raw))
+    row = min(rows, key=lambda row: (abs(row["raw"] - raw), row["raw"]))
+    return row["tv"], row["raw"] != raw
+
+
 def load_document(path):
     if not path.exists():
         return {"format_version": 1, "calibration": None, "recovery": None}
+    if path.stat().st_size > 2 * 1024 * 1024:
+        raise CalibrationError("Calibration JSON exceeds the 2 MiB limit.")
     document = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(document, dict) or document.get("format_version") != 1:
+    if (not isinstance(document, dict) or type(document.get("format_version")) is not int
+            or document["format_version"] != 1):
         raise CalibrationError("Unsupported calibration JSON format. Preserve the file for recovery.")
     recovery = document.get("recovery")
     if recovery is not None:
@@ -221,11 +297,14 @@ class Peer:
 
 class CalibrationSession:
     def __init__(self, cancel, progress, path=DATA_PATH, mute_factory=WindowsMute,
-                 peer_factory=Peer, restore_volume=None, recovery=False, silent_source_confirmed=False):
+                 peer_factory=Peer, restore_volume=None, recovery=False, silent_source_confirmed=False, sweep=False, raw_lower=0, raw_upper=None):
         self.cancel, self.progress, self.path = cancel, progress, path
         self.mute_factory, self.peer_factory = mute_factory, peer_factory
         self.restore_volume, self.recovery = restore_volume, recovery
         self.silent_source_confirmed = silent_source_confirmed
+        self.sweep = sweep
+        self.raw_lower, self.raw_upper = raw_lower, raw_upper
+        self.pending_mapping = None
         self.token = uuid.uuid4().hex
         self.peers = {}
         self.next_renew = 0
@@ -477,6 +556,61 @@ class CalibrationSession:
         write_document(self.path, self.document)
         self.saved = updated
 
+    def sweep_limits(self):
+        ceiling = self.peers["amplifier"].state["raw_max_volume"]
+        lower = self.raw_lower
+        upper = ceiling if self.raw_upper is None else self.raw_upper
+        if (not self.number(lower) or not self.number(upper)
+                or not 0 <= lower < upper <= ceiling):
+            raise CalibrationError("Sweep limits must satisfy 0 <= lower < upper <= amplifier API ceiling.")
+        return lower, upper, ceiling
+
+    def calibration_sweep(self):
+        lower, upper, ceiling = self.sweep_limits()
+        self.progress(f"Moving to lower raw limit {lower}; the source must remain silent throughout the sweep.")
+        self.seek_volume(raw_target=lower)
+        def observation():
+            amp, tv = self.guard(require_windows_mute=True)
+            return {"tv": tv["volume"], "raw": amp["raw_volume"]}
+        upward = [observation()]
+        start = time.monotonic()
+        while upward[-1]["raw"] < upper:
+            if len(upward) > MAX_VOLUME_STEPS or time.monotonic() - start >= SWEEP_SECONDS:
+                raise CalibrationError("Upward sweep exceeded its step/time limit.")
+            self.relative_step(1)
+            row = observation()
+            if row["raw"] > upper:
+                raise CalibrationError("A volume step crossed the requested upper limit. Choose a reachable limit.")
+            upward.append(row)
+            self.progress(f"Upward {len(upward) - 1}: amplifier raw {row['raw']}, TV {row['tv']}.")
+            # No more upward commands after the first observed ceiling reading.
+        downward = [observation()]
+        start = time.monotonic()
+        while downward[-1]["raw"] > lower:
+            if len(downward) > MAX_VOLUME_STEPS or time.monotonic() - start >= SWEEP_SECONDS:
+                raise CalibrationError("Downward sweep exceeded its step/time limit.")
+            self.relative_step(-1)
+            row = observation()
+            if row["raw"] < lower:
+                raise CalibrationError("A volume step crossed the requested lower limit. Choose a reachable limit.")
+            downward.append(row)
+            self.progress(f"Downward {len(downward) - 1}: amplifier raw {row['raw']}, TV {row['tv']}.")
+        all_rows = upward + downward
+        mapping = {"schema_version": 1,
+                   "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                   "input": self.saved["input"], "tv_id": self.saved["tv_id"],
+                   "amplifier_id": self.saved["amplifier_id"], "api_ceiling": ceiling,
+                   "raw_min": lower, "raw_max": upward[-1]["raw"],
+                   "tv_min": min(row["tv"] for row in all_rows),
+                   "tv_max": max(row["tv"] for row in all_rows),
+                   "up": upward, "down": downward}
+        report = mapping_report(mapping)
+        self.progress("Both passes complete. " + ("Observed pairs agree." if report["verified"]
+                      else "Directional differences were found; the results will identify unverified observations."))
+        if self.cancel.is_set():
+            raise Cancelled("Cancelled. Restoring saved states; the previous mapping will be preserved.")
+        self.pending_mapping = mapping
+
     def restore(self):
         self.restoring = True
         self.progress("Restoring saved states; cancellation is paused until cleanup finishes.")
@@ -533,7 +667,11 @@ class CalibrationSession:
             if self.recovery:
                 self.saved = existing
             else:
+                if self.sweep:
+                    self.sweep_limits()
                 self.prepare_and_probe()
+                if self.sweep:
+                    self.calibration_sweep()
         except Exception as error:
             failure = error
         finally:
@@ -563,6 +701,10 @@ class CalibrationSession:
                 self.windows.close()
         if failure is not None:
             raise failure
+        if self.pending_mapping is not None and not self.cancel.is_set():
+            self.document["calibration"] = self.pending_mapping
+            write_document(self.path, self.document)
+            return "Sweep completed, saved states restored, and mapping saved."
         return "Saved states recovered and verified." if self.recovery else outcome
 
 
@@ -570,15 +712,17 @@ class SessionWorker(QThread):
     progress = Signal(str)
     completed = Signal(bool, str)
 
-    def __init__(self, restore_volume=None, recovery=False, parent=None):
+    def __init__(self, restore_volume=None, recovery=False, parent=None, sweep=False, raw_lower=0, raw_upper=None):
         super().__init__(parent)
         self.cancel = threading.Event()
         self.restore_volume, self.recovery = restore_volume, recovery
+        self.sweep, self.raw_lower, self.raw_upper = sweep, raw_lower, raw_upper
 
     def run(self):
         try:
             message = CalibrationSession(self.cancel, self.progress.emit, restore_volume=self.restore_volume,
-                                         recovery=self.recovery, silent_source_confirmed=True).run()
+                                         recovery=self.recovery, silent_source_confirmed=True, sweep=self.sweep,
+                                         raw_lower=self.raw_lower, raw_upper=self.raw_upper).run()
             self.completed.emit(True, message)
         except Exception as error:
             self.completed.emit(False, str(error))
@@ -595,8 +739,9 @@ class CalibrationWindow(QWidget):
             "Start both updated remotes. Set the amplifier to the input connected to the TV, "
             "and start at a comfortable volume below its API ceiling. Select a TV input/source that plays NO sound "
             "and stop all other playback. Windows mute does not silence the TV or other amplifier sources.\n\n"
-            "Volume changes can automatically unmute the TV and amplifier. This check mutes Windows only, tests one CEC volume step, "
-            "then restores and verifies the saved states. It does not create a volume mapping yet. "
+            "Volume changes can automatically unmute the TV and amplifier. Windows alone is muted. "
+            "The full sweep goes from the lower limit to the amplifier API ceiling (or a lower chosen limit) and back, "
+            "then restores your saved states. The upper range can be VERY LOUD if the source becomes active. "
             "Do not use physical device controls during the test.")
         instructions.setWordWrap(True)
         layout.addWidget(instructions)
@@ -610,27 +755,57 @@ class CalibrationWindow(QWidget):
         self.safe_restore.toggled.connect(self.restore_value.setEnabled)
         layout.addWidget(self.safe_restore)
         layout.addWidget(self.restore_value)
+        self.raw_lower = QDoubleSpinBox()
+        self.raw_lower.setRange(0, 100000)
+        self.raw_lower.setDecimals(3)
+        self.raw_lower.setPrefix("Lower raw limit: ")
+        self.limit_upper = QCheckBox("Use a lower upper limit instead of the amplifier API ceiling")
+        self.raw_upper = QDoubleSpinBox()
+        self.raw_upper.setRange(0, 100000)
+        self.raw_upper.setDecimals(3)
+        self.raw_upper.setEnabled(False)
+        self.limit_upper.toggled.connect(self.raw_upper.setEnabled)
+        for widget in (self.raw_lower, self.limit_upper, self.raw_upper):
+            layout.addWidget(widget)
+        location = QLabel(f"Mapping and recovery file: {DATA_PATH}\nKeep this file beside SonyRemote.pyw to use it automatically.")
+        location.setWordWrap(True)
+        layout.addWidget(location)
         buttons = QHBoxLayout()
-        self.start = QPushButton("Run silent-source CEC check")
+        self.start = QPushButton("Run full calibration sweep")
+        self.preflight = QPushButton("Run step check only")
+        self.preflight.clicked.connect(lambda: self.begin(False, sweep=False))
         self.recover = QPushButton("Recover saved states")
         self.cancel_button = QPushButton("Cancel and restore")
         self.cancel_button.setEnabled(False)
-        self.start.clicked.connect(lambda: self.begin(False))
+        self.start.clicked.connect(lambda: self.begin(False, sweep=True))
         self.recover.clicked.connect(lambda: self.begin(True))
         self.cancel_button.clicked.connect(self.cancel)
-        for button in (self.start, self.recover, self.cancel_button):
+        for button in (self.start, self.preflight, self.recover, self.cancel_button):
             buttons.addWidget(button)
         layout.addLayout(buttons)
+        self.activity = QProgressBar()
+        self.activity.setRange(0, 1)
+        self.activity.setValue(0)
+        layout.addWidget(self.activity)
+        self.result_summary = QLabel("No mapping loaded.")
+        self.result_summary.setWordWrap(True)
+        layout.addWidget(self.result_summary)
+        self.results = QTableWidget(0, 4)
+        self.results.setHorizontalHeaderLabels(["TV level", "Upward raw values", "Downward raw values", "Verification"])
+        self.results.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        layout.addWidget(self.results)
         self.log = QTextEdit()
         self.log.setReadOnly(True)
         layout.addWidget(self.log)
-        self.resize(650, 460)
+        self.resize(900, 850)
         self.refresh()
+        self.load_results()
 
     def refresh(self):
         try:
             pending = bool(load_document(DATA_PATH).get("recovery"))
             self.start.setEnabled(not pending and sys.platform == "win32" and self.silent_source.isChecked())
+            self.preflight.setEnabled(self.start.isEnabled())
             self.recover.setEnabled(pending and sys.platform == "win32" and self.silent_source.isChecked())
             if pending and not self._recovery_notice_shown:
                 self.log.append("A saved session needs recovery before another test can start.")
@@ -639,20 +814,59 @@ class CalibrationWindow(QWidget):
                 self.log.append("Windows is required for this stage's system mute control.")
         except Exception as error:
             self.start.setEnabled(False)
+            self.preflight.setEnabled(False)
             self.recover.setEnabled(False)
             self.log.append(str(error))
 
-    def begin(self, recovery):
+    def load_results(self):
+        try:
+            mapping = load_document(DATA_PATH).get("calibration")
+            if mapping is None:
+                self.results.setRowCount(0)
+                self.result_summary.setText("No saved mapping. A cancelled or failed sweep preserves the previous mapping.")
+                return
+            report = mapping_report(mapping)
+            self.results.setRowCount(len(report["rows"]))
+            for index, (tv, up, down, status) in enumerate(report["rows"]):
+                for column, value in enumerate((tv, ", ".join(map(str, up)), ", ".join(map(str, down)), status)):
+                    if column in (1, 2):
+                        observations = up if column == 1 else down
+                        text = (f"{observations[0]}–{observations[-1]} ({len(observations)} observations)"
+                                if observations else "Not observed")
+                        item = QTableWidgetItem(text)
+                        item.setToolTip(str(value))
+                    else:
+                        item = QTableWidgetItem(str(value))
+                    self.results.setItem(index, column, item)
+            self.results.resizeColumnsToContents()
+            self.result_summary.setText(
+                f"Input {mapping['input']}; raw {mapping['raw_min']}–{mapping['raw_max']}; "
+                f"TV {mapping['tv_min']}–{mapping['tv_max']}. "
+                f"{'Observed pairs verified' if report['verified'] else 'Direction differences / unverified observations'}; "
+                f"{len(report['differences'])} conflicting raw values, {len(report['unverified_raw'])} values seen in one pass, "
+                f"{len(report['tv_gaps'])} gaps in observed TV levels. "
+                "The reported API ceiling is a control limit, not the physical maximum.")
+        except Exception as error:
+            self.results.setRowCount(0)
+            self.result_summary.setText(f"Cannot display mapping: {error}")
+
+    def begin(self, recovery, sweep=False):
         if not self.silent_source.isChecked() or self.worker is not None:
             return
         self.silent_source.setEnabled(False)
         self.start.setEnabled(False)
+        self.preflight.setEnabled(False)
         self.recover.setEnabled(False)
+        self.activity.setRange(0, 0)
+        for widget in (self.raw_lower, self.limit_upper, self.raw_upper):
+            widget.setEnabled(False)
         self.cancel_button.setEnabled(True)
         self.safe_restore.setEnabled(False)
         self.restore_value.setEnabled(False)
         volume = self.restore_value.value() if self.safe_restore.isChecked() else None
-        self.worker = SessionWorker(volume, recovery, self)
+        self.worker = SessionWorker(volume, recovery, self, sweep=sweep,
+                                    raw_lower=self.raw_lower.value(),
+                                    raw_upper=self.raw_upper.value() if self.limit_upper.isChecked() else None)
         self.worker.progress.connect(self.log.append)
         self.worker.completed.connect(self.completed)
         self.worker.finished.connect(self.finished)
@@ -673,10 +887,16 @@ class CalibrationWindow(QWidget):
         self.worker.deleteLater()
         self.worker = None
         self.cancel_button.setEnabled(False)
+        self.activity.setRange(0, 1)
+        self.activity.setValue(1)
+        self.raw_lower.setEnabled(True)
+        self.limit_upper.setEnabled(True)
+        self.raw_upper.setEnabled(self.limit_upper.isChecked())
         self.silent_source.setEnabled(True)
         self.safe_restore.setEnabled(True)
         self.restore_value.setEnabled(self.safe_restore.isChecked())
         self.refresh()
+        self.load_results()
 
     def closeEvent(self, event):
         if self.worker is not None and self.worker.isRunning():

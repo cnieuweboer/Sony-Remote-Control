@@ -334,7 +334,7 @@ class CalibrationServer(QObject):
 APP_NAME = "Sony Remote"
 
 
-__version__ = "2026.10.18.9"
+__version__ = "2026.10.18.10"
 
 
 CONFIG_PATH = Path(__file__).with_name("SonyRemote.json")
@@ -421,6 +421,77 @@ BOOLEAN_CONFIG_KEYS = (
     "CloseToTray",
     "DropdownAnimationWorkaround",
 )
+
+
+def validate_mapping(value):
+    """Validate observed pairs; never infer a linear scale from endpoints."""
+    if (not isinstance(value, dict) or type(value.get("schema_version")) is not int
+            or value["schema_version"] != 1):
+        raise ValueError("Unsupported volume mapping format.")
+    for key in ("input", "tv_id", "amplifier_id", "created_at"):
+        if not isinstance(value.get(key), str) or not value[key]:
+            raise ValueError(f"Missing mapping field: {key}.")
+    for key in ("raw_min", "raw_max", "api_ceiling"):
+        number = value.get(key)
+        if type(number) not in (int, float) or not math.isfinite(number):
+            raise ValueError(f"Invalid mapping field: {key}.")
+    if not 0 <= value["raw_min"] < value["raw_max"] <= value["api_ceiling"]:
+        raise ValueError("Invalid mapped amplifier range.")
+    for key in ("tv_min", "tv_max"):
+        if type(value.get(key)) is not int or value[key] < 0:
+            raise ValueError("Invalid mapped TV range.")
+    if value["tv_min"] > value["tv_max"]:
+        raise ValueError("Invalid mapped TV range.")
+    for direction in ("up", "down"):
+        rows = value.get(direction)
+        if not isinstance(rows, list) or not 2 <= len(rows) <= 513:
+            raise ValueError("Invalid mapping observations.")
+        previous = None
+        for row in rows:
+            if not isinstance(row, dict) or type(row.get("tv")) is not int:
+                raise ValueError("Invalid observed TV level.")
+            raw = row.get("raw")
+            if (type(raw) not in (int, float) or not math.isfinite(raw)
+                    or not value["raw_min"] <= raw <= value["raw_max"]
+                    or not value["tv_min"] <= row["tv"] <= value["tv_max"]):
+                raise ValueError("Observed volume is outside the mapped range.")
+            if previous is not None:
+                if ((raw - previous["raw"]) * (1 if direction == "up" else -1) <= 0
+                        or (row["tv"] - previous["tv"]) * (1 if direction == "up" else -1) < 0):
+                    raise ValueError("Mapping observations are not monotonic.")
+            previous = row
+        ends = (rows[0]["raw"], rows[-1]["raw"])
+        expected = (value["raw_min"], value["raw_max"]) if direction == "up" else (value["raw_max"], value["raw_min"])
+        if ends != expected:
+            raise ValueError("Mapping passes do not cover the same endpoints.")
+    all_tv = [row["tv"] for direction in ("up", "down") for row in value[direction]]
+    if min(all_tv) != value["tv_min"] or max(all_tv) != value["tv_max"]:
+        raise ValueError("Mapping TV limits do not match observations.")
+    return value
+
+
+def mapping_report(mapping):
+    validate_mapping(mapping)
+    up = {row["raw"]: row["tv"] for row in mapping["up"]}
+    down = {row["raw"]: row["tv"] for row in mapping["down"]}
+    differences = sorted(raw for raw in up.keys() & down.keys() if up[raw] != down[raw])
+    unverified = sorted(up.keys() ^ down.keys())
+    rows = []
+    for tv in sorted(set(up.values()) | set(down.values())):
+        rising = sorted(raw for raw, level in up.items() if level == tv)
+        falling = sorted(raw for raw, level in down.items() if level == tv)
+        status = "Verified" if rising == falling else "Direction differs / incomplete"
+        rows.append((tv, rising, falling, status))
+    gaps = [(a, b) for a, b in zip([row[0] for row in rows], [row[0] for row in rows][1:]) if b - a > 1]
+    return {"rows": rows, "differences": differences, "unverified_raw": unverified,
+            "tv_gaps": gaps, "verified": not differences and not unverified}
+
+
+def mapped_tv_volume(mapping, raw, direction="up"):
+    rows = sorted(mapping[direction], key=lambda row: row["raw"])
+    raw = max(mapping["raw_min"], min(mapping["raw_max"], raw))
+    row = min(rows, key=lambda row: (abs(row["raw"] - raw), row["raw"]))
+    return row["tv"], row["raw"] != raw
 
 
 class ConfigError(ValueError):
@@ -1567,6 +1638,11 @@ class SonyRemote(QMainWindow):
         super().__init__()
         self.config = config
         self.calibration_active = False
+        self.volume_mapping = None
+        self._mapping_digest = None
+        self._mapping_error = None
+        self._mapping_direction = "up"
+        self._previous_amplifier_raw = None
         self._calibration_operation = False
         self._status_sequence = 0
         self._status_observed_at = 0
@@ -1601,6 +1677,7 @@ class SonyRemote(QMainWindow):
         self._apply_style()
         self._setup_timers()
         self._setup_config_watcher()
+        self._reload_volume_mapping()
         self._setup_tray()
         self._setup_shortcuts()
         self._setup_calibration()
@@ -2493,12 +2570,32 @@ class SonyRemote(QMainWindow):
             self.power_button.setText("Power On")
 
     def update_volume_ui(self, volume):
+        prefix = ""
         if self._use_amplifier():
-            volume = {"volume": self.amplifier_state["raw_volume"], "mute": self.amplifier_state["mute"]}
-            self.volume_value.setToolTip("Amplifier raw volume (TV-scale calibration is not configured)")
+            raw = self.amplifier_state["raw_volume"]
+            mapping = self._matched_volume_mapping()
+            if mapping:
+                if raw > mapping["raw_max"]:
+                    display, approximate = mapping["tv_max"], False
+                elif raw < mapping["raw_min"]:
+                    display, approximate = mapping["tv_min"], False
+                else:
+                    display, approximate = mapped_tv_volume(mapping, raw, self._mapping_direction)
+                    values = {row["tv"] for direction in ("up", "down") for row in mapping[direction] if row["raw"] == raw}
+                    approximate = approximate or len(values) > 1
+                prefix = "≈" if approximate else ""
+                self.volume_value.setToolTip(f"Calibrated TV scale; amplifier raw {raw}. "
+                                             "≈ marks a nearest observation or direction-dependent level. "
+                                             "Display is capped to the calibrated range.")
+            else:
+                display = raw
+                self.volume_value.setToolTip("Amplifier raw volume (no matching calibration)")
+            volume = {"volume": display, "mute": self.amplifier_state["mute"]}
         else:
             self.volume_value.setToolTip("TV volume")
-        self.volume_value.setText(str(volume.get("volume", "—")))
+        if self._mapping_error:
+            self.volume_value.setToolTip(self.volume_value.toolTip() + "\nCalibration reload failed: " + self._mapping_error)
+        self.volume_value.setText(prefix + str(volume.get("volume", "—")))
         self.mute_button.setText("Unmute" if volume.get("mute") else "Mute")
 
     def update_active_input(self, entries):
@@ -2530,12 +2627,54 @@ class SonyRemote(QMainWindow):
             ),
         )
 
+    def _matched_volume_mapping(self):
+        mapping = self.volume_mapping
+        state = self.amplifier_state or {}
+        tv_id = hashlib.sha256(self.config["Host"].casefold().encode()).hexdigest()
+        if mapping and mapping["tv_id"] == tv_id and mapping["amplifier_id"] == state.get("device_id"):
+            return mapping
+        return None
+
+    def _amplifier_tv_input(self):
+        mapping = self._matched_volume_mapping()
+        return mapping["input"] if mapping else self.config["AmplifierTVInput"]
+
+    def _reload_volume_mapping(self):
+        path = CONFIG_PATH.with_name("VolumeCalibration.json")
+        digest = _file_sha256(path)
+        if digest == self._mapping_digest:
+            return
+        self._mapping_digest = digest
+        self._mapping_error = None
+        if digest is None:
+            self.volume_mapping = None
+        else:
+            try:
+                if path.stat().st_size > 2 * 1024 * 1024:
+                    raise ValueError("Volume calibration JSON exceeds the 2 MiB limit.")
+                document = json.loads(path.read_text(encoding="utf-8"))
+                if (not isinstance(document, dict) or type(document.get("format_version")) is not int
+                        or document["format_version"] != 1):
+                    raise ValueError("Unsupported volume calibration document.")
+                mapping = document.get("calibration")
+                self.volume_mapping = validate_mapping(mapping) if mapping is not None else None
+            except (OSError, ValueError, TypeError, OverflowError, RecursionError) as error:
+                # Keep the last valid mapping after a bad edit. On first load
+                # the configured input and raw-volume display remain available.
+                self._mapping_error = str(error)
+                record_exception(error, "Volume calibration JSON")
+                if hasattr(self, "volume_value"):
+                    self.volume_value.setToolTip(f"Calibration was not reloaded: {error}")
+                return
+        if hasattr(self, "amplifier_client"):
+            self._amplifier_state_changed(self.amplifier_state)
+
     def _use_amplifier(self):
         state = self.amplifier_state
         return bool(not self._shutting_down and state and self.amplifier_client.state_is_fresh
-                    and self.config["AmplifierTVInput"]
+                    and self._amplifier_tv_input()
                     and state["online"] and state["power"] == "on" and state["valid_for_ms"] > 0
-                    and state["input"] == self.config["AmplifierTVInput"]
+                    and state["input"] == self._amplifier_tv_input()
                     and state["raw_volume"] is not None and type(state["mute"]) is bool)
 
     def _amplifier_owns_hotkeys(self):
@@ -2548,6 +2687,13 @@ class SonyRemote(QMainWindow):
                     and self.amplifier_state["global_hotkeys_active"])
 
     def _amplifier_state_changed(self, state):
+        raw = (state or {}).get("raw_volume")
+        if type(raw) in (int, float) and self._previous_amplifier_raw is not None:
+            if raw > self._previous_amplifier_raw:
+                self._mapping_direction = "up"
+            elif raw < self._previous_amplifier_raw:
+                self._mapping_direction = "down"
+        self._previous_amplifier_raw = raw
         self.amplifier_state = state
         routed = self._use_amplifier()
         if routed != self._amplifier_routed:
@@ -2569,7 +2715,7 @@ class SonyRemote(QMainWindow):
     def _route_volume_command(self, command):
         if not self._use_amplifier():
             return False
-        if not self.amplifier_client.send_command(command, self.config["AmplifierTVInput"]):
+        if not self.amplifier_client.send_command(command, self._amplifier_tv_input()):
             self.show_error("Amplifier command could not be queued. Command was not sent to the TV.")
         return True
 
@@ -2871,6 +3017,9 @@ class SonyRemote(QMainWindow):
         config_path = str(CONFIG_PATH)
         if CONFIG_PATH.exists() and config_path not in self.config_watcher.files():
             self.config_watcher.addPath(config_path)
+        mapping_path = str(CONFIG_PATH.with_name("VolumeCalibration.json"))
+        if Path(mapping_path).exists() and mapping_path not in self.config_watcher.files():
+            self.config_watcher.addPath(mapping_path)
         parent = str(CONFIG_PATH.parent)
         if parent not in self.config_watcher.directories():
             self.config_watcher.addPath(parent)
@@ -2891,6 +3040,7 @@ class SonyRemote(QMainWindow):
         if self._shutting_down or self._config_restart_pending:
             return
 
+        self._reload_volume_mapping()
         digest = self._get_config_digest()
         if digest is None or digest == self._config_digest:
             return
