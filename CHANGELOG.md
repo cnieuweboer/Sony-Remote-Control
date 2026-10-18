@@ -4,6 +4,8 @@ Release identifiers below come from the corresponding commits. Some releases upd
 
 ## 2026-10-18
 
+- 2026.10.18.24 — Show keyboard shortcuts in button hover tooltips.
+
 - 2026.10.18.23 — Add Insert for Input and Delete for Settings to focused keyboard shortcuts, preserving text editing.
 
 - 2026.10.18.22 — Add NavigationControlsCompact to choose between separate menu rows (default) and a full three-by-three navigation grid.

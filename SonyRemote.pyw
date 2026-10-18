@@ -339,7 +339,7 @@ class CalibrationServer(QObject):
 APP_NAME = "Sony Remote"
 
 
-__version__ = "2026.10.18.23"
+__version__ = "2026.10.18.24"
 
 
 CONFIG_PATH = Path(__file__).with_name("SonyRemote.json")
@@ -759,6 +759,16 @@ _SHORTCUT_KEYS = {
     0xB2: 'Stop',
     0xB0: 'Next',
     0xB1: 'Prev',
+}
+_SHORTCUT_LABELS = {
+    "Left": "Left Arrow", "Right": "Right Arrow",
+    "Up": "Up Arrow", "Down": "Down Arrow",
+    "Confirm": "Enter", "Return": "Backspace", "Home": "Home",
+    "TvInput": "Insert", "Settings": "Delete",
+    "ChannelUp": "Numpad +", "ChannelDown": "Numpad −",
+    "PlayPause": "Media Play/Pause", "Next": "Media Next",
+    "Prev": "Media Previous",
+    **{f"Num{number}": f"Numpad {number}" for number in range(10)},
 }
 _RETAINED_SHORTCUT_HOOKS = []
 
@@ -1834,6 +1844,7 @@ class SonyRemote(QMainWindow):
             button.clicked.connect(
                 lambda checked=False, c=command: self.send_ircc(c)
             )
+            button.setToolTip("Shortcut: " + _SHORTCUT_LABELS[command])
             self.channel_buttons[command] = button
             grid.addWidget(button, row, column)
 
@@ -1862,6 +1873,7 @@ class SonyRemote(QMainWindow):
             button = QPushButton(text)
             button.setMinimumHeight(36)
             button.clicked.connect(lambda checked=False: self.send_ircc(command))
+            button.setToolTip("Shortcut: " + _SHORTCUT_LABELS[command])
             if command in ("TvInput", "Settings"):
                 self.navigation_menu_buttons[command] = button
             return button
@@ -1909,6 +1921,8 @@ class SonyRemote(QMainWindow):
         self.volume_value.setObjectName("volumeValue")
         self.volume_value.setAlignment(Qt.AlignCenter)
         self.volume_up = QPushButton("+")
+        self.volume_down.setToolTip("Shortcut: Volume Down")
+        self.volume_up.setToolTip("Shortcut: Volume Up")
         self.volume_down.clicked.connect(lambda: self.adjust_volume(-1))
         self.volume_up.clicked.connect(lambda: self.adjust_volume(1))
 
@@ -1918,6 +1932,7 @@ class SonyRemote(QMainWindow):
         layout.addLayout(row)
 
         self.mute_button = QPushButton("Mute")
+        self.mute_button.setToolTip("Shortcut: Volume Mute")
         self.mute_button.clicked.connect(self.toggle_mute)
         layout.addWidget(self.mute_button)
 
@@ -1932,6 +1947,8 @@ class SonyRemote(QMainWindow):
         ):
             button = QPushButton(text)
             button.clicked.connect(lambda checked=False, c=command: self.send_ircc(c))
+            if command in _SHORTCUT_LABELS:
+                button.setToolTip("Shortcut: " + _SHORTCUT_LABELS[command])
             row.addWidget(button)
         layout.addLayout(row)
 
