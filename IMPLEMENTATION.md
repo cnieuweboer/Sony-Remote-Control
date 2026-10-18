@@ -139,3 +139,11 @@ Local cleanup separates runtime-document validation (`validate_runtime_mapping`)
 | Failed restoration or atomic file replacement | Existing mapping bytes remain unchanged; temporary file removed |
 
 These tests do not exercise real Windows Core Audio, physical CEC timing, or device firmware. No calibration behavior changes were needed for this coverage release.
+
+## Small reliability checks
+
+IPC frame readers drain available socket data in bounded chunks, preserving incomplete frames and enforcing the 4,096-byte limit per frame rather than per burst. Configuration-change checks hash and parse the same byte snapshot. Sony applies the same rule to calibration-file reloads, retaining its last valid mapping after a malformed edit.
+
+Windows mutex creation uses `WinDLL(..., use_last_error=True)` and the ctypes cached last-error value immediately after `CreateMutexW`. Handle release retains pointer-sized signatures. Yamaha’s published freshness uses its existing hotkey age constant; no protocol or freshness-policy change is introduced.
+
+`tests/test_reliability.py` covers fragmented UTF-8, multi-read bursts, frame-size boundaries, invalid frames, changing/unreadable configuration files, and mocked Win32 mutex success/existing/error paths. Native Windows mutex behavior still requires Windows testing.

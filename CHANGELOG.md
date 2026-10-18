@@ -4,6 +4,8 @@ Release identifiers below come from the corresponding commits. Some releases upd
 
 ## 2026-10-18
 
+- 2026.10.18.33 — Drain IPC reads with frame bounds, use cached Win32 mutex errors, and hash/validate the same configuration bytes. Sony mapping reload also uses one snapshot; move the helper QLockFile import. Add focused reliability regression tests.
+
 - 2026.10.18.32 — Add 31 deterministic calibration and mapping regression tests. Calibration behavior and file format are unchanged; only the helper version label changes. Both remotes remain at 2026.10.18.31.
 
 - 2026.10.18.31 — Clean up local configuration/state helpers and endpoint naming, reduce Sony duplication, and add development-only regression tests. Scripts remain self-contained; IPC names and calibration file format are unchanged.

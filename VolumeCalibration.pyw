@@ -10,14 +10,14 @@ import threading
 import time
 import uuid
 
-from PySide6.QtCore import QThread, Signal
+from PySide6.QtCore import QLockFile, QThread, Signal
 from PySide6.QtNetwork import QLocalSocket
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QLabel, QMessageBox, QPushButton,
     QProgressBar, QTextEdit, QVBoxLayout, QWidget,
 )
 
-__version__ = "2026.10.18.32"
+__version__ = "2026.10.18.33"
 DATA_PATH = Path(__file__).resolve().with_name("VolumeCalibration.json")
 IPC_USER_SUFFIX = hashlib.sha256(str(Path.home()).encode("utf-8")).hexdigest()[:16]
 
@@ -1004,7 +1004,6 @@ class CalibrationWindow(QWidget):
 
 def main():
     app = QApplication(sys.argv)
-    from PySide6.QtCore import QLockFile
     # Prevent two helpers replacing the same mapping; device leases separately
     # prevent concurrent calibration through either remote.
     lock = QLockFile(str(DATA_PATH) + ".lock")

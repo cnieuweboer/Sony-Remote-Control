@@ -55,24 +55,29 @@ def _ipc_encode(message):
 
 
 def _ipc_frames(socket, buffer):
-    # Bound reads even if another local process sends an oversized frame.
-    buffer.extend(bytes(socket.read(IPC_MAX_FRAME + 1)))
     messages = []
-    while b"\n" in buffer:
-        frame, _, tail = buffer.partition(b"\n")
-        buffer[:] = tail
-        if len(frame) > IPC_MAX_FRAME:
+    while socket.bytesAvailable():
+        # Parse between bounded reads so a burst of valid frames is allowed,
+        # without allowing an oversized complete or partial frame.
+        chunk = bytes(socket.read(IPC_MAX_FRAME + 1))
+        if not chunk:
+            break
+        buffer.extend(chunk)
+        while b"\n" in buffer:
+            frame, _, tail = buffer.partition(b"\n")
+            buffer[:] = tail
+            if len(frame) > IPC_MAX_FRAME:
+                raise ValueError("Local protocol frame too large")
+            try:
+                message = json.loads(frame)
+            except RecursionError as error:
+                raise ValueError("Local protocol nesting too deep") from error
+            if (not isinstance(message, dict) or type(message.get("version")) is not int
+                    or message["version"] != 1):
+                raise ValueError("Unsupported local protocol message")
+            messages.append(message)
+        if len(buffer) > IPC_MAX_FRAME:
             raise ValueError("Local protocol frame too large")
-        try:
-            message = json.loads(frame)
-        except RecursionError as error:
-            raise ValueError("Local protocol nesting too deep") from error
-        if (not isinstance(message, dict) or type(message.get("version")) is not int
-                or message["version"] != 1):
-            raise ValueError("Unsupported local protocol message")
-        messages.append(message)
-    if len(buffer) > IPC_MAX_FRAME:
-        raise ValueError("Local protocol frame too large")
     return messages
 
 
@@ -355,7 +360,7 @@ class CalibrationServer(QObject):
 APP_NAME = "Sony Remote"
 
 
-__version__ = "2026.10.18.31"
+__version__ = "2026.10.18.33"
 
 
 CONFIG_PATH = Path(__file__).with_name("SonyRemote.json")
@@ -743,11 +748,16 @@ def save_config(config):
             pass
 
 
-def _file_sha256(path):
+def _file_snapshot(path):
     try:
-        return hashlib.sha256(path.read_bytes()).digest()
+        content = path.read_bytes()
     except OSError:
-        return None
+        return None, None
+    return content, hashlib.sha256(content).digest()
+
+
+def _file_sha256(path):
+    return _file_snapshot(path)[1]
 
 
 # ----------------------------
@@ -769,6 +779,7 @@ class TooltipDelayStyle(QProxyStyle):
 
 
 _instance_mutex_handle = None
+_instance_mutex_api = None
 
 
 _instance_lock_file = None
@@ -1026,24 +1037,24 @@ class _WindowsShortcutHook(QObject):
 
 
 def acquire_single_instance():
-    global _instance_mutex_handle, _instance_lock_file
+    global _instance_mutex_handle, _instance_mutex_api, _instance_lock_file
 
     if sys.platform == "win32":
-        kernel32 = ctypes.windll.kernel32
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
         kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, ctypes.c_bool, ctypes.c_wchar_p]
         kernel32.CreateMutexW.restype = ctypes.c_void_p
-        kernel32.GetLastError.argtypes = []
-        kernel32.GetLastError.restype = ctypes.c_ulong
         kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
         kernel32.CloseHandle.restype = ctypes.c_bool
+        ctypes.set_last_error(0)
         handle = kernel32.CreateMutexW(None, False, INSTANCE_MUTEX_NAME)
-        last_error = kernel32.GetLastError()
+        last_error = ctypes.get_last_error()
         if not handle:
             raise OSError(last_error, "CreateMutexW failed.")
         if last_error == 183:  # ERROR_ALREADY_EXISTS
             kernel32.CloseHandle(handle)
             return False
         _instance_mutex_handle = handle
+        _instance_mutex_api = kernel32
         return True
 
     # Include the user ID so separate logged-in users do not block each other.
@@ -1060,15 +1071,16 @@ def acquire_single_instance():
 
 
 def release_single_instance():
-    global _instance_mutex_handle, _instance_lock_file
+    global _instance_mutex_handle, _instance_mutex_api, _instance_lock_file
 
     if sys.platform == "win32":
         if _instance_mutex_handle:
             try:
-                ctypes.windll.kernel32.CloseHandle(_instance_mutex_handle)
+                _instance_mutex_api.CloseHandle(_instance_mutex_handle)
             except Exception:
                 pass
             _instance_mutex_handle = None
+            _instance_mutex_api = None
         return
 
     if _instance_lock_file is not None:
@@ -2680,7 +2692,7 @@ class SonyRemote(QMainWindow):
 
     def _reload_volume_mapping(self):
         path = CONFIG_PATH.with_name("VolumeCalibration.json")
-        digest = _file_sha256(path)
+        content, digest = _file_snapshot(path)
         if digest == self._mapping_digest:
             return
         self._mapping_digest = digest
@@ -2688,9 +2700,9 @@ class SonyRemote(QMainWindow):
             self.volume_mapping = None
         else:
             try:
-                if path.stat().st_size > 2 * 1024 * 1024:
+                if len(content) > 2 * 1024 * 1024:
                     raise ValueError("Volume calibration JSON exceeds the 2 MiB limit.")
-                document = json.loads(path.read_text(encoding="utf-8"))
+                document = json.loads(content.decode("utf-8"))
                 self.volume_mapping = prepare_volume_mapping(document)
             except (OSError, ValueError, TypeError, OverflowError, RecursionError) as error:
                 # Keep the last valid mapping after a bad edit. On first load
@@ -3071,13 +3083,12 @@ class SonyRemote(QMainWindow):
             return
 
         self._reload_volume_mapping()
-        digest = self._get_config_digest()
+        content, digest = _file_snapshot(CONFIG_PATH)
         if digest is None or digest == self._config_digest:
             return
 
         try:
-            with CONFIG_PATH.open("r", encoding="utf-8") as f:
-                candidate = json.load(f)
+            candidate = json.loads(content.decode("utf-8"))
             validate_config(candidate)
         except (OSError, ValueError) as ex:
             if digest != self._invalid_config_digest:
