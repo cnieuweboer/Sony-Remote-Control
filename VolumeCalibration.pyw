@@ -1,4 +1,4 @@
-"""Standalone muted CEC preflight and restoration helper. Mapping is stage two."""
+"""Standalone silent-source CEC preflight and restoration helper. Mapping is stage two."""
 import ctypes
 import hashlib
 import json
@@ -17,7 +17,7 @@ from PySide6.QtWidgets import (
     QSpinBox, QTextEdit, QVBoxLayout, QWidget,
 )
 
-__version__ = "2026.10.18.5"
+__version__ = "2026.10.18.6"
 DATA_PATH = Path(__file__).resolve().with_name("VolumeCalibration.json")
 USER_SUFFIX = hashlib.sha256(str(Path.home()).encode()).hexdigest()[:16]
 TIMEOUT = 5.0
@@ -215,10 +215,11 @@ class Peer:
 
 class CalibrationSession:
     def __init__(self, cancel, progress, path=DATA_PATH, mute_factory=WindowsMute,
-                 peer_factory=Peer, restore_volume=None, recovery=False):
+                 peer_factory=Peer, restore_volume=None, recovery=False, silent_source_confirmed=False):
         self.cancel, self.progress, self.path = cancel, progress, path
         self.mute_factory, self.peer_factory = mute_factory, peer_factory
         self.restore_volume, self.recovery = restore_volume, recovery
+        self.silent_source_confirmed = silent_source_confirmed
         self.token = uuid.uuid4().hex
         self.peers = {}
         self.next_renew = 0
@@ -277,7 +278,7 @@ class CalibrationSession:
         elif action == "release":
             peer.acquired = False
 
-    def guard(self, require_mute=False):
+    def guard(self, require_windows_mute=False):
         amp, tv = (self.peers[role] for role in ("amplifier", "tv"))
         if not amp.fresh() or not tv.fresh():
             raise CalibrationError("Device state became stale.")
@@ -291,13 +292,11 @@ class CalibrationSession:
                     or a.get("device_id") != self.saved["amplifier_id"]
                     or t.get("device_id") != self.saved["tv_id"]):
                 raise CalibrationError("The amplifier input or configured device changed. Restore the original pairing before recovery.")
-        if require_mute and (a.get("mute") is not True or t.get("mute") is not True):
-            raise CalibrationError("Mute was lost during the muted test.")
-        if require_mute and not self.windows.get():
+        if require_windows_mute and not self.windows.get():
             raise CalibrationError("Windows was unmuted during the test.")
         return a, t
 
-    def wait(self, predicate, description, *, muted=False, settle=True):
+    def wait(self, predicate, description, *, windows_muted=False, settle=True):
         self.progress(description)
         start = time.monotonic()
         deadline = start + TIMEOUT
@@ -308,7 +307,7 @@ class CalibrationSession:
             self.pump()
             if not all(peer.fresh() for peer in self.peers.values()):
                 continue
-            a, t = self.guard(require_mute=muted)
+            a, t = self.guard(require_windows_mute=windows_muted)
             pair = (a["sample_id"], t["sample_id"])
             values = (a.get("raw_volume"), a.get("mute"), t.get("volume"), t.get("mute"))
             if predicate(a, t):
@@ -358,20 +357,17 @@ class CalibrationSession:
     def prepare_and_probe(self):
         self.capture()
         self.windows.set(True)
-        self.request("tv", "set_mute", True)
-        self.wait(lambda a, t: a["mute"] is True and t["mute"] is True,
-                  "Verifying TV and amplifier mute")
-        if not self.windows.get():
-            raise CalibrationError("Windows mute could not be verified.")
-        a, t = self.guard(require_mute=True)
+        # Volume changes commonly clear TV/CEC mute. Silence is supplied by
+        # the explicitly confirmed source, not a mute flag that cannot persist.
+        a, t = self.guard(require_windows_mute=True)
         target = t["volume"] - 1 if t["volume"] > t["minimum"] else t["volume"] + 1
         if target > t["maximum"]:
             raise CalibrationError("The TV exposes no usable volume step.")
         original_raw = a["raw_volume"]
         self.request("tv", "set_volume", target)
         self.wait(lambda a, t: t["volume"] == target and a["raw_volume"] != original_raw,
-                  "Verifying a single muted TV/CEC volume step", muted=True)
-        self.progress("Muted CEC check passed. No calibration sweep was performed.")
+                  "Verifying a single TV/CEC volume step on the silent source", windows_muted=True)
+        self.progress("Silent-source CEC check passed. No calibration sweep was performed.")
 
     def restore(self):
         self.restoring = True
@@ -381,10 +377,7 @@ class CalibrationSession:
             raise CalibrationError("Windows output device changed. Restore the original output before recovery.")
         # Verify identity and input BEFORE issuing any device mutations.
         self.guard()
-        self.request("tv", "set_mute", True)
-        self.wait(lambda a, t: a["mute"] is True and t["mute"] is True,
-                  "Verifying mute before volume restoration")
-        before_a, before_t = self.guard(require_mute=True)
+        before_a, before_t = self.guard(require_windows_mute=True)
         before_raw, before_tv = before_a["raw_volume"], before_t["volume"]
         target = self.saved["restore_volume"]
         self.request("tv", "set_volume", target)
@@ -395,7 +388,7 @@ class CalibrationSession:
                 return a["raw_volume"] == self.saved["amplifier_volume"]
             return (a["raw_volume"] <= self.saved["amplifier_volume"]
                     and (target == before_tv or a["raw_volume"] != before_raw))
-        self.wait(restored, "Verifying restored TV and amplifier volume", muted=True)
+        self.wait(restored, "Verifying restored TV and amplifier volume", windows_muted=True)
         self.request("tv", "set_mute", self.saved["tv_mute"])
         self.wait(lambda a, t: a["mute"] == self.saved["amplifier_mute"] and t["mute"] == self.saved["tv_mute"],
                   "Verifying restored TV and amplifier mute")
@@ -408,9 +401,11 @@ class CalibrationSession:
         self.progress("Volume and mute restoration verified. Windows mute restored last.")
 
     def run(self):
-        outcome = "Muted CEC check completed; original states restored."
+        outcome = "Silent-source CEC check completed; saved states restored."
         failure = None
         try:
+            if not self.silent_source_confirmed:
+                raise CalibrationError("Confirm that the TV is on a silent input/source and all other playback is stopped before testing or recovery.")
             self.document = load_document(self.path)
             existing = self.document.get("recovery")
             if existing and not self.recovery:
@@ -442,7 +437,7 @@ class CalibrationSession:
                     except Exception:
                         pass
                     failure = CalibrationError(f"{failure or 'Session ended'}. Restoration could not be verified: {error}. "
-                                               "Windows has been left muted where possible. Keep devices muted, select the original input/output, "
+                                               "Windows has been left muted where possible. Keep the TV on a silent source, select the original amplifier input and Windows output, "
                                                "start both remotes, and use Recover saved states.")
             self.restoring = True
             for role, peer in list(self.peers.items()):
@@ -472,7 +467,7 @@ class SessionWorker(QThread):
     def run(self):
         try:
             message = CalibrationSession(self.cancel, self.progress.emit, restore_volume=self.restore_volume,
-                                         recovery=self.recovery).run()
+                                         recovery=self.recovery, silent_source_confirmed=True).run()
             self.completed.emit(True, message)
         except Exception as error:
             self.completed.emit(False, str(error))
@@ -486,12 +481,16 @@ class CalibrationWindow(QWidget):
         layout = QVBoxLayout(self)
         instructions = QLabel(
             "Start both updated remotes. Set the amplifier to the input connected to the TV, "
-            "and start at a comfortable volume below its API ceiling. Stop other audio playback.\n\n"
-            "This first stage mutes Windows and the TV, verifies amplifier mute, tests one CEC volume step, "
+            "and start at a comfortable volume below its API ceiling. Select a TV input/source that plays NO sound "
+            "and stop all other playback. Windows mute does not silence the TV or other amplifier sources.\n\n"
+            "Volume changes can automatically unmute the TV and amplifier. This check mutes Windows only, tests one CEC volume step, "
             "then restores and verifies the saved states. It does not create a volume mapping yet. "
             "Do not use physical device controls during the test.")
         instructions.setWordWrap(True)
         layout.addWidget(instructions)
+        self.silent_source = QCheckBox("I confirm the TV source is silent and all other playback is stopped")
+        self.silent_source.toggled.connect(lambda _: self.refresh())
+        layout.addWidget(self.silent_source)
         self.safe_restore = QCheckBox("Use a lower safe TV restore volume")
         self.restore_value = QSpinBox()
         self.restore_value.setRange(0, 1000)
@@ -500,7 +499,7 @@ class CalibrationWindow(QWidget):
         layout.addWidget(self.safe_restore)
         layout.addWidget(self.restore_value)
         buttons = QHBoxLayout()
-        self.start = QPushButton("Run muted CEC check")
+        self.start = QPushButton("Run silent-source CEC check")
         self.recover = QPushButton("Recover saved states")
         self.cancel_button = QPushButton("Cancel and restore")
         self.cancel_button.setEnabled(False)
@@ -519,8 +518,8 @@ class CalibrationWindow(QWidget):
     def refresh(self):
         try:
             pending = bool(load_document(DATA_PATH).get("recovery"))
-            self.start.setEnabled(not pending and sys.platform == "win32")
-            self.recover.setEnabled(pending and sys.platform == "win32")
+            self.start.setEnabled(not pending and sys.platform == "win32" and self.silent_source.isChecked())
+            self.recover.setEnabled(pending and sys.platform == "win32" and self.silent_source.isChecked())
             if pending:
                 self.log.append("A saved session needs recovery before another test can start.")
             if sys.platform != "win32":
@@ -531,6 +530,9 @@ class CalibrationWindow(QWidget):
             self.log.append(str(error))
 
     def begin(self, recovery):
+        if not self.silent_source.isChecked() or self.worker is not None:
+            return
+        self.silent_source.setEnabled(False)
         self.start.setEnabled(False)
         self.recover.setEnabled(False)
         self.cancel_button.setEnabled(True)
@@ -558,6 +560,7 @@ class CalibrationWindow(QWidget):
         self.worker.deleteLater()
         self.worker = None
         self.cancel_button.setEnabled(False)
+        self.silent_source.setEnabled(True)
         self.safe_restore.setEnabled(True)
         self.restore_value.setEnabled(self.safe_restore.isChecked())
         self.refresh()
