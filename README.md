@@ -134,7 +134,7 @@ Sony loads a successful calibration automatically; no manual `AmplifierTVInput` 
 
 ## Navigation
 
-Compact **Input** and **Settings** buttons sit beside Up, matching the physical remote layout. Input opens the TV’s input menu; the separate input dropdown remains available.
+**Input** and **Settings** buttons sit beside Up, matching the physical remote layout. Input opens the TV’s input menu; the separate input dropdown remains available.
 
 ## Text input
 

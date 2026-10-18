@@ -4,6 +4,8 @@ Release identifiers below come from the corresponding commits. Some releases upd
 
 ## 2026-10-18
 
+- 2026.10.18.21 — Match Input and Settings button sizes to the navigation grid.
+
 - 2026.10.18.20 — Add compact Input and Settings buttons beside Up in the navigation area, using commands advertised by the TV.
 
 - 2026.10.18.19 — Share Yamaha’s formatted volume and unit over IPC; Sony mirrors them when no calibration matches. Update both remotes together.

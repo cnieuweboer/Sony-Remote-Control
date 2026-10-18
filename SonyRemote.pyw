@@ -339,7 +339,7 @@ class CalibrationServer(QObject):
 APP_NAME = "Sony Remote"
 
 
-__version__ = "2026.10.18.20"
+__version__ = "2026.10.18.21"
 
 
 CONFIG_PATH = Path(__file__).with_name("SonyRemote.json")
@@ -1866,14 +1866,14 @@ class SonyRemote(QMainWindow):
             button.clicked.connect(lambda checked=False, c=command: self.send_ircc(c))
             grid.addWidget(button, row, col)
         self.navigation_menu_buttons = {}
-        for text, column, command, alignment in (
-            ("Input", 0, "TvInput", Qt.AlignLeft),
-            ("Settings", 2, "Settings", Qt.AlignRight),
+        for text, column, command in (
+            ("Input", 0, "TvInput"),
+            ("Settings", 2, "Settings"),
         ):
             button = QPushButton(text)
-            button.setFixedHeight(28)
+            button.setMinimumHeight(36)
             button.clicked.connect(lambda checked=False, c=command: self.send_ircc(c))
-            grid.addWidget(button, 0, column, alignment | Qt.AlignVCenter)
+            grid.addWidget(button, 0, column)
             self.navigation_menu_buttons[command] = button
         layout.addLayout(grid)
         row = QHBoxLayout()
