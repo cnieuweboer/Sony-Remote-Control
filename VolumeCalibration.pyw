@@ -18,7 +18,7 @@ from PySide6.QtWidgets import (
     QProgressBar, QTextEdit, QVBoxLayout, QWidget,
 )
 
-__version__ = "2026.10.18.10"
+__version__ = "2026.10.18.11"
 DATA_PATH = Path(__file__).resolve().with_name("VolumeCalibration.json")
 USER_SUFFIX = hashlib.sha256(str(Path.home()).encode()).hexdigest()[:16]
 TIMEOUT = 5.0
@@ -37,7 +37,7 @@ class Cancelled(CalibrationError):
     pass
 
 
-def validate_mapping(value):
+def validate_mapping_v1(value):
     """Validate observed pairs; never infer a linear scale from endpoints."""
     if (not isinstance(value, dict) or type(value.get("schema_version")) is not int
             or value["schema_version"] != 1):
@@ -84,7 +84,7 @@ def validate_mapping(value):
     return value
 
 
-def mapping_report(mapping):
+def mapping_report_v1(mapping):
     validate_mapping(mapping)
     up = {row["raw"]: row["tv"] for row in mapping["up"]}
     down = {row["raw"]: row["tv"] for row in mapping["down"]}
@@ -101,11 +101,149 @@ def mapping_report(mapping):
             "tv_gaps": gaps, "verified": not differences and not unverified}
 
 
-def mapped_tv_volume(mapping, raw, direction="up"):
+def mapped_tv_volume_v1(mapping, raw, direction="up"):
     rows = sorted(mapping[direction], key=lambda row: row["raw"])
     raw = max(mapping["raw_min"], min(mapping["raw_max"], raw))
     row = min(rows, key=lambda row: (abs(row["raw"] - raw), row["raw"]))
     return row["tv"], row["raw"] != raw
+
+
+def validate_mapping(value):
+    if isinstance(value, dict) and type(value.get("schema_version")) is int and value["schema_version"] == 1:
+        return validate_mapping_v1(value)
+    if not isinstance(value, dict) or type(value.get("schema_version")) is not int or value["schema_version"] != 2:
+        raise ValueError("Unsupported volume mapping format.")
+    for key in ("input", "tv_id", "amplifier_id", "created_at"):
+        if not isinstance(value.get(key), str) or not value[key]:
+            raise ValueError(f"Invalid mapping field: {key}.")
+    for key in ("raw_max", "tv_min", "tv_max", "observed_min_raw", "api_ceiling"):
+        if type(value.get(key)) is not int or value[key] < 0:
+            raise ValueError(f"Invalid integer mapping field: {key}.")
+    if (type(value.get("raw_min")) is not int or value["raw_min"] != 0 or not 0 <= value["observed_min_raw"] < value["raw_max"] <= min(value["api_ceiling"], 10000)
+            or value["tv_min"] > value["tv_max"]):
+        raise ValueError("Invalid canonical mapping bounds.")
+    observations = value.get("observations")
+    checks = value.get("gap_checks")
+    entries = value.get("lookup")
+    if not isinstance(observations, list) or not 2 <= len(observations) <= 5000 or not isinstance(checks, dict):
+        raise ValueError("Invalid canonical observations/evidence.")
+    measured = {}
+    for row in observations:
+        if (not isinstance(row, dict) or type(row.get("raw")) is not int or type(row.get("tv")) is not int
+                or not value["observed_min_raw"] <= row["raw"] <= value["raw_max"]
+                or not value["tv_min"] <= row["tv"] <= value.get("observed_tv_max", value["tv_max"])):
+            raise ValueError("Invalid canonical observation.")
+        measured.setdefault(row["raw"], []).append(row["tv"])
+    if min(measured) != value["observed_min_raw"] or max(measured) != value["raw_max"]:
+        raise ValueError("Canonical observed bounds do not match measurements.")
+    if not isinstance(entries, list) or len(entries) != value["raw_max"] + 1:
+        raise ValueError("Canonical lookup must cover every integer raw value.")
+    previous = value["tv_min"]
+    for raw, entry in enumerate(entries):
+        if (not isinstance(entry, dict) or type(entry.get("raw")) is not int or entry["raw"] != raw
+                or type(entry.get("tv")) is not int or not previous <= entry["tv"] <= value["tv_max"]):
+            raise ValueError("Canonical lookup must be complete and monotonic.")
+        previous = entry["tv"]
+        source = entry.get("source")
+        if source == "measured":
+            if raw not in measured or entry["tv"] != min(measured[raw]):
+                raise ValueError("Measured entry does not match its evidence.")
+        elif source == "boundary-clamped":
+            if raw >= value["observed_min_raw"] or entry["tv"] != value["tv_min"]:
+                raise ValueError("Invalid lower-boundary clamp.")
+        elif source == "interpolated":
+            evidence = checks.get(str(raw), [])
+            for direction in (-1, 1):
+                crossings = [e for e in evidence if isinstance(e, dict) and type(e.get("direction")) is int and e["direction"] == direction
+                             and type(e.get("from")) is int and type(e.get("to")) is int
+                             and e["from"] in measured and e["to"] in measured
+                             and (e["from"] - raw) * (e["to"] - raw) < 0
+                             and (e["to"] - e["from"]) * direction > 0]
+                if len(crossings) < 2:
+                    raise ValueError("Interpolation requires two verified crossings from each direction.")
+            if raw in measured or raw < value["observed_min_raw"]:
+                raise ValueError("A measured/boundary value cannot be interpolated.")
+            anchors = entry.get("anchors", [])
+            if (not isinstance(anchors, list) or len(anchors) != 2 or not all(type(a) is int for a in anchors)
+                    or not anchors[0] < raw < anchors[1] or any(a not in measured for a in anchors)
+                    or not min(measured[anchors[0]]) <= entry["tv"] <= min(measured[anchors[1]])):
+                raise ValueError("Invalid interpolation anchors.")
+        else:
+            raise ValueError("Unknown lookup provenance.")
+    if entries[0]["tv"] != value["tv_min"] or entries[-1]["tv"] != value["tv_max"]:
+        raise ValueError("Canonical TV limits do not match lookup endpoints.")
+    return value
+
+
+def mapping_report(mapping):
+    validate_mapping(mapping)
+    if mapping["schema_version"] == 1:
+        return mapping_report_v1(mapping)
+    candidates = {}
+    for row in mapping["observations"]:
+        candidates.setdefault(row["raw"], set()).add(row["tv"])
+    return {"canonical": True, "entries": mapping["lookup"],
+            "conflicts": sorted(raw for raw, levels in candidates.items() if len(levels) > 1),
+            "counts": {source: sum(entry["source"] == source for entry in mapping["lookup"])
+                       for source in ("measured", "boundary-clamped", "interpolated")}}
+
+
+def mapped_tv_volume(mapping, raw, direction="up"):
+    if mapping["schema_version"] == 1:
+        return mapped_tv_volume_v1(mapping, raw, direction)
+    bounded = max(0, min(mapping["raw_max"], raw))
+    index = int(math.floor(bounded + 0.5))
+    entry = mapping["lookup"][index]
+    return entry["tv"], bounded != index or entry["source"] == "interpolated"
+
+
+def build_canonical_mapping(observations, checks, saved, ceiling, top, tv_min):
+    candidates = {}
+    for row in observations:
+        candidates.setdefault(row["raw"], set()).add(row["tv"])
+    known = sorted(candidates)
+    first = known[0]
+    # Minimum observed TV number is deterministic, and in particular retains
+    # the lowest TV level associated with a saturated API readout.
+    measured = {raw: min(levels) for raw, levels in candidates.items()}
+    rounding = {"nearest-half-up": lambda x: math.floor(x + 0.5),
+                "floor": math.floor, "ceil": math.ceil}
+    lookup = []
+    for raw in range(top + 1):
+        if raw in measured:
+            entry = {"raw": raw, "tv": measured[raw], "source": "measured"}
+            if len(candidates[raw]) > 1:
+                entry["observed_tv_values"] = sorted(candidates[raw])
+        elif raw < first:
+            entry = {"raw": raw, "tv": tv_min, "source": "boundary-clamped"}
+        else:
+            lower = max(value for value in known if value < raw)
+            upper = min(value for value in known if value > raw)
+            # Select rounding from nearby measured transitions using held-out
+            # middle observations. Ties use nearest-half-up deterministically.
+            triples = list(zip(known, known[1:], known[2:]))
+            triples.sort(key=lambda triple: abs(triple[1] - raw))
+            scores = {}
+            for name, rule in rounding.items():
+                errors = []
+                for a, b, c in triples[:8]:
+                    predicted = measured[a] + (measured[c] - measured[a]) * (b - a) / (c - a)
+                    errors.append(abs(rule(predicted) - measured[b]))
+                scores[name] = sum(errors) / len(errors) if errors else 0
+            selected = min(rounding, key=lambda name: scores[name])
+            estimate = measured[lower] + (measured[upper] - measured[lower]) * (raw - lower) / (upper - lower)
+            tv = max(measured[lower], min(measured[upper], rounding[selected](estimate)))
+            entry = {"raw": raw, "tv": tv, "source": "interpolated",
+                     "anchors": [lower, upper], "rounding": selected}
+        lookup.append(entry)
+    mapping = {"schema_version": 2, "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+               "input": saved["input"], "tv_id": saved["tv_id"], "amplifier_id": saved["amplifier_id"],
+               "api_ceiling": ceiling, "raw_min": 0, "raw_max": top,
+               "observed_min_raw": first, "tv_min": tv_min, "tv_max": measured[top],
+               "observed_tv_max": max(row["tv"] for row in observations),
+               "observations": observations, "gap_checks": checks, "lookup": lookup}
+    validate_mapping(mapping)
+    return mapping
 
 
 def load_document(path):
@@ -558,55 +696,97 @@ class CalibrationSession:
 
     def sweep_limits(self):
         ceiling = self.peers["amplifier"].state["raw_max_volume"]
-        lower = self.raw_lower
         upper = ceiling if self.raw_upper is None else self.raw_upper
-        if (not self.number(lower) or not self.number(upper)
-                or not 0 <= lower < upper <= ceiling):
-            raise CalibrationError("Sweep limits must satisfy 0 <= lower < upper <= amplifier API ceiling.")
-        return lower, upper, ceiling
+        if (not self.number(ceiling) or not float(ceiling).is_integer()
+                or not self.number(upper) or not float(upper).is_integer()
+                or not 0 < upper <= min(ceiling, 10000) or self.raw_lower != 0):
+            raise CalibrationError("Canonical calibration needs integer raw values, an upper limit <= min(API ceiling, 10000), and automatic TV-minimum positioning.")
+        return 0, int(upper), int(ceiling)
 
     def calibration_sweep(self):
-        lower, upper, ceiling = self.sweep_limits()
-        self.progress(f"Moving to lower raw limit {lower}; the source must remain silent throughout the sweep.")
-        self.seek_volume(raw_target=lower)
-        def observation():
-            amp, tv = self.guard(require_windows_mute=True)
-            return {"tv": tv["volume"], "raw": amp["raw_volume"]}
-        upward = [observation()]
+        _, upper, ceiling = self.sweep_limits()
+        observations = []
+        checks = {}
+        def observe(phase, direction=0):
+            a, t = self.guard(require_windows_mute=True)
+            raw = a["raw_volume"]
+            if not self.number(raw) or not float(raw).is_integer() or not 0 <= raw <= upper:
+                raise CalibrationError("A step left the requested integer raw range.")
+            row = {"raw": int(raw), "tv": t["volume"], "phase": phase, "direction": direction}
+            observations.append(row)
+            return row
+        self.progress("Moving the TV to its reported minimum using relative CEC steps.")
+        minimum = self.peers["tv"].state["minimum"]
+        self.seek_volume(tv_target=minimum)
+        first = observe("up")
+        if first["raw"] >= upper:
+            raise CalibrationError("There is no usable raw range above the TV minimum.")
+        upward = [first]
         start = time.monotonic()
-        while upward[-1]["raw"] < upper:
+        while upward[-1]["raw"] < upper and upward[-1]["tv"] < self.peers["tv"].state["maximum"]:
             if len(upward) > MAX_VOLUME_STEPS or time.monotonic() - start >= SWEEP_SECONDS:
                 raise CalibrationError("Upward sweep exceeded its step/time limit.")
             self.relative_step(1)
-            row = observation()
-            if row["raw"] > upper:
-                raise CalibrationError("A volume step crossed the requested upper limit. Choose a reachable limit.")
+            row = observe("up", 1)
             upward.append(row)
-            self.progress(f"Upward {len(upward) - 1}: amplifier raw {row['raw']}, TV {row['tv']}.")
-            # No more upward commands after the first observed ceiling reading.
-        downward = [observation()]
+            self.progress(f"Upward: amplifier {row['raw']} → TV {row['tv']}.")
+        top = upward[-1]["raw"]
+        observe("down")
         start = time.monotonic()
-        while downward[-1]["raw"] > lower:
-            if len(downward) > MAX_VOLUME_STEPS or time.monotonic() - start >= SWEEP_SECONDS:
+        down_steps = 0
+        while self.peers["tv"].state["volume"] > minimum:
+            if down_steps >= MAX_VOLUME_STEPS or time.monotonic() - start >= SWEEP_SECONDS:
                 raise CalibrationError("Downward sweep exceeded its step/time limit.")
             self.relative_step(-1)
-            row = observation()
-            if row["raw"] < lower:
-                raise CalibrationError("A volume step crossed the requested lower limit. Choose a reachable limit.")
-            downward.append(row)
-            self.progress(f"Downward {len(downward) - 1}: amplifier raw {row['raw']}, TV {row['tv']}.")
-        all_rows = upward + downward
-        mapping = {"schema_version": 1,
-                   "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                   "input": self.saved["input"], "tv_id": self.saved["tv_id"],
-                   "amplifier_id": self.saved["amplifier_id"], "api_ceiling": ceiling,
-                   "raw_min": lower, "raw_max": upward[-1]["raw"],
-                   "tv_min": min(row["tv"] for row in all_rows),
-                   "tv_max": max(row["tv"] for row in all_rows),
-                   "up": upward, "down": downward}
-        report = mapping_report(mapping)
-        self.progress("Both passes complete. " + ("Observed pairs agree." if report["verified"]
-                      else "Directional differences were found; the results will identify unverified observations."))
+            row = observe("down", -1)
+            down_steps += 1
+            self.progress(f"Downward: amplifier {row['raw']} → TV {row['tv']}.")
+        # Cross each missing integer twice from BOTH directions. A target found
+        # during positioning is measured too; any command error is inconclusive,
+        # never evidence that the raw value is unreachable.
+        gap_start = time.monotonic()
+        gap_steps = 0
+        def step(direction):
+            nonlocal gap_steps
+            if gap_steps >= 2048 or time.monotonic() - gap_start >= 1800:
+                raise CalibrationError("Gap verification exceeded its 2048-step/30-minute budget.")
+            current = self.guard(require_windows_mute=True)[0]["raw_volume"]
+            if (direction > 0 and current >= top) or (direction < 0 and current <= 0):
+                raise CalibrationError("Cannot verify a gap without leaving the observed range.")
+            self.relative_step(direction)
+            gap_steps += 1
+            return observe("gap", direction)
+        def measured(raw):
+            return any(row["raw"] == raw for row in observations)
+        while True:
+            missing = [raw for raw in range(min(row["raw"] for row in observations) + 1, top)
+                       if not measured(raw) and str(raw) not in checks]
+            if not missing:
+                break
+            target = missing[0]
+            self.progress(f"Verifying skipped amplifier value {target} from both directions.")
+            evidence = []
+            for direction in (1, -1, 1, -1):
+                current = self.guard(require_windows_mute=True)[0]["raw_volume"]
+                while (current >= target if direction > 0 else current <= target):
+                    row = step(-direction)
+                    current = row["raw"]
+                    if measured(target):
+                        break
+                if measured(target):
+                    break
+                while (current < target if direction > 0 else current > target):
+                    before = int(current)
+                    current = step(direction)["raw"]
+                    if current == target:
+                        break
+                    if (before - target) * (current - target) < 0:
+                        evidence.append({"direction": direction, "from": before, "to": current})
+                if measured(target):
+                    break
+            checks[str(target)] = evidence
+        mapping = build_canonical_mapping(observations, checks, self.saved, ceiling, top, minimum)
+        self.progress("Canonical lookup complete: " + ", ".join(f"{count} {source}" for source, count in mapping_report(mapping)["counts"].items()))
         if self.cancel.is_set():
             raise Cancelled("Cancelled. Restoring saved states; the previous mapping will be preserved.")
         self.pending_mapping = mapping
@@ -740,7 +920,7 @@ class CalibrationWindow(QWidget):
             "and start at a comfortable volume below its API ceiling. Select a TV input/source that plays NO sound "
             "and stop all other playback. Windows mute does not silence the TV or other amplifier sources.\n\n"
             "Volume changes can automatically unmute the TV and amplifier. Windows alone is muted. "
-            "The full sweep goes from the lower limit to the amplifier API ceiling (or a lower chosen limit) and back, "
+            "The sweep starts at the TV minimum, goes to the API ceiling (or a lower chosen limit) and back, "
             "then restores your saved states. The upper range can be VERY LOUD if the source becomes active. "
             "Do not use physical device controls during the test.")
         instructions.setWordWrap(True)
@@ -758,14 +938,15 @@ class CalibrationWindow(QWidget):
         self.raw_lower = QDoubleSpinBox()
         self.raw_lower.setRange(0, 100000)
         self.raw_lower.setDecimals(3)
-        self.raw_lower.setPrefix("Lower raw limit: ")
+        self.raw_lower.setPrefix("Automatic TV-minimum baseline: ")
+        self.raw_lower.setVisible(False)
         self.limit_upper = QCheckBox("Use a lower upper limit instead of the amplifier API ceiling")
         self.raw_upper = QDoubleSpinBox()
-        self.raw_upper.setRange(0, 100000)
-        self.raw_upper.setDecimals(3)
+        self.raw_upper.setRange(0, 10000)
+        self.raw_upper.setDecimals(0)
         self.raw_upper.setEnabled(False)
         self.limit_upper.toggled.connect(self.raw_upper.setEnabled)
-        for widget in (self.raw_lower, self.limit_upper, self.raw_upper):
+        for widget in (self.limit_upper, self.raw_upper):
             layout.addWidget(widget)
         location = QLabel(f"Mapping and recovery file: {DATA_PATH}\nKeep this file beside SonyRemote.pyw to use it automatically.")
         location.setWordWrap(True)
@@ -826,6 +1007,29 @@ class CalibrationWindow(QWidget):
                 self.result_summary.setText("No saved mapping. A cancelled or failed sweep preserves the previous mapping.")
                 return
             report = mapping_report(mapping)
+            if report.get("canonical"):
+                self.results.setHorizontalHeaderLabels(["Amplifier raw", "TV level", "Origin", "Evidence / method"])
+                self.results.setRowCount(len(report["entries"]))
+                for index, entry in enumerate(report["entries"]):
+                    if entry["source"] == "interpolated":
+                        detail = f"4 verified skipped-value crossings; neighbors {entry['anchors']}; {entry['rounding']}"
+                    elif entry["source"] == "boundary-clamped":
+                        detail = "Below the lowest measured TV-minimum amplifier value"
+                    elif "observed_tv_values" in entry:
+                        detail = f"Lowest of observed TV values {entry['observed_tv_values']}"
+                    else:
+                        detail = "Directly observed through TV/CEC control"
+                    for column, value in enumerate((entry["raw"], entry["tv"], entry["source"], detail)):
+                        self.results.setItem(index, column, QTableWidgetItem(str(value)))
+                self.results.resizeColumnsToContents()
+                counts = report["counts"]
+                self.result_summary.setText(
+                    f"Input {mapping['input']}; complete raw lookup 0–{mapping['raw_max']} → TV {mapping['tv_min']}–{mapping['tv_max']}. "
+                    + ", ".join(f"{count} {source}" for source, count in counts.items())
+                    + f". {len(report['conflicts'])} raw values had multiple TV observations; lowest recorded values are used. "
+                    "API ceiling is a readout/control limit, not the physical maximum.")
+                return
+            self.results.setHorizontalHeaderLabels(["TV level", "Upward raw values", "Downward raw values", "Verification"])
             self.results.setRowCount(len(report["rows"]))
             for index, (tv, up, down, status) in enumerate(report["rows"]):
                 for column, value in enumerate((tv, ", ".join(map(str, up)), ", ".join(map(str, down)), status)):
