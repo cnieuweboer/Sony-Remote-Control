@@ -485,7 +485,7 @@ class CalibrationServer(QObject):
 APP_NAME = "Sony Remote"
 
 
-__version__ = "2026.10.19.2"
+__version__ = "2026.10.19.3"
 
 
 CONFIG_PATH = Path(__file__).with_name("SonyRemote.json")
@@ -2985,7 +2985,12 @@ class SonyRemote(QMainWindow):
             info = result.get("info")
             if info:
                 self.last_volume = info
-            if result.get("done"):
+            # A newer keypress may have changed the target while this result
+            # waited for GUI delivery. Only finish against the current target.
+            if result.get("done") and (
+                self._desired_volume is None
+                or int(info.get("volume", 0)) == self._desired_volume
+            ):
                 self._volume_rate_loop_running = False
                 self._desired_volume = None
                 if self.last_volume:

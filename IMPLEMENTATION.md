@@ -179,3 +179,9 @@ Automatic discovery writes use the last accepted file digest as their baseline. 
 Successful saves return the digest of the exact UTF-8 bytes written, rather than re-reading the destination. An edit made after replacement therefore remains detectable. Default-file creation still works without an existing baseline. Both scripts retain their own implementation and atomic replacement; no shared module or additional polling is introduced.
 
 `tests/test_reliability.py` covers ordinary discovery saves, valid and unfinished edits, deletion/read failures, edits during replacement preparation and immediately after replacement, failed-restart protection, failed replacement cleanup, and initial default-file creation. Temporary files isolate every write.
+
+## Volume target completion
+
+The TV volume rate limiter checks a worker's completed reading against the latest requested target before clearing it. A keypress received after the worker finishes but before its GUI callback runs therefore continues through the existing rate-limited relative-step loop. A worker that sent a volume command still requires a later observation to confirm completion. Rate settings and amplifier routing are unchanged.
+
+`tests/test_volume_limiter.py` separates fake-device execution from GUI result delivery to force the lost-key timing. It covers up/down presses, coalesced bursts, a new target during an issued step, returning to the current volume, a TV command that does not move volume, and switching away from TV routing. It performs no real device requests.
