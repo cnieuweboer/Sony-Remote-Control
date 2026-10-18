@@ -17,10 +17,12 @@ from PySide6.QtWidgets import (
     QSpinBox, QTextEdit, QVBoxLayout, QWidget,
 )
 
-__version__ = "2026.10.18.7"
+__version__ = "2026.10.18.8"
 DATA_PATH = Path(__file__).resolve().with_name("VolumeCalibration.json")
 USER_SUFFIX = hashlib.sha256(str(Path.home()).encode()).hexdigest()[:16]
 TIMEOUT = 5.0
+TV_VOLUME_ATTEMPTS = 3
+TV_VOLUME_CONFIRM_SECONDS = 2.0
 
 
 class CalibrationError(RuntimeError):
@@ -369,6 +371,35 @@ class CalibrationSession:
         self.saved = saved
         self.progress(f"Captured amplifier TV input: {a['input']}. Recovery state saved.")
 
+    def set_tv_volume(self, target):
+        """Retry only a confirmed TV no-op/shortfall, using the same absolute target."""
+        if type(target) is not int:
+            raise CalibrationError("TV volume target must be an integer.")
+        for attempt in range(1, TV_VOLUME_ATTEMPTS + 1):
+            _, state = self.guard(require_windows_mute=True)
+            if not state["minimum"] <= target <= state["maximum"]:
+                raise CalibrationError("TV volume target is outside the reported range.")
+            previous_sample = state["sample_id"]
+            # An API/IPC error propagates without retry. Only fresh TV status
+            # proving that an accepted command missed its target permits retry.
+            self.request("tv", "set_volume", target)
+            deadline = time.monotonic() + TV_VOLUME_CONFIRM_SECONDS
+            observed = None
+            while time.monotonic() < deadline:
+                self.pump()
+                _, state = self.guard(require_windows_mute=True)
+                if state["sample_id"] != previous_sample:
+                    observed = state.get("volume")
+                    if type(observed) is int and observed == target:
+                        return
+            if type(observed) is not int:
+                raise CalibrationError("No fresh TV volume confirmation arrived; command was not retried.")
+            if attempt < TV_VOLUME_ATTEMPTS:
+                self.progress(f"TV reports {observed}, requested {target}; retrying the same absolute target "
+                              f"({attempt + 1}/{TV_VOLUME_ATTEMPTS}).")
+        raise CalibrationError(f"TV did not reach volume {target} after {TV_VOLUME_ATTEMPTS} attempts "
+                               f"(last reported {observed}).")
+
     def prepare_and_probe(self):
         self.capture()
         self.windows.set(True)
@@ -379,7 +410,7 @@ class CalibrationSession:
         if target > t["maximum"]:
             raise CalibrationError("The TV exposes no usable volume step.")
         original_raw = a["raw_volume"]
-        self.request("tv", "set_volume", target)
+        self.set_tv_volume(target)
         increasing = target > t["volume"]
         self.wait(lambda a, t: t["volume"] == target
                   and (a["raw_volume"] > original_raw if increasing else a["raw_volume"] < original_raw),
@@ -393,7 +424,7 @@ class CalibrationSession:
         self.progress("Rechecking the CEC pairing in the older recovery record.")
         target = self.saved["restore_volume"]
         ceiling = self.saved["amplifier_api_ceiling"]
-        self.request("tv", "set_volume", target)
+        self.set_tv_volume(target)
         def usable(a, t):
             return (t["volume"] == target and self.number(a.get("raw_volume"))
                     and self.number(a.get("raw_max_volume"))
@@ -404,13 +435,13 @@ class CalibrationSession:
         probe = target - 1 if target > t["minimum"] else target + 1
         if probe > t["maximum"]:
             raise CalibrationError("There is no usable TV step to verify the older recovery record.")
-        self.request("tv", "set_volume", probe)
+        self.set_tv_volume(probe)
         def responded(a, t):
             raw = a.get("raw_volume")
             return (t["volume"] == probe and self.number(raw) and 0 <= raw < ceiling
                     and (raw < paired_raw if probe < target else raw > paired_raw))
         self.wait(responded, "Verifying CEC response for the older recovery record", windows_muted=True)
-        self.request("tv", "set_volume", target)
+        self.set_tv_volume(target)
         self.wait(lambda a, t: t["volume"] == target and a["raw_volume"] == paired_raw,
                   "Verifying the recovered TV/amplifier pair", windows_muted=True,
                   stable_for=3.0, min_elapsed=3.0, timeout=15.0)
@@ -433,7 +464,7 @@ class CalibrationSession:
         before_a, before_t = self.guard(require_windows_mute=True)
         before_raw, before_tv = before_a["raw_volume"], before_t["volume"]
         target = self.saved["restore_volume"]
-        self.request("tv", "set_volume", target)
+        self.set_tv_volume(target)
         def restored(a, t):
             if t["volume"] != target:
                 return False
