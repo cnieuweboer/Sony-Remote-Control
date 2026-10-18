@@ -1,7 +1,8 @@
-# Per-user calibration data and interrupted-session recovery journal.
+# Per-user calibration data and temporary files.
 VolumeCalibration.json
 VolumeCalibration.json.tmp
 VolumeCalibration.json.lock
 __pycache__/
+# Ignore old release-16 journals if a local copy remains.
 VolumeCalibration.session.json
 VolumeCalibration.session.json.tmp

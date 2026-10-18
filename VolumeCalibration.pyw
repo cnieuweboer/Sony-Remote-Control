@@ -13,12 +13,11 @@ import uuid
 from PySide6.QtCore import QThread, Signal
 from PySide6.QtNetwork import QLocalSocket
 from PySide6.QtWidgets import (
-    QApplication, QCheckBox, QHBoxLayout, QLabel, QMessageBox, QPushButton,
-    QSpinBox, QDoubleSpinBox, QTableWidget, QTableWidgetItem, QAbstractItemView,
+    QApplication, QCheckBox, QLabel, QMessageBox, QPushButton,
     QProgressBar, QTextEdit, QVBoxLayout, QWidget,
 )
 
-__version__ = "2026.10.18.16"
+__version__ = "2026.10.18.17"
 DATA_PATH = Path(__file__).resolve().with_name("VolumeCalibration.json")
 USER_SUFFIX = hashlib.sha256(str(Path.home()).encode()).hexdigest()[:16]
 TIMEOUT = 5.0
@@ -30,6 +29,10 @@ TV_VOLUME_CONFIRM_SECONDS = 5.0
 MAX_VOLUME_STEPS = 512
 VOLUME_RESTORE_SECONDS = 900.0
 SWEEP_SECONDS = 900.0
+POST_SWEEP_WARNING = (
+    "Before playing any sound, check the volume and mute settings on your TV, "
+    "amplifier, and computer. Automatic restoration cannot be guaranteed after an error or interruption."
+)
 
 
 class CalibrationError(RuntimeError):
@@ -65,12 +68,7 @@ def validate_runtime_mapping(document):
             or any(type(raw) is not int or not 0 <= raw < len(levels) for raw in estimated)
             or len(set(estimated)) != len(estimated)):
         raise ValueError("Invalid estimated amplifier raw volumes.")
-    estimated = set(estimated)
-    return {"input": document["amplifier_tv_input"],
-            "tv_id": document["tv_device_id"], "amplifier_id": document["amplifier_device_id"],
-            "raw_min": 0, "raw_max": len(levels) - 1, "tv_min": levels[0], "tv_max": levels[-1],
-            "lookup": [{"raw": raw, "tv": level, "source": "interpolated" if raw in estimated else "mapped"}
-                       for raw, level in enumerate(levels)]}
+    return document
 
 
 def runtime_document(mapping):
@@ -81,7 +79,7 @@ def runtime_document(mapping):
         raise ValueError("Invalid complete amplifier lookup range.")
     for raw, entry in enumerate(entries):
         if (not isinstance(entry, dict) or type(entry.get("raw")) is not int or entry["raw"] != raw
-                or entry.get("source") not in ("measured", "boundary-clamped", "interpolated", "mapped")):
+                or entry.get("source") not in ("measured", "boundary-clamped", "interpolated")):
             raise ValueError("Lookup must contain exactly one entry for every amplifier raw value.")
     document = {"format_version": 2, "tv_device_id": mapping.get("tv_id"),
                 "amplifier_device_id": mapping.get("amplifier_id"), "amplifier_tv_input": mapping.get("input"),
@@ -205,55 +203,12 @@ def build_canonical_mapping(observations, checks, saved, ceiling, top, tv_min):
     return mapping
 
 
-def session_path(path):
-    return path.with_name(path.stem + ".session.json")
-
-
-def read_json(path):
+def load_mapping(path):
+    if not path.exists():
+        return None
     if path.stat().st_size > 2 * 1024 * 1024:
         raise CalibrationError("Calibration JSON exceeds the 2 MiB limit.")
-    return json.loads(path.read_text(encoding="utf-8"))
-
-
-def load_document(path):
-    # Keep the current session/recovery workflow out of the runtime lookup.
-    # The next workflow release will remove this temporary sidecar mechanism.
-    document = {"calibration": None, "recovery": None}
-    if path.exists():
-        document["calibration"] = validate_runtime_mapping(read_json(path))
-    state_path = session_path(path)
-    if state_path.exists():
-        state = read_json(state_path)
-        if not isinstance(state, dict) or type(state.get("format_version")) is not int or state["format_version"] != 1:
-            raise CalibrationError("Unsupported calibration session journal. Preserve it for recovery.")
-        for key in ("recovery", "draft"):
-            document[key] = state.get(key)
-    recovery = document.get("recovery")
-    if recovery is not None:
-        validate_saved(recovery)
-    return document
-
-
-def validate_saved(saved):
-    if not isinstance(saved, dict):
-        raise CalibrationError("Invalid recovery record.")
-    for key in ("input", "amplifier_id", "tv_id", "windows_device"):
-        if not isinstance(saved.get(key), str) or not saved[key]:
-            raise CalibrationError(f"Invalid recovery field: {key}.")
-    for key in ("windows_mute", "tv_mute", "amplifier_mute"):
-        if type(saved.get(key)) is not bool:
-            raise CalibrationError(f"Invalid recovery field: {key}.")
-    for key in ("tv_volume", "restore_volume"):
-        if type(saved.get(key)) is not int or saved[key] < 0:
-            raise CalibrationError(f"Invalid recovery field: {key}.")
-    for key in ("amplifier_volume", "amplifier_api_ceiling"):
-        value = saved.get(key)
-        if type(value) not in (int, float) or not math.isfinite(value) or value < 0:
-            raise CalibrationError(f"Invalid recovery field: {key}.")
-    if (saved["restore_volume"] > saved["tv_volume"]
-            or saved["amplifier_volume"] >= saved["amplifier_api_ceiling"]
-            or saved["tv_mute"] != saved["amplifier_mute"]):
-        raise CalibrationError("Inconsistent recovery record.")
+    return validate_runtime_mapping(json.loads(path.read_text(encoding="utf-8")))
 
 
 def atomic_json(path, document):
@@ -265,21 +220,10 @@ def atomic_json(path, document):
         temporary.unlink(missing_ok=True)
 
 
-def write_document(path, document):
-    mapping = document.get("calibration")
-    compact = runtime_document(mapping) if mapping is not None else None
-    if compact is not None:
-        validate_runtime_mapping(compact)
-    state_path = session_path(path)
-    state = {"format_version": 1, "recovery": document.get("recovery"), "draft": document.get("draft")}
-    pending = bool(state["recovery"] or state["draft"])
-    existing = read_json(path) if path.exists() else None
-    if compact is not None and existing != compact:
-        atomic_json(path, compact)
-    if pending:
-        atomic_json(state_path, state)
-    else:
-        state_path.unlink(missing_ok=True)
+def write_mapping(path, mapping):
+    document = runtime_document(mapping)
+    validate_runtime_mapping(document)
+    atomic_json(path, document)
 
 
 class WindowsMute:
@@ -294,7 +238,6 @@ class WindowsMute:
         self.ole.CoCreateInstance.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint32,
                                              ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)]
         self.ole.CoCreateInstance.restype = ctypes.c_int32
-        self.ole.CoTaskMemFree.argtypes = [ctypes.c_void_p]
         self.ole.CoUninitialize.argtypes = []
         self.enumerator = ctypes.c_void_p()
         self.device = ctypes.c_void_p()
@@ -309,12 +252,6 @@ class WindowsMute:
                                                  ctypes.byref(iid), ctypes.byref(self.enumerator)))
             self._check(self._call(self.enumerator, 4, [ctypes.c_int, ctypes.c_int,
                          ctypes.POINTER(ctypes.c_void_p)], 0, 0, ctypes.byref(self.device)))
-            pointer = ctypes.c_void_p()
-            self._check(self._call(self.device, 5, [ctypes.POINTER(ctypes.c_void_p)], ctypes.byref(pointer)))
-            try:
-                self.device_id = ctypes.wstring_at(pointer)
-            finally:
-                self.ole.CoTaskMemFree(pointer)
             iid = self._guid("5CDF2C82-841E-4546-9722-0CF74078229A")
             self._check(self._call(self.device, 3, [ctypes.c_void_p, ctypes.c_uint32,
                          ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)],
@@ -423,15 +360,12 @@ class Peer:
 
 class CalibrationSession:
     def __init__(self, cancel, progress, path=DATA_PATH, mute_factory=WindowsMute,
-                 peer_factory=Peer, restore_volume=None, recovery=False, silent_source_confirmed=False, sweep=False, raw_lower=0, raw_upper=None):
+                 peer_factory=Peer, silent_source_confirmed=False, cleanup_started=None):
         self.cancel, self.progress, self.path = cancel, progress, path
         self.mute_factory, self.peer_factory = mute_factory, peer_factory
-        self.restore_volume, self.recovery = restore_volume, recovery
         self.silent_source_confirmed = silent_source_confirmed
-        self.sweep = sweep
-        self.raw_lower, self.raw_upper = raw_lower, raw_upper
+        self.cleanup_started = cleanup_started or (lambda: None)
         self.pending_mapping = None
-        self.draft = None
         self.restoration_verified = False
         self.token = uuid.uuid4().hex
         self.peers = {}
@@ -442,7 +376,6 @@ class CalibrationSession:
         self.in_step = False
         self.saved = None
         self.windows = None
-        self.document = None
 
     def pump(self):
         if self.cancel.is_set() and not self.restoring and not self.in_request and not self.in_step:
@@ -505,12 +438,12 @@ class CalibrationSession:
             if (a.get("input") != self.saved["input"]
                     or a.get("device_id") != self.saved["amplifier_id"]
                     or t.get("device_id") != self.saved["tv_id"]):
-                raise CalibrationError("The amplifier input or configured device changed. Restore the original pairing before recovery.")
+                raise CalibrationError("The amplifier input or configured device changed. Original settings cannot be restored to a different pairing.")
         if require_windows_mute and not self.windows.get():
             raise CalibrationError("Windows was unmuted during the test.")
         return a, t
 
-    def wait(self, predicate, description, *, windows_muted=False, settle=True,
+    def wait(self, predicate, description, *, windows_muted=False,
              stable_for=0.5, min_elapsed=1.0, timeout=TIMEOUT, timeout_error=CalibrationError):
         self.progress(description)
         start = time.monotonic()
@@ -529,8 +462,6 @@ class CalibrationSession:
             pair = (a["sample_id"], t["sample_id"])
             values = (a.get("raw_volume"), a.get("mute"), t.get("volume"), t.get("mute"))
             if predicate(a, t):
-                if not settle:
-                    return a, t
                 # Count fresh observations from BOTH devices. Start the quiet
                 # period again whenever either device's value changes.
                 if values != last_values:
@@ -567,19 +498,10 @@ class CalibrationSession:
             raise CalibrationError("Start below the amplifier API ceiling, with valid TV volume limits and mute states.")
         if a["mute"] != t["mute"]:
             raise CalibrationError("TV and amplifier mute states differ. Align them before starting.")
-        restore = t["volume"] if self.restore_volume is None else self.restore_volume
-        if type(restore) is not int or not t["minimum"] <= restore <= t["volume"]:
-            raise CalibrationError("The safe restore volume must lie between the TV minimum and starting volume.")
-        saved = {"input": a["input"], "amplifier_id": a["device_id"], "tv_id": t["device_id"],
-                      "windows_device": self.windows.device_id, "windows_mute": self.windows.get(),
-                      "tv_mute": t["mute"], "tv_volume": t["volume"], "restore_volume": restore,
-                      "amplifier_mute": a["mute"], "amplifier_volume": a["raw_volume"],
-                      "amplifier_api_ceiling": a["raw_max_volume"]}
-        self.document["recovery"] = saved
-        write_document(self.path, self.document)
-        # No mute/volume mutations are allowed before the journal is durable.
-        self.saved = saved
-        self.progress(f"Captured amplifier TV input: {a['input']}. Recovery state saved.")
+        self.saved = {"input": a["input"], "amplifier_id": a["device_id"], "tv_id": t["device_id"],
+                      "windows_mute": self.windows.get(), "tv_mute": t["mute"], "tv_volume": t["volume"],
+                      "amplifier_mute": a["mute"], "amplifier_volume": a["raw_volume"]}
+        self.progress(f"Captured original settings and amplifier TV input: {a['input']}.")
 
     @staticmethod
     def volume_pair(a, t):
@@ -741,103 +663,65 @@ class CalibrationSession:
             was_quick = t["volume"] > minimum + 5
             self.relative_step(-1, quick=was_quick)
 
-    def seek_volume(self, *, raw_target=None, tv_target=None, raw_limit=None, fast_tv_target=None):
-        """Bounded incremental restoration; verify the final approach and never oscillate."""
+    def seek_volume(self, raw_target, tv_target):
+        """Restore the original raw value, verifying the final approach."""
         start = time.monotonic()
         was_quick = False
         previous_direction = None
-        def approach(a, t):
-            raw = a["raw_volume"]
-            if raw_target is not None:
-                reached = raw == raw_target
-                direction = 1 if raw < raw_target else -1
-            else:
-                reached = t["volume"] == tv_target and (raw_limit is None or raw <= raw_limit)
-                direction = 1 if t["volume"] < tv_target else -1
-            quick = fast_tv_target is not None and abs(t["volume"] - fast_tv_target) > 5
-            if raw_target is not None:
-                # A coarse/stale TV readout must not keep fast mode active
-                # when the exact saved raw target is already close.
-                quick = quick and abs(raw - raw_target) > 5
-            if raw_limit is not None and direction > 0:
-                quick = quick and raw_limit - raw > 5
-            return reached, direction, quick
         for step in range(MAX_VOLUME_STEPS + 1):
             a, t = self.guard(require_windows_mute=True)
-            reached, direction, quick = approach(a, t)
-            if was_quick and (not quick or reached or direction != previous_direction):
+            raw = a["raw_volume"]
+            quick = abs(t["volume"] - tv_target) > 5 and abs(raw - raw_target) > 5
+            direction = 1 if raw < raw_target else -1
+            if was_quick and (not quick or raw == raw_target or direction != previous_direction):
                 self.cec_quiet("Resynchronizing TV/amplifier readings before the final restoration approach",
                                self.volume_pair(a, t), previous_direction)
                 a, t = self.guard(require_windows_mute=True)
-                reached, direction, quick = approach(a, t)
-                was_quick = False
-            if reached:
+                raw = a["raw_volume"]
+                quick = abs(t["volume"] - tv_target) > 5 and abs(raw - raw_target) > 5
+                direction = 1 if raw < raw_target else -1
+            if raw == raw_target:
                 return a, t
             if step == MAX_VOLUME_STEPS or time.monotonic() - start >= VOLUME_RESTORE_SECONDS:
                 raise CalibrationError("Incremental volume restoration exceeded its step/time limit.")
-            if raw_limit is not None and direction > 0 and a["raw_volume"] >= raw_limit:
-                # Wait for a delayed TV readout rather than raising the
-                # amplifier above the saved safe restore limit.
-                return self.wait(lambda a, t: t["volume"] == tv_target and a["raw_volume"] <= raw_limit,
-                                 "Waiting for the safe restore TV level to catch up", windows_muted=True)
-            before = a["raw_volume"]
             self.relative_step(direction, quick=quick)
             was_quick, previous_direction = quick, direction
             after = self.guard(require_windows_mute=True)[0]["raw_volume"]
-            if raw_target is not None and (before - raw_target) * (after - raw_target) < 0:
-                raise CalibrationError("The saved raw volume lies between reachable steps; restoration stopped without oscillating.")
+            if (raw - raw_target) * (after - raw_target) < 0:
+                raise CalibrationError("The original raw volume lies between reachable steps; restoration stopped without oscillating.")
         raise CalibrationError("Volume restoration did not complete.")
 
-    def prepare_and_probe(self):
-        self.capture()
-        self.windows.set(True)
-        a, _ = self.guard(require_windows_mute=True)
-        self.relative_step(-1 if a["raw_volume"] > 0 else 1)
-        self.progress("Relative CEC step confirmed, including changes within one TV display level."
-                      + ("" if self.sweep else " No sweep was performed."))
-
-    def sweep_limits(self):
+    def amplifier_ceiling(self):
         ceiling = self.peers["amplifier"].state["raw_max_volume"]
-        upper = ceiling if self.raw_upper is None else self.raw_upper
         if (not self.number(ceiling) or not float(ceiling).is_integer()
-                or not self.number(upper) or not float(upper).is_integer()
-                or not 0 < upper <= min(ceiling, 10000) or self.raw_lower != 0):
-            raise CalibrationError("Canonical calibration needs integer raw values, an upper limit <= min(API ceiling, 10000), and automatic TV-minimum positioning.")
-        return 0, int(upper), int(ceiling)
+                or not 0 < ceiling <= 10000):
+            raise CalibrationError("Calibration needs an integer amplifier API ceiling between 1 and 10000.")
+        return int(ceiling)
 
-    def calibration_sweep(self):
-        _, upper, ceiling = self.sweep_limits()
+    def calibration_sweep(self, ceiling):
         observations = []
         checks = {}
         minimum = self.peers["tv"].state["minimum"]
-        self.draft = {"created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                      "input": self.saved["input"], "tv_id": self.saved["tv_id"],
-                      "amplifier_id": self.saved["amplifier_id"], "api_ceiling": ceiling,
-                      "upper_limit": upper, "tv_min": minimum, "status": "in-progress",
-                      "observations": observations, "gap_checks": checks}
-        self.document["draft"] = self.draft
-        write_document(self.path, self.document)
-        def observe(phase, direction=0):
+        def observe():
             a, t = self.guard(require_windows_mute=True)
             raw = a["raw_volume"]
-            if not self.number(raw) or not float(raw).is_integer() or not 0 <= raw <= upper:
-                raise CalibrationError("A step left the requested integer raw range.")
-            row = {"raw": int(raw), "tv": t["volume"], "phase": phase, "direction": direction}
+            if not self.number(raw) or not float(raw).is_integer() or not 0 <= raw <= ceiling:
+                raise CalibrationError("A step left the observable integer amplifier range.")
+            row = {"raw": int(raw), "tv": t["volume"]}
             observations.append(row)
-            write_document(self.path, self.document)
             return row
         self.progress("Moving the TV to its reported minimum using relative CEC steps.")
         self.position_at_tv_minimum(minimum)
-        first = observe("up")
-        if first["raw"] >= upper:
+        first = observe()
+        if first["raw"] >= ceiling:
             raise CalibrationError("There is no usable raw range above the TV minimum.")
         upward = [first]
         start = time.monotonic()
-        while upward[-1]["raw"] < upper and upward[-1]["tv"] < self.peers["tv"].state["maximum"]:
+        while upward[-1]["raw"] < ceiling and upward[-1]["tv"] < self.peers["tv"].state["maximum"]:
             if len(upward) > MAX_VOLUME_STEPS or time.monotonic() - start >= SWEEP_SECONDS:
                 raise CalibrationError("Upward sweep exceeded its step/time limit.")
             self.relative_step(1)
-            row = observe("up", 1)
+            row = observe()
             upward.append(row)
             self.progress(f"Upward: amplifier {row['raw']} → TV {row['tv']}.")
         top = upward[-1]["raw"]
@@ -856,7 +740,7 @@ class CalibrationSession:
                 raise CalibrationError("Cannot verify a gap without leaving the observed range.")
             self.relative_step(direction)
             gap_steps += 1
-            return observe("gap", direction)
+            return observe()
         def measured(raw):
             return any(row["raw"] == raw for row in observations)
         while True:
@@ -886,7 +770,6 @@ class CalibrationSession:
                 if measured(target):
                     break
             checks[str(target)] = evidence
-            write_document(self.path, self.document)
         mapping = build_canonical_mapping(observations, checks, self.saved, ceiling, top, minimum)
         counts = {source: sum(entry["source"] == source for entry in mapping["lookup"])
                   for source in ("measured", "boundary-clamped", "interpolated")}
@@ -894,50 +777,31 @@ class CalibrationSession:
         if self.cancel.is_set():
             raise Cancelled("Cancelled. Restoring saved states; the previous mapping will be preserved.")
         self.pending_mapping = mapping
-        self.draft["status"] = "awaiting-restoration"
-        self.draft["mapping"] = mapping
-        write_document(self.path, self.document)
 
     def restore(self):
-        self.restoring = True
-        self.progress("Restoring saved states; cancellation is paused until cleanup finishes.")
+        self.progress("Restoring original settings; cancellation is paused until cleanup finishes.")
         self.windows.set(True)
-        if self.windows.device_id != self.saved["windows_device"]:
-            raise CalibrationError("Windows output device changed. Restore the original output before recovery.")
-        # Verify identity and input BEFORE issuing any device mutations.
+        # Verify the current device pairing before issuing device mutations.
         self.guard()
         self.cec_quiet("Waiting for pending CEC activity to settle before session restoration")
-        target = self.saved["restore_volume"]
-        if target == self.saved["tv_volume"]:
-            self.seek_volume(raw_target=self.saved["amplifier_volume"], fast_tv_target=target)
-        else:
-            self.seek_volume(tv_target=target, raw_limit=self.saved["amplifier_volume"], fast_tv_target=target)
-        def restored(a, t):
-            return (t["volume"] == target and
-                    (a["raw_volume"] == self.saved["amplifier_volume"] if target == self.saved["tv_volume"]
-                     else a["raw_volume"] <= self.saved["amplifier_volume"]))
-        self.wait(restored, "Verifying restored TV and amplifier volume", windows_muted=True)
+        self.seek_volume(self.saved["amplifier_volume"], self.saved["tv_volume"])
+        self.wait(lambda a, t: t["volume"] == self.saved["tv_volume"]
+                  and a["raw_volume"] == self.saved["amplifier_volume"],
+                  "Verifying restored TV and amplifier volume", windows_muted=True)
         self.request("tv", "set_mute", self.saved["tv_mute"])
         self.wait(lambda a, t: a["mute"] == self.saved["amplifier_mute"] and t["mute"] == self.saved["tv_mute"],
                   "Verifying restored TV and amplifier mute")
         self.windows.set(self.saved["windows_mute"])
-        self.document["recovery"] = None
-        write_document(self.path, self.document)
         self.restoration_verified = True
-        self.progress("Volume and mute restoration verified. Windows mute restored last.")
+        self.progress("Original volume and mute settings verified. Windows mute restored last.")
 
     def run(self):
-        outcome = "Silent-source CEC check completed; saved states restored."
         failure = None
         try:
             if not self.silent_source_confirmed:
-                raise CalibrationError("Confirm that the TV is on a silent input/source and all other playback is stopped before testing or recovery.")
-            self.document = load_document(self.path)
-            existing = self.document.get("recovery")
-            if existing and not self.recovery:
-                raise CalibrationError("A previous session needs recovery. Use Recover saved states first.")
-            if self.recovery and not existing:
-                raise CalibrationError("There is no saved session to recover.")
+                raise CalibrationError("Confirm that the TV is on a silent source and all other playback is stopped before starting.")
+            if self.cancel.is_set():
+                raise Cancelled("Calibration cancelled before starting.")
             self.windows = self.mute_factory()
             for role in ("amplifier", "tv"):
                 peer = self.peer_factory(role)
@@ -947,33 +811,29 @@ class CalibrationSession:
             self.wait(lambda a, t: True, "Waiting for settled TV/amplifier status after earlier CEC commands",
                       stable_for=3.0, min_elapsed=3.0, timeout=15.0)
             if self.peers["tv"].state.get("relative_volume") is not True:
-                raise CalibrationError("Update Sony Remote to 2026.10.18.9 or newer for relative calibration commands.")
-            if self.recovery:
-                self.saved = existing
-            else:
-                if self.sweep:
-                    self.sweep_limits()
-                self.prepare_and_probe()
-                if self.sweep:
-                    self.calibration_sweep()
+                raise CalibrationError("The TV remote must support relative calibration commands.")
+            ceiling = self.amplifier_ceiling()
+            self.capture()
+            self.windows.set(True)
+            self.calibration_sweep(ceiling)
         except Exception as error:
             failure = error
         finally:
+            self.restoring = True
+            self.cleanup_started()
             if self.saved is not None and self.windows is not None:
                 try:
                     self.restore()
                 except Exception as error:
-                    # Keep the durable journal. Never restore Windows unmute
-                    # after an uncertain device restoration.
                     try:
                         self.windows.set(True)
                     except Exception:
                         pass
-                    failure = CalibrationError(f"{str(failure or 'Session ended').rstrip('. ')}. Restoration could not be verified: {str(error).rstrip('. ')}. "
-                                               "Windows has been left muted where possible. Keep the TV on a silent source, select the original amplifier input and Windows output, "
-                                               "start both remotes, and use Recover saved states.")
-            self.restoring = True
-            for role, peer in list(self.peers.items()):
+                    failure = CalibrationError(
+                        f"{str(failure or 'Calibration ended').rstrip('. ')}. "
+                        f"Original settings could not be verified: {str(error).rstrip('. ')}. "
+                        "Windows has been left muted where possible. Restore volume and mute settings manually.")
+            for role, peer in self.peers.items():
                 try:
                     if peer.acquired:
                         self.request(role, "release")
@@ -983,226 +843,153 @@ class CalibrationSession:
                 peer.socket.abort()
             if self.windows is not None:
                 self.windows.close()
-        if self.draft is not None:
-            self.draft["status"] = ("cancelled" if isinstance(failure, Cancelled) or self.cancel.is_set()
-                                    else "failed" if failure is not None else "awaiting-activation")
-            self.draft["restoration_verified"] = self.restoration_verified
-            if failure is not None:
-                self.draft["error"] = str(failure)
-            try:
-                write_document(self.path, self.document)
-            except Exception as error:
-                failure = CalibrationError(f"{failure or 'Session finished'}. Could not update inactive draft: {error}")
         if failure is not None:
+            if isinstance(failure, Cancelled) and self.restoration_verified:
+                raise Cancelled("Calibration cancelled. Original settings restored; saved mapping unchanged.") from failure
             raise failure
-        if self.pending_mapping is not None and not self.cancel.is_set():
-            self.document["calibration"] = self.pending_mapping
-            self.document.pop("draft", None)
-            write_document(self.path, self.document)
-            return "Sweep completed, saved states restored, and mapping saved."
-        return "Saved states recovered and verified." if self.recovery else outcome
+        if self.cancel.is_set():
+            raise Cancelled("Calibration cancelled. Original settings restored; saved mapping unchanged.")
+        if self.pending_mapping is None or not self.restoration_verified:
+            raise CalibrationError("Calibration did not complete; saved mapping unchanged.")
+        write_mapping(self.path, self.pending_mapping)
+        return "Calibration completed, original settings restored, and mapping saved."
 
 
 class SessionWorker(QThread):
     progress = Signal(str)
-    completed = Signal(bool, str)
+    cleanup_started = Signal()
+    completed = Signal(str)
 
-    def __init__(self, restore_volume=None, recovery=False, parent=None, sweep=False, raw_lower=0, raw_upper=None):
+    def __init__(self, parent=None):
         super().__init__(parent)
         self.cancel = threading.Event()
-        self.restore_volume, self.recovery = restore_volume, recovery
-        self.sweep, self.raw_lower, self.raw_upper = sweep, raw_lower, raw_upper
 
     def run(self):
         try:
-            message = CalibrationSession(self.cancel, self.progress.emit, restore_volume=self.restore_volume,
-                                         recovery=self.recovery, silent_source_confirmed=True, sweep=self.sweep,
-                                         raw_lower=self.raw_lower, raw_upper=self.raw_upper).run()
-            self.completed.emit(True, message)
+            message = CalibrationSession(
+                self.cancel, self.progress.emit, silent_source_confirmed=True,
+                cleanup_started=self.cleanup_started.emit).run()
         except Exception as error:
-            self.completed.emit(False, str(error))
+            message = str(error)
+        self.completed.emit(message)
 
 
 class CalibrationWindow(QWidget):
     def __init__(self):
         super().__init__()
         self.worker = None
-        self._recovery_notice_shown = False
+        self.cleaning_up = False
+        self.has_mapping = False
+        self._mapping_error = None
         self.setWindowTitle(f"Volume matching helper — {__version__}")
         layout = QVBoxLayout(self)
         instructions = QLabel(
             "Start both updated remotes. Set the amplifier to the input connected to the TV, "
             "and start at a comfortable volume below its API ceiling. Select a TV input/source that plays NO sound "
-            "and stop all other playback. Windows mute does not silence the TV or other amplifier sources.\n\n"
+            "and stop all other playback. Keep the same Windows audio output selected. "
+            "Windows mute does not silence the TV or other amplifier sources.\n\n"
             "Volume changes can automatically unmute the TV and amplifier. Windows alone is muted. "
-            "The sweep starts at the TV minimum, goes to the API ceiling (or a lower chosen limit) and back, "
-            "then restores your saved states. The upper range can be VERY LOUD if the source becomes active. "
+            "The sweep starts at the TV minimum and goes to the amplifier API ceiling or TV maximum, "
+            "then attempts to restore your original settings. The upper range can be VERY LOUD if the source becomes active. "
             "Do not use physical device controls during the test.")
         instructions.setWordWrap(True)
         layout.addWidget(instructions)
         self.silent_source = QCheckBox("I confirm the TV source is silent and all other playback is stopped")
-        self.silent_source.toggled.connect(lambda _: self.refresh())
+        self.silent_source.toggled.connect(self.refresh)
         layout.addWidget(self.silent_source)
-        self.safe_restore = QCheckBox("Use a lower safe TV restore volume")
-        self.restore_value = QSpinBox()
-        self.restore_value.setRange(0, 1000)
-        self.restore_value.setEnabled(False)
-        self.safe_restore.toggled.connect(self.restore_value.setEnabled)
-        layout.addWidget(self.safe_restore)
-        layout.addWidget(self.restore_value)
-        self.raw_lower = QDoubleSpinBox()
-        self.raw_lower.setRange(0, 100000)
-        self.raw_lower.setDecimals(3)
-        self.raw_lower.setPrefix("Automatic TV-minimum baseline: ")
-        self.raw_lower.setVisible(False)
-        self.limit_upper = QCheckBox("Use a lower upper limit instead of the amplifier API ceiling")
-        self.raw_upper = QDoubleSpinBox()
-        self.raw_upper.setRange(0, 10000)
-        self.raw_upper.setDecimals(0)
-        self.raw_upper.setEnabled(False)
-        self.limit_upper.toggled.connect(self.raw_upper.setEnabled)
-        for widget in (self.limit_upper, self.raw_upper):
-            layout.addWidget(widget)
-        location = QLabel(f"Runtime mapping: {DATA_PATH}\nTemporary session journal: {session_path(DATA_PATH)}\nKeep the runtime mapping beside SonyRemote.pyw.")
-        location.setWordWrap(True)
-        layout.addWidget(location)
-        buttons = QHBoxLayout()
-        self.start = QPushButton("Run full calibration sweep")
-        self.preflight = QPushButton("Run step check only")
-        self.preflight.clicked.connect(lambda: self.begin(False, sweep=False))
-        self.recover = QPushButton("Recover saved states")
-        self.cancel_button = QPushButton("Cancel and restore")
-        self.cancel_button.setEnabled(False)
-        self.start.clicked.connect(lambda: self.begin(False, sweep=True))
-        self.recover.clicked.connect(lambda: self.begin(True))
-        self.cancel_button.clicked.connect(self.cancel)
-        for button in (self.start, self.preflight, self.recover, self.cancel_button):
-            buttons.addWidget(button)
-        layout.addLayout(buttons)
+        self.status = QLabel()
+        self.status.setWordWrap(True)
+        layout.addWidget(self.status)
+        self.start = QPushButton()
+        self.start.clicked.connect(self.begin_or_cancel)
+        layout.addWidget(self.start)
         self.activity = QProgressBar()
         self.activity.setRange(0, 1)
         self.activity.setValue(0)
         layout.addWidget(self.activity)
-        self.result_summary = QLabel("No mapping loaded.")
-        self.result_summary.setWordWrap(True)
-        layout.addWidget(self.result_summary)
-        self.results = QTableWidget(0, 4)
-        self.results.setHorizontalHeaderLabels(["TV level", "Upward raw values", "Downward raw values", "Verification"])
-        self.results.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        layout.addWidget(self.results)
         self.log = QTextEdit()
         self.log.setReadOnly(True)
         layout.addWidget(self.log)
-        self.resize(900, 850)
+        if sys.platform != "win32":
+            self.log.append("Windows is required for system mute control.")
+        self.resize(760, 650)
         self.refresh()
-        self.load_results()
 
     def refresh(self):
+        if self.worker is not None:
+            return
         try:
-            pending = bool(load_document(DATA_PATH).get("recovery"))
-            self.start.setEnabled(not pending and sys.platform == "win32" and self.silent_source.isChecked())
-            self.preflight.setEnabled(self.start.isEnabled())
-            self.recover.setEnabled(pending and sys.platform == "win32" and self.silent_source.isChecked())
-            if pending and not self._recovery_notice_shown:
-                self.log.append("A saved session needs recovery before another test can start.")
-            self._recovery_notice_shown = pending
-            if sys.platform != "win32":
-                self.log.append("Windows is required for this stage's system mute control.")
+            mapping = load_mapping(DATA_PATH)
+            self.has_mapping = mapping is not None
+            self._mapping_error = None
+            if mapping:
+                levels = mapping["tv_volume_by_amplifier_raw_volume"]
+                self.status.setText(f"Completed calibration: amplifier raw 0–{len(levels) - 1} → TV {levels[0]}–{levels[-1]}.")
+            else:
+                self.status.setText("No completed calibration found.")
         except Exception as error:
-            self.start.setEnabled(False)
-            self.preflight.setEnabled(False)
-            self.recover.setEnabled(False)
-            self.log.append(str(error))
+            self.has_mapping = False
+            message = f"Existing calibration is unreadable: {error}. A successful sweep will replace it."
+            if message != self._mapping_error:
+                self.log.append(message)
+            self._mapping_error = message
+            self.status.setText("No usable completed calibration found.")
+        self.start.setText("Replace calibration" if self.has_mapping else "Start calibration")
+        self.start.setEnabled(sys.platform == "win32" and self.silent_source.isChecked())
 
-    def load_results(self):
-        try:
-            document = load_document(DATA_PATH)
-            mapping = document.get("calibration")
-            draft = document.get("draft")
-            draft_note = ""
-            if isinstance(draft, dict):
-                rows = draft.get("observations", [])
-                draft_note = (f" Inactive draft: {len(rows)} observations; {draft.get('status', 'unfinished')}. "
-                              "It is not used by Sony; start a new sweep after any required recovery.")
-            if mapping is None:
-                self.results.setHorizontalHeaderLabels(["Amplifier raw", "TV level", "Phase", "Status"])
-                self.results.setRowCount(len(rows) if draft_note else 0)
-                if draft_note:
-                    for index, row in enumerate(rows):
-                        for column, value in enumerate((row['raw'], row['tv'], row['phase'], "Inactive draft")):
-                            self.results.setItem(index, column, QTableWidgetItem(str(value)))
-                    self.results.resizeColumnsToContents()
-                self.result_summary.setText("No active saved mapping." + draft_note)
-                return
-            entries = mapping["lookup"]
-            estimated = sum(entry["source"] == "interpolated" for entry in entries)
-            self.results.setHorizontalHeaderLabels(["Amplifier raw", "TV level", "Origin", "Status"])
-            self.results.setRowCount(len(entries))
-            for index, entry in enumerate(entries):
-                values = (entry["raw"], entry["tv"], "Estimated" if entry["source"] == "interpolated" else "Mapped", "Completed lookup")
-                for column, value in enumerate(values):
-                    self.results.setItem(index, column, QTableWidgetItem(str(value)))
-            self.results.resizeColumnsToContents()
-            self.result_summary.setText(
-                f"Input {mapping['input']}; amplifier raw 0–{mapping['raw_max']} → TV {mapping['tv_min']}–{mapping['tv_max']}. "
-                f"{len(entries)} mapped values, {estimated} estimates. Measurement evidence is not stored in the runtime file."
-                + draft_note)
-        except Exception as error:
-            self.results.setRowCount(0)
-            self.result_summary.setText(f"Cannot display mapping: {error}")
-
-    def begin(self, recovery, sweep=False):
-        if not self.silent_source.isChecked() or self.worker is not None:
+    def begin_or_cancel(self):
+        if self.worker is not None:
+            self.cancel()
+            return
+        self.refresh()
+        if not self.start.isEnabled():
+            return
+        if self.has_mapping and QMessageBox.question(
+                self, "Replace calibration", "Replace the completed calibration? The existing mapping is kept until the new sweep and restoration succeed.",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
             return
         self.silent_source.setEnabled(False)
-        self.start.setEnabled(False)
-        self.preflight.setEnabled(False)
-        self.recover.setEnabled(False)
+        self.cleaning_up = False
+        self.start.setText("Cancel calibration")
         self.activity.setRange(0, 0)
-        for widget in (self.raw_lower, self.limit_upper, self.raw_upper):
-            widget.setEnabled(False)
-        self.cancel_button.setEnabled(True)
-        self.safe_restore.setEnabled(False)
-        self.restore_value.setEnabled(False)
-        volume = self.restore_value.value() if self.safe_restore.isChecked() else None
-        self.worker = SessionWorker(volume, recovery, self, sweep=sweep,
-                                    raw_lower=self.raw_lower.value(),
-                                    raw_upper=self.raw_upper.value() if self.limit_upper.isChecked() else None)
+        self.worker = SessionWorker(self)
         self.worker.progress.connect(self.log.append)
+        self.worker.cleanup_started.connect(self.show_restoring)
         self.worker.completed.connect(self.completed)
         self.worker.finished.connect(self.finished)
         self.worker.start()
 
     def cancel(self):
-        if self.worker is not None:
+        if self.worker is not None and not self.cleaning_up and not self.worker.cancel.is_set():
             self.worker.cancel.set()
-            self.cancel_button.setEnabled(False)
-            self.log.append("Cancellation requested; waiting for restoration.")
+            self.start.setEnabled(False)
+            self.start.setText("Cancelling…")
+            self.log.append("Cancellation requested; the current command will settle before original settings are restored.")
 
-    def completed(self, ok, message):
+    def show_restoring(self):
+        self.cleaning_up = True
+        self.start.setText("Restoring original settings…")
+        self.start.setEnabled(False)
+
+    def completed(self, message):
         self.log.append(message)
-        if not ok:
-            QMessageBox.warning(self, "Volume matching helper", message)
+        self.log.append(POST_SWEEP_WARNING)
+        QMessageBox.warning(self, "Check volume and mute settings", message + "\n\n" + POST_SWEEP_WARNING)
 
     def finished(self):
         self.worker.deleteLater()
         self.worker = None
-        self.cancel_button.setEnabled(False)
+        self.cleaning_up = False
         self.activity.setRange(0, 1)
         self.activity.setValue(1)
-        self.raw_lower.setEnabled(True)
-        self.limit_upper.setEnabled(True)
-        self.raw_upper.setEnabled(self.limit_upper.isChecked())
         self.silent_source.setEnabled(True)
-        self.safe_restore.setEnabled(True)
-        self.restore_value.setEnabled(self.safe_restore.isChecked())
+        self.silent_source.setChecked(False)
         self.refresh()
-        self.load_results()
 
     def closeEvent(self, event):
-        if self.worker is not None and self.worker.isRunning():
+        if self.worker is not None:
             self.cancel()
-            self.log.append("Close again after restoration completes.")
+            self.log.append("Wait for restoration to finish before closing the helper.")
             event.ignore()
         else:
             event.accept()
@@ -1210,13 +997,13 @@ class CalibrationWindow(QWidget):
 
 def main():
     app = QApplication(sys.argv)
-    # A second helper may inspect recovery state, but only one can own it or
-    # alter devices. Lock the journal as well as relying on remote leases.
     from PySide6.QtCore import QLockFile
+    # Prevent two helpers replacing the same mapping; device leases separately
+    # prevent concurrent calibration through either remote.
     lock = QLockFile(str(DATA_PATH) + ".lock")
     lock.setStaleLockTime(0)
     if not lock.tryLock(0):
-        QMessageBox.warning(None, "Volume matching helper", "Another helper is already using this calibration JSON.")
+        QMessageBox.warning(None, "Volume matching helper", "Another helper is already using this calibration file.")
         return 1
     window = CalibrationWindow()
     window.show()
