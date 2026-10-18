@@ -18,7 +18,7 @@ from PySide6.QtWidgets import (
     QProgressBar, QTextEdit, QVBoxLayout, QWidget,
 )
 
-__version__ = "2026.10.18.12"
+__version__ = "2026.10.18.13"
 DATA_PATH = Path(__file__).resolve().with_name("VolumeCalibration.json")
 USER_SUFFIX = hashlib.sha256(str(Path.home()).encode()).hexdigest()[:16]
 TIMEOUT = 5.0
@@ -607,9 +607,14 @@ class CalibrationSession:
     def cec_quiet(self, description, baseline=None, direction=None):
         """Observe a full quiet interval without issuing another volume command."""
         def safe(a, t):
-            if baseline is not None and ((a["raw_volume"] - baseline[0]) * direction < 0
-                                         or (t["volume"] - baseline[1]) * direction < 0):
-                raise CalibrationError("Volume moved opposite to the requested direction.")
+            if baseline is not None and (a["raw_volume"] - baseline[0]) * direction < 0:
+                raise CalibrationError(
+                    f"Amplifier raw volume moved opposite to requested {direction:+d}: "
+                    f"raw {baseline[0]} → {a['raw_volume']}, TV {baseline[1]} → {t['volume']}.")
+            # TV display updates can lag or bounce while the amplifier moves
+            # correctly. Observe them through the quiet interval; the caller
+            # still checks the resulting pair before accepting/retrying.
+
             return True
         return self.wait(safe, description, windows_muted=True,
                          stable_for=CEC_QUIET_SECONDS, min_elapsed=CEC_QUIET_SECONDS,
@@ -670,15 +675,20 @@ class CalibrationSession:
         def confirmed(a, t):
             nonlocal candidate
             amp_delta, tv_delta = a["raw_volume"] - raw, t["volume"] - tv_volume
-            if amp_delta * direction < 0 or tv_delta * direction < 0:
-                raise CalibrationError("Volume moved opposite to the requested direction.")
+            if amp_delta * direction < 0:
+                raise CalibrationError(
+                    f"Amplifier raw volume moved opposite to requested {direction:+d}: "
+                    f"raw {raw} → {a['raw_volume']}, TV {tv_volume} → {t['volume']}.")
             if amp_delta * direction <= 0:
                 return False
             if candidate is None:
                 candidate = a["raw_volume"]
             elif a["raw_volume"] != candidate:
                 raise StepUncertain("Amplifier continued beyond the first observed step before settling.")
-            return True
+            # Quick positioning records no mapping pairs. In verified steps a
+            # contrary TV reading must correct itself and settle, rather than
+            # instantly aborting or being accepted as measurement data.
+            return quick or tv_delta * direction >= 0
         while time.monotonic() < deadline:
             self.pump()
             a, t = self.guard(require_windows_mute=True)
@@ -731,15 +741,24 @@ class CalibrationSession:
     def position_at_tv_minimum(self, minimum):
         self.progress("Positioning at the TV minimum; full step verification starts within five TV levels of minimum.")
         start = time.monotonic()
+        was_quick = False
         for count in range(MAX_VOLUME_STEPS + 1):
             a, t = self.guard(require_windows_mute=True)
-            if t["volume"] == minimum:
+            if was_quick and t["volume"] <= minimum + 5:
+                self.cec_quiet("Resynchronizing TV/amplifier readings after fast positioning",
+                               self.volume_pair(a, t), -1)
+                a, t = self.guard(require_windows_mute=True)
+                was_quick = False
+            if t["volume"] == minimum or a["raw_volume"] == 0:
+                # A delayed TV number may still be above minimum when raw
+                # volume has reached its lower boundary. Send nothing further.
                 return self.wait(lambda a, t: t["volume"] == minimum,
                                  "Verifying the settled TV-minimum baseline", windows_muted=True,
                                  stable_for=3.0, min_elapsed=3.0, timeout=15.0)
             if count == MAX_VOLUME_STEPS or time.monotonic() - start >= VOLUME_RESTORE_SECONDS:
                 raise CalibrationError("TV-minimum positioning exceeded its step/time limit.")
-            self.relative_step(-1, quick=t["volume"] > minimum + 5)
+            was_quick = t["volume"] > minimum + 5
+            self.relative_step(-1, quick=was_quick)
 
     def seek_volume(self, *, raw_target=None, tv_target=None, raw_limit=None):
         """Bounded incremental restoration; never oscillate around an unreachable raw target."""
