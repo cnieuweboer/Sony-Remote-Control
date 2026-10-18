@@ -16,6 +16,7 @@
   "AppControls": true,
   "ChannelControls": false,
   "NavigationControls": true,
+  "NavigationControlsCompact": false,
   "PlaybackControls": true,
   "VolumeControls": true,
   "VolumeRateLimit": {

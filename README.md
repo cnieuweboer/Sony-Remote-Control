@@ -59,6 +59,7 @@ Set:
   "ChannelControls": true,
   "AppControls": true,
   "NavigationControls": true,
+  "NavigationControlsCompact": false,
   "InputControls": false,
   "VolumeControls": true,
   "AmplifierTVInput": "",
@@ -80,7 +81,8 @@ Set:
 - `TextInputControls` — show the Text Input section. Text is sent to the currently active TV software keyboard or text field by pressing Enter.
 - `ChannelControls` — show number buttons `0`–`9` and channel `−` / `+` controls.
 - `AppControls` — show the application launcher and favorite application buttons.
-- `NavigationControls` — show directional, OK, Home, and Back controls.
+- `NavigationControls` — show directional, OK, Input, Settings, Home, and Back controls.
+- `NavigationControlsCompact` — `false` (default) gives Input/Settings and Back/Home their own two-button rows; `true` places them in the corners of the three-by-three navigation grid.
 - `InputControls` — show the input selector and favorite input buttons.
 - `VolumeControls` — show volume and mute controls.
 - `PlaybackControls` — show media playback controls.
@@ -134,7 +136,7 @@ Sony loads a successful calibration automatically; no manual `AmplifierTVInput` 
 
 ## Navigation
 
-**Input** and **Settings** buttons sit beside Up, matching the physical remote layout. Input opens the TV’s input menu; the separate input dropdown remains available.
+**Input** opens the TV’s input menu and **Settings** opens its settings menu; the separate input dropdown remains available. Use `NavigationControlsCompact` to switch between separate menu rows and a compact three-by-three grid.
 
 ## Text input
 

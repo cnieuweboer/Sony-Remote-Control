@@ -339,7 +339,7 @@ class CalibrationServer(QObject):
 APP_NAME = "Sony Remote"
 
 
-__version__ = "2026.10.18.21"
+__version__ = "2026.10.18.22"
 
 
 CONFIG_PATH = Path(__file__).with_name("SonyRemote.json")
@@ -392,6 +392,7 @@ DEFAULT_CONFIG = {
     "AppControls": True,
     "ChannelControls": True,
     "NavigationControls": True,
+    "NavigationControlsCompact": False,
     "PlaybackControls": True,
     "VolumeControls": True,
     "AmplifierTVInput": "",
@@ -420,6 +421,7 @@ BOOLEAN_CONFIG_KEYS = (
     "AppControls",
     "ChannelControls",
     "NavigationControls",
+    "NavigationControlsCompact",
     "PlaybackControls",
     "VolumeControls",
     "SystemTray",
@@ -1851,39 +1853,47 @@ class SonyRemote(QMainWindow):
 
     def _build_navigation_controls(self):
         layout = self._section("Navigation")
+        compact = self.config["NavigationControlsCompact"]
+        self.navigation_menu_buttons = {}
+
+        def make_button(text, command):
+            button = QPushButton(text)
+            button.setMinimumHeight(36)
+            button.clicked.connect(lambda checked=False: self.send_ircc(command))
+            if command in ("TvInput", "Settings"):
+                self.navigation_menu_buttons[command] = button
+            return button
+
+        def add_menu_row(entries):
+            row = QHBoxLayout()
+            row.setSpacing(6)
+            for text, command in entries:
+                row.addWidget(make_button(text, command), 1)
+            layout.addLayout(row)
+
+        if not compact:
+            add_menu_row((("Input", "TvInput"), ("Settings", "Settings")))
+
         grid = QGridLayout()
         grid.setSpacing(6)
         for column in range(3):
             grid.setColumnStretch(column, 1)
-
-        for text, row, col, command in (
+        entries = [
             ("↑", 0, 1, "Up"), ("←", 1, 0, "Left"),
             ("OK", 1, 1, "Confirm"), ("→", 1, 2, "Right"),
             ("↓", 2, 1, "Down"),
-        ):
-            button = QPushButton(text)
-            button.setMinimumHeight(36)
-            button.clicked.connect(lambda checked=False, c=command: self.send_ircc(c))
-            grid.addWidget(button, row, col)
-        self.navigation_menu_buttons = {}
-        for text, column, command in (
-            ("Input", 0, "TvInput"),
-            ("Settings", 2, "Settings"),
-        ):
-            button = QPushButton(text)
-            button.setMinimumHeight(36)
-            button.clicked.connect(lambda checked=False, c=command: self.send_ircc(c))
-            grid.addWidget(button, 0, column)
-            self.navigation_menu_buttons[command] = button
+        ]
+        if compact:
+            entries.extend((
+                ("Input", 0, 0, "TvInput"), ("Settings", 0, 2, "Settings"),
+                ("Back", 2, 0, "Return"), ("Home", 2, 2, "Home"),
+            ))
+        for text, row, column, command in entries:
+            grid.addWidget(make_button(text, command), row, column)
         layout.addLayout(grid)
-        row = QHBoxLayout()
-        back = QPushButton("Back")
-        home = QPushButton("Home")
-        back.clicked.connect(lambda: self.send_ircc("Return"))
-        home.clicked.connect(lambda: self.send_ircc("Home"))
-        row.addWidget(back)
-        row.addWidget(home)
-        layout.addLayout(row)
+
+        if not compact:
+            add_menu_row((("Back", "Return"), ("Home", "Home")))
 
     def _build_volume_controls(self):
         layout = self._section("Volume")
