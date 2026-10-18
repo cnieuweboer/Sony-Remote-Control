@@ -18,7 +18,7 @@ from PySide6.QtWidgets import (
     QProgressBar, QTextEdit, QVBoxLayout, QWidget,
 )
 
-__version__ = "2026.10.18.13"
+__version__ = "2026.10.18.14"
 DATA_PATH = Path(__file__).resolve().with_name("VolumeCalibration.json")
 USER_SUFFIX = hashlib.sha256(str(Path.home()).encode()).hexdigest()[:16]
 TIMEOUT = 5.0
@@ -760,11 +760,12 @@ class CalibrationSession:
             was_quick = t["volume"] > minimum + 5
             self.relative_step(-1, quick=was_quick)
 
-    def seek_volume(self, *, raw_target=None, tv_target=None, raw_limit=None):
-        """Bounded incremental restoration; never oscillate around an unreachable raw target."""
+    def seek_volume(self, *, raw_target=None, tv_target=None, raw_limit=None, fast_tv_target=None):
+        """Bounded incremental restoration; verify the final approach and never oscillate."""
         start = time.monotonic()
-        for step in range(MAX_VOLUME_STEPS + 1):
-            a, t = self.guard(require_windows_mute=True)
+        was_quick = False
+        previous_direction = None
+        def approach(a, t):
             raw = a["raw_volume"]
             if raw_target is not None:
                 reached = raw == raw_target
@@ -772,12 +773,35 @@ class CalibrationSession:
             else:
                 reached = t["volume"] == tv_target and (raw_limit is None or raw <= raw_limit)
                 direction = 1 if t["volume"] < tv_target else -1
+            quick = fast_tv_target is not None and abs(t["volume"] - fast_tv_target) > 5
+            if raw_target is not None:
+                # A coarse/stale TV readout must not keep fast mode active
+                # when the exact saved raw target is already close.
+                quick = quick and abs(raw - raw_target) > 5
+            if raw_limit is not None and direction > 0:
+                quick = quick and raw_limit - raw > 5
+            return reached, direction, quick
+        for step in range(MAX_VOLUME_STEPS + 1):
+            a, t = self.guard(require_windows_mute=True)
+            reached, direction, quick = approach(a, t)
+            if was_quick and (not quick or reached or direction != previous_direction):
+                self.cec_quiet("Resynchronizing TV/amplifier readings before the final restoration approach",
+                               self.volume_pair(a, t), previous_direction)
+                a, t = self.guard(require_windows_mute=True)
+                reached, direction, quick = approach(a, t)
+                was_quick = False
             if reached:
                 return a, t
             if step == MAX_VOLUME_STEPS or time.monotonic() - start >= VOLUME_RESTORE_SECONDS:
                 raise CalibrationError("Incremental volume restoration exceeded its step/time limit.")
-            before = raw
-            self.relative_step(direction)
+            if raw_limit is not None and direction > 0 and a["raw_volume"] >= raw_limit:
+                # Wait for a delayed TV readout rather than raising the
+                # amplifier above the saved safe restore limit.
+                return self.wait(lambda a, t: t["volume"] == tv_target and a["raw_volume"] <= raw_limit,
+                                 "Waiting for the safe restore TV level to catch up", windows_muted=True)
+            before = a["raw_volume"]
+            self.relative_step(direction, quick=quick)
+            was_quick, previous_direction = quick, direction
             after = self.guard(require_windows_mute=True)[0]["raw_volume"]
             if raw_target is not None and (before - raw_target) * (after - raw_target) < 0:
                 raise CalibrationError("The saved raw volume lies between reachable steps; restoration stopped without oscillating.")
@@ -924,9 +948,9 @@ class CalibrationSession:
             self.repair_legacy_baseline()
         target = self.saved["restore_volume"]
         if target == self.saved["tv_volume"]:
-            self.seek_volume(raw_target=self.saved["amplifier_volume"])
+            self.seek_volume(raw_target=self.saved["amplifier_volume"], fast_tv_target=target)
         else:
-            self.seek_volume(tv_target=target, raw_limit=self.saved["amplifier_volume"])
+            self.seek_volume(tv_target=target, raw_limit=self.saved["amplifier_volume"], fast_tv_target=target)
         def restored(a, t):
             return (t["volume"] == target and
                     (a["raw_volume"] == self.saved["amplifier_volume"] if target == self.saved["tv_volume"]
