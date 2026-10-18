@@ -171,3 +171,11 @@ Connection retries and the handshake share a 1.5-second startup deadline. An una
 The hook thread checks its existing stop flag after native message-queue setup and before installation. If shutdown arrives during installation, the thread skips the started notification once it observes the flag and immediately follows its existing unhook cleanup path. Running hooks still use `WM_QUIT` to wake the native message loop. Worker draining, join limits, and restart behavior are unchanged.
 
 `tests/test_hook_lifecycle.py` uses real Python threads with a fake Win32 API and event barriers to force shutdown before thread-ID publication and during hook installation. It also checks normal message-loop shutdown, repeated stop calls, and stopping before start. These tests exercise lifecycle ordering without relying on randomly hitting a race; actual Windows API behavior still requires Windows testing.
+
+## Discovery saves and user configuration edits
+
+Automatic discovery writes use the last accepted file digest as their baseline. After preparing a temporary file, they check the current configuration immediately before replacement; changed, missing, or unreadable files are left alone. A skipped save keeps the baseline unchanged so existing file watching can validate the user's edit and restart only when it is valid. Failed-restart and unknown-baseline guards also prevent discovery saves.
+
+Successful saves return the digest of the exact UTF-8 bytes written, rather than re-reading the destination. An edit made after replacement therefore remains detectable. Default-file creation still works without an existing baseline. Both scripts retain their own implementation and atomic replacement; no shared module or additional polling is introduced.
+
+`tests/test_reliability.py` covers ordinary discovery saves, valid and unfinished edits, deletion/read failures, edits during replacement preparation and immediately after replacement, failed-restart protection, failed replacement cleanup, and initial default-file creation. Temporary files isolate every write.

@@ -3,6 +3,7 @@ import hashlib
 import json
 from pathlib import Path
 import runpy
+import tempfile
 from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
@@ -228,6 +229,136 @@ class MappingSnapshotTests(unittest.TestCase):
         self.assertIs(remote.volume_mapping, previous)
         remote._amplifier_state_changed.assert_called_once_with(None)
         self.assertEqual(remote._mapping_digest, hashlib.sha256(b'invalid edit').digest())
+
+
+class DiscoverySaveTests(unittest.TestCase):
+    def setUp(self):
+        self.folder = tempfile.TemporaryDirectory()
+        self.addCleanup(self.folder.cleanup)
+        self.path = Path(self.folder.name) / ('SonyRemote.json' if IS_TV else 'YamahaRemote.json')
+        self.config = REMOTE['_default_config_copy']()
+        self.config['Host'] = 'device.local'
+        if IS_TV:
+            self.config['PreSharedKey'] = 'test-only'
+        self.original = json.dumps(self.config).encode('utf-8')
+        self.path.write_bytes(self.original)
+        self.baseline = hashlib.sha256(self.original).digest()
+        self.remote = SimpleNamespace(
+            config=self.config, _config_digest=self.baseline, _restart_failed=False,
+            _watch_config_paths=Mock(), _shutting_down=False, calibration_active=False,
+            _config_restart_pending=False, _invalid_config_digest=None,
+            _reload_volume_mapping=Mock(), _restart_for_config_change=Mock(),
+        )
+        self.cls = REMOTE['SonyRemote' if IS_TV else 'YamahaRemote']
+        self.context = patch.dict(GLOBALS, {'CONFIG_PATH': self.path})
+        self.context.start()
+        self.addCleanup(self.context.stop)
+        # A discovered name requires an automatic save, while the instance's
+        # accepted file digest still refers to the original configuration.
+        self.config['Inputs']['input'] = {'Name': 'Discovered café', 'NameOverride': '',
+                                         'Hidden': False, 'Favorite': False}
+
+    def save(self):
+        self.cls._save_config_without_restart(self.remote)
+        self.assertFalse(self.path.with_name(self.path.name + '.tmp').exists())
+
+    def edit(self):
+        candidate = json.loads(self.original)
+        candidate['Host'] = 'edited.local'
+        return json.dumps(candidate).encode('utf-8')
+
+    def test_unchanged_file_saves_discovery_and_does_not_restart(self):
+        self.save()
+        content = self.path.read_bytes()
+        self.assertEqual(json.loads(content), self.config)
+        self.assertIn('café'.encode('utf-8'), content)
+        self.assertEqual(self.remote._config_digest, hashlib.sha256(content).digest())
+        self.remote._watch_config_paths.assert_called_once()
+        self.cls._check_external_config_change(self.remote)
+        self.remote._restart_for_config_change.assert_not_called()
+
+    def test_valid_unapplied_edit_is_preserved_and_still_triggers_restart(self):
+        edited = self.edit()
+        self.path.write_bytes(edited)
+        self.save()
+        self.assertEqual(self.path.read_bytes(), edited)
+        self.assertEqual(self.remote._config_digest, self.baseline)
+        self.cls._check_external_config_change(self.remote)
+        self.remote._restart_for_config_change.assert_called_once()
+
+    def test_invalid_edit_is_preserved_for_normal_validation_feedback(self):
+        edited = b'{"Host": "unfinished'
+        self.path.write_bytes(edited)
+        self.save()
+        self.assertEqual(self.path.read_bytes(), edited)
+        self.assertEqual(self.remote._config_digest, self.baseline)
+        with patch.object(REMOTE['QMessageBox'], 'warning') as warning:
+            self.cls._check_external_config_change(self.remote)
+        warning.assert_called_once()
+        self.remote._restart_for_config_change.assert_not_called()
+
+    def test_edit_during_replacement_preparation_is_preserved(self):
+        write_bytes = Path.write_bytes
+        edited = self.edit()
+        def prepare(path, content):
+            result = write_bytes(path, content)
+            if path.name == self.path.name + '.tmp':
+                write_bytes(self.path, edited)
+            return result
+        with patch.object(Path, 'write_bytes', prepare):
+            self.save()
+        self.assertEqual(self.path.read_bytes(), edited)
+        self.assertEqual(self.remote._config_digest, self.baseline)
+
+    def test_edit_after_replacement_is_not_adopted_as_apps_saved_digest(self):
+        replace = REMOTE['os'].replace
+        edited = self.edit()
+        def replace_then_edit(source, destination):
+            replace(source, destination)
+            self.path.write_bytes(edited)
+        with patch.object(REMOTE['os'], 'replace', side_effect=replace_then_edit):
+            self.save()
+        own_content = (json.dumps(self.config, indent=2, ensure_ascii=False) + '\n').encode('utf-8')
+        self.assertEqual(self.path.read_bytes(), edited)
+        self.assertEqual(self.remote._config_digest, hashlib.sha256(own_content).digest())
+        self.cls._check_external_config_change(self.remote)
+        self.remote._restart_for_config_change.assert_called_once()
+
+    def test_deleted_file_is_not_recreated_by_discovery(self):
+        self.path.unlink()
+        self.save()
+        self.assertFalse(self.path.exists())
+        self.assertEqual(self.remote._config_digest, self.baseline)
+
+    def test_unreadable_file_is_not_replaced(self):
+        with patch.object(Path, 'read_bytes', side_effect=PermissionError('unreadable')):
+            self.save()
+        self.assertEqual(self.path.read_bytes(), self.original)
+        self.assertEqual(self.remote._config_digest, self.baseline)
+
+    def test_failed_restart_and_unknown_baseline_do_not_save(self):
+        for restart_failed, digest in ((True, self.baseline), (False, None)):
+            with self.subTest(restart_failed=restart_failed, digest=digest):
+                self.remote._restart_failed = restart_failed
+                self.remote._config_digest = digest
+                with patch.dict(GLOBALS, {'save_config': Mock()}) as context:
+                    self.save()
+                    context['save_config'].assert_not_called()
+                self.assertEqual(self.path.read_bytes(), self.original)
+
+    def test_failed_replacement_retains_file_and_baseline_and_cleans_temporary(self):
+        with patch.object(REMOTE['os'], 'replace', side_effect=OSError('replacement failed')):
+            with self.assertRaises(REMOTE['ConfigError']):
+                self.cls._save_config_without_restart(self.remote)
+        self.assertEqual(self.path.read_bytes(), self.original)
+        self.assertEqual(self.remote._config_digest, self.baseline)
+        self.assertFalse(self.path.with_name(self.path.name + '.tmp').exists())
+
+    def test_initial_default_save_still_creates_file(self):
+        self.path.unlink()
+        digest = REMOTE['save_config'](self.config)
+        self.assertEqual(json.loads(self.path.read_bytes()), self.config)
+        self.assertEqual(digest, hashlib.sha256(self.path.read_bytes()).digest())
 
 
 if __name__ == '__main__':
