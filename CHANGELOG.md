@@ -4,6 +4,8 @@ Release identifiers below come from the corresponding commits. Some releases upd
 
 ## 2026-10-18
 
+- 2026.10.18.25 — Require one second of hovering before showing tooltips, including when moving between controls.
+
 - 2026.10.18.24 — Show keyboard shortcuts in button hover tooltips.
 
 - 2026.10.18.23 — Add Insert for Input and Delete for Settings to focused keyboard shortcuts, preserving text editing.

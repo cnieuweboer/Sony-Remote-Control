@@ -23,7 +23,7 @@ from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtGui import QAction, QColor, QPalette
 from PySide6.QtWidgets import (
     QApplication, QComboBox, QDialogButtonBox, QFrame, QGridLayout, QHBoxLayout, QLabel,
-    QGraphicsOpacityEffect, QMainWindow, QMenu, QMessageBox, QPushButton, QStyle, QTextEdit,
+    QGraphicsOpacityEffect, QMainWindow, QMenu, QMessageBox, QPushButton, QProxyStyle, QStyle, QTextEdit,
     QStyleOptionComboBox, QStylePainter, QStyledItemDelegate,
     QSystemTrayIcon, QVBoxLayout, QWidget,
 )
@@ -339,7 +339,7 @@ class CalibrationServer(QObject):
 APP_NAME = "Sony Remote"
 
 
-__version__ = "2026.10.18.24"
+__version__ = "2026.10.18.25"
 
 
 CONFIG_PATH = Path(__file__).with_name("SonyRemote.json")
@@ -722,6 +722,19 @@ def _file_sha256(path):
 # ----------------------------
 # Platform integration
 # ----------------------------
+
+
+class TooltipDelayStyle(QProxyStyle):
+    def styleHint(self, hint, option=None, widget=None, returnData=None):
+        if hint == QStyle.SH_ToolTip_WakeUpDelay:
+            return 1000
+        if hint == QStyle.SH_ToolTip_FallAsleepDelay:
+            # Moving between controls must still require a full hover delay.
+            return 0
+        return super().styleHint(hint, option, widget, returnData)
+
+
+
 
 
 _instance_mutex_handle = None
@@ -3332,6 +3345,7 @@ def launch_replacement():
 
 def _run_application():
     app = QApplication(sys.argv)
+    app.setStyle(TooltipDelayStyle())
     try:
         if not acquire_single_instance():
             return 0
