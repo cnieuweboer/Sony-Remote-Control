@@ -18,7 +18,7 @@ from PySide6.QtWidgets import (
     QProgressBar, QTextEdit, QVBoxLayout, QWidget,
 )
 
-__version__ = "2026.10.18.14"
+__version__ = "2026.10.18.16"
 DATA_PATH = Path(__file__).resolve().with_name("VolumeCalibration.json")
 USER_SUFFIX = hashlib.sha256(str(Path.home()).encode()).hexdigest()[:16]
 TIMEOUT = 5.0
@@ -44,86 +44,61 @@ class Cancelled(CalibrationError):
     pass
 
 
-def validate_mapping_v1(value):
-    """Validate observed pairs; never infer a linear scale from endpoints."""
-    if (not isinstance(value, dict) or type(value.get("schema_version")) is not int
-            or value["schema_version"] != 1):
-        raise ValueError("Unsupported volume mapping format.")
-    for key in ("input", "tv_id", "amplifier_id", "created_at"):
-        if not isinstance(value.get(key), str) or not value[key]:
-            raise ValueError(f"Missing mapping field: {key}.")
-    for key in ("raw_min", "raw_max", "api_ceiling"):
-        number = value.get(key)
-        if type(number) not in (int, float) or not math.isfinite(number):
-            raise ValueError(f"Invalid mapping field: {key}.")
-    if not 0 <= value["raw_min"] < value["raw_max"] <= value["api_ceiling"]:
-        raise ValueError("Invalid mapped amplifier range.")
-    for key in ("tv_min", "tv_max"):
-        if type(value.get(key)) is not int or value[key] < 0:
-            raise ValueError("Invalid mapped TV range.")
-    if value["tv_min"] > value["tv_max"]:
-        raise ValueError("Invalid mapped TV range.")
-    for direction in ("up", "down"):
-        rows = value.get(direction)
-        if not isinstance(rows, list) or not 2 <= len(rows) <= 513:
-            raise ValueError("Invalid mapping observations.")
-        previous = None
-        for row in rows:
-            if not isinstance(row, dict) or type(row.get("tv")) is not int:
-                raise ValueError("Invalid observed TV level.")
-            raw = row.get("raw")
-            if (type(raw) not in (int, float) or not math.isfinite(raw)
-                    or not value["raw_min"] <= raw <= value["raw_max"]
-                    or not value["tv_min"] <= row["tv"] <= value["tv_max"]):
-                raise ValueError("Observed volume is outside the mapped range.")
-            if previous is not None:
-                if ((raw - previous["raw"]) * (1 if direction == "up" else -1) <= 0
-                        or (row["tv"] - previous["tv"]) * (1 if direction == "up" else -1) < 0):
-                    raise ValueError("Mapping observations are not monotonic.")
-            previous = row
-        ends = (rows[0]["raw"], rows[-1]["raw"])
-        expected = (value["raw_min"], value["raw_max"]) if direction == "up" else (value["raw_max"], value["raw_min"])
-        if ends != expected:
-            raise ValueError("Mapping passes do not cover the same endpoints.")
-    all_tv = [row["tv"] for direction in ("up", "down") for row in value[direction]]
-    if min(all_tv) != value["tv_min"] or max(all_tv) != value["tv_max"]:
-        raise ValueError("Mapping TV limits do not match observations.")
-    return value
+def validate_runtime_mapping(document):
+    """Validate only the completed lookup and its device-routing information."""
+    if (not isinstance(document, dict) or type(document.get("format_version")) is not int
+            or document["format_version"] != 2):
+        raise ValueError("Unsupported volume calibration document.")
+    for key in ("tv_device_id", "amplifier_device_id", "amplifier_tv_input"):
+        if not isinstance(document.get(key), str) or not document[key].strip():
+            raise ValueError(f"Invalid calibration field: {key}.")
+    levels = document.get("tv_volume_by_amplifier_raw_volume")
+    if not isinstance(levels, list) or not 2 <= len(levels) <= 10001:
+        raise ValueError("Lookup must cover amplifier raw zero through its calibrated maximum.")
+    previous = 0
+    for level in levels:
+        if type(level) is not int or level < previous:
+            raise ValueError("Mapped TV volumes must be nonnegative, integer, and nondecreasing.")
+        previous = level
+    estimated = document.get("estimated_amplifier_raw_volumes", [])
+    if (not isinstance(estimated, list)
+            or any(type(raw) is not int or not 0 <= raw < len(levels) for raw in estimated)
+            or len(set(estimated)) != len(estimated)):
+        raise ValueError("Invalid estimated amplifier raw volumes.")
+    estimated = set(estimated)
+    return {"input": document["amplifier_tv_input"],
+            "tv_id": document["tv_device_id"], "amplifier_id": document["amplifier_device_id"],
+            "raw_min": 0, "raw_max": len(levels) - 1, "tv_min": levels[0], "tv_max": levels[-1],
+            "lookup": [{"raw": raw, "tv": level, "source": "interpolated" if raw in estimated else "mapped"}
+                       for raw, level in enumerate(levels)]}
 
 
-def mapping_report_v1(mapping):
-    validate_mapping(mapping)
-    up = {row["raw"]: row["tv"] for row in mapping["up"]}
-    down = {row["raw"]: row["tv"] for row in mapping["down"]}
-    differences = sorted(raw for raw in up.keys() & down.keys() if up[raw] != down[raw])
-    unverified = sorted(up.keys() ^ down.keys())
-    rows = []
-    for tv in sorted(set(up.values()) | set(down.values())):
-        rising = sorted(raw for raw, level in up.items() if level == tv)
-        falling = sorted(raw for raw, level in down.items() if level == tv)
-        status = "Verified" if rising == falling else "Direction differs / incomplete"
-        rows.append((tv, rising, falling, status))
-    gaps = [(a, b) for a, b in zip([row[0] for row in rows], [row[0] for row in rows][1:]) if b - a > 1]
-    return {"rows": rows, "differences": differences, "unverified_raw": unverified,
-            "tv_gaps": gaps, "verified": not differences and not unverified}
+def runtime_document(mapping):
+    """Strip measurement evidence; array index is the amplifier raw value."""
+    entries = mapping.get("lookup")
+    if (not isinstance(entries, list) or not 2 <= len(entries) <= 10001
+            or mapping.get("raw_min") != 0 or mapping.get("raw_max") != len(entries) - 1):
+        raise ValueError("Invalid complete amplifier lookup range.")
+    for raw, entry in enumerate(entries):
+        if (not isinstance(entry, dict) or type(entry.get("raw")) is not int or entry["raw"] != raw
+                or entry.get("source") not in ("measured", "boundary-clamped", "interpolated", "mapped")):
+            raise ValueError("Lookup must contain exactly one entry for every amplifier raw value.")
+    document = {"format_version": 2, "tv_device_id": mapping.get("tv_id"),
+                "amplifier_device_id": mapping.get("amplifier_id"), "amplifier_tv_input": mapping.get("input"),
+                "tv_volume_by_amplifier_raw_volume": [entry.get("tv") for entry in entries],
+                "estimated_amplifier_raw_volumes": [raw for raw, entry in enumerate(entries)
+                                                    if entry["source"] == "interpolated"]}
+    return document
 
 
-def mapped_tv_volume_v1(mapping, raw, direction="up"):
-    rows = sorted(mapping[direction], key=lambda row: row["raw"])
-    raw = max(mapping["raw_min"], min(mapping["raw_max"], raw))
-    row = min(rows, key=lambda row: (abs(row["raw"] - raw), row["raw"]))
-    return row["tv"], row["raw"] != raw
-
-
-def validate_mapping(value):
-    if isinstance(value, dict) and type(value.get("schema_version")) is int and value["schema_version"] == 1:
-        return validate_mapping_v1(value)
-    if not isinstance(value, dict) or type(value.get("schema_version")) is not int or value["schema_version"] != 2:
-        raise ValueError("Unsupported volume mapping format.")
-    for key in ("input", "tv_id", "amplifier_id", "created_at"):
+def validate_sweep_mapping(value):
+    """Verify measurement evidence before publishing a completed lookup."""
+    if not isinstance(value, dict):
+        raise ValueError("Invalid sweep measurements.")
+    for key in ("input", "tv_id", "amplifier_id"):
         if not isinstance(value.get(key), str) or not value[key]:
             raise ValueError(f"Invalid mapping field: {key}.")
-    for key in ("raw_max", "tv_min", "tv_max", "observed_min_raw", "api_ceiling"):
+    for key in ("raw_max", "tv_min", "tv_max", "observed_min_raw", "observed_tv_max", "api_ceiling"):
         if type(value.get(key)) is not int or value[key] < 0:
             raise ValueError(f"Invalid integer mapping field: {key}.")
     if (type(value.get("raw_min")) is not int or value["raw_min"] != 0 or not 0 <= value["observed_min_raw"] < value["raw_max"] <= min(value["api_ceiling"], 10000)
@@ -138,7 +113,7 @@ def validate_mapping(value):
     for row in observations:
         if (not isinstance(row, dict) or type(row.get("raw")) is not int or type(row.get("tv")) is not int
                 or not value["observed_min_raw"] <= row["raw"] <= value["raw_max"]
-                or not value["tv_min"] <= row["tv"] <= value.get("observed_tv_max", value["tv_max"])):
+                or not value["tv_min"] <= row["tv"] <= value["observed_tv_max"]):
             raise ValueError("Invalid canonical observation.")
         measured.setdefault(row["raw"], []).append(row["tv"])
     if min(measured) != value["observed_min_raw"] or max(measured) != value["raw_max"]:
@@ -182,28 +157,6 @@ def validate_mapping(value):
     return value
 
 
-def mapping_report(mapping):
-    validate_mapping(mapping)
-    if mapping["schema_version"] == 1:
-        return mapping_report_v1(mapping)
-    candidates = {}
-    for row in mapping["observations"]:
-        candidates.setdefault(row["raw"], set()).add(row["tv"])
-    return {"canonical": True, "entries": mapping["lookup"],
-            "conflicts": sorted(raw for raw, levels in candidates.items() if len(levels) > 1),
-            "counts": {source: sum(entry["source"] == source for entry in mapping["lookup"])
-                       for source in ("measured", "boundary-clamped", "interpolated")}}
-
-
-def mapped_tv_volume(mapping, raw, direction="up"):
-    if mapping["schema_version"] == 1:
-        return mapped_tv_volume_v1(mapping, raw, direction)
-    bounded = max(0, min(mapping["raw_max"], raw))
-    index = int(math.floor(bounded + 0.5))
-    entry = mapping["lookup"][index]
-    return entry["tv"], bounded != index or entry["source"] == "interpolated"
-
-
 def build_canonical_mapping(observations, checks, saved, ceiling, top, tv_min):
     candidates = {}
     for row in observations:
@@ -243,25 +196,38 @@ def build_canonical_mapping(observations, checks, saved, ceiling, top, tv_min):
             entry = {"raw": raw, "tv": tv, "source": "interpolated",
                      "anchors": [lower, upper], "rounding": selected}
         lookup.append(entry)
-    mapping = {"schema_version": 2, "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-               "input": saved["input"], "tv_id": saved["tv_id"], "amplifier_id": saved["amplifier_id"],
+    mapping = {"input": saved["input"], "tv_id": saved["tv_id"], "amplifier_id": saved["amplifier_id"],
                "api_ceiling": ceiling, "raw_min": 0, "raw_max": top,
                "observed_min_raw": first, "tv_min": tv_min, "tv_max": measured[top],
                "observed_tv_max": max(row["tv"] for row in observations),
                "observations": observations, "gap_checks": checks, "lookup": lookup}
-    validate_mapping(mapping)
+    validate_sweep_mapping(mapping)
     return mapping
 
 
-def load_document(path):
-    if not path.exists():
-        return {"format_version": 1, "calibration": None, "recovery": None}
+def session_path(path):
+    return path.with_name(path.stem + ".session.json")
+
+
+def read_json(path):
     if path.stat().st_size > 2 * 1024 * 1024:
         raise CalibrationError("Calibration JSON exceeds the 2 MiB limit.")
-    document = json.loads(path.read_text(encoding="utf-8"))
-    if (not isinstance(document, dict) or type(document.get("format_version")) is not int
-            or document["format_version"] != 1):
-        raise CalibrationError("Unsupported calibration JSON format. Preserve the file for recovery.")
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def load_document(path):
+    # Keep the current session/recovery workflow out of the runtime lookup.
+    # The next workflow release will remove this temporary sidecar mechanism.
+    document = {"calibration": None, "recovery": None}
+    if path.exists():
+        document["calibration"] = validate_runtime_mapping(read_json(path))
+    state_path = session_path(path)
+    if state_path.exists():
+        state = read_json(state_path)
+        if not isinstance(state, dict) or type(state.get("format_version")) is not int or state["format_version"] != 1:
+            raise CalibrationError("Unsupported calibration session journal. Preserve it for recovery.")
+        for key in ("recovery", "draft"):
+            document[key] = state.get(key)
     recovery = document.get("recovery")
     if recovery is not None:
         validate_saved(recovery)
@@ -271,8 +237,6 @@ def load_document(path):
 def validate_saved(saved):
     if not isinstance(saved, dict):
         raise CalibrationError("Invalid recovery record.")
-    if "baseline_verified" in saved and type(saved["baseline_verified"]) is not bool:
-        raise CalibrationError("Invalid recovery baseline marker.")
     for key in ("input", "amplifier_id", "tv_id", "windows_device"):
         if not isinstance(saved.get(key), str) or not saved[key]:
             raise CalibrationError(f"Invalid recovery field: {key}.")
@@ -292,13 +256,30 @@ def validate_saved(saved):
         raise CalibrationError("Inconsistent recovery record.")
 
 
-def write_document(path, document):
+def atomic_json(path, document):
     temporary = path.with_name(path.name + ".tmp")
     try:
         temporary.write_text(json.dumps(document, indent=2, allow_nan=False) + "\n", encoding="utf-8")
         os.replace(temporary, path)
     finally:
         temporary.unlink(missing_ok=True)
+
+
+def write_document(path, document):
+    mapping = document.get("calibration")
+    compact = runtime_document(mapping) if mapping is not None else None
+    if compact is not None:
+        validate_runtime_mapping(compact)
+    state_path = session_path(path)
+    state = {"format_version": 1, "recovery": document.get("recovery"), "draft": document.get("draft")}
+    pending = bool(state["recovery"] or state["draft"])
+    existing = read_json(path) if path.exists() else None
+    if compact is not None and existing != compact:
+        atomic_json(path, compact)
+    if pending:
+        atomic_json(state_path, state)
+    else:
+        state_path.unlink(missing_ok=True)
 
 
 class WindowsMute:
@@ -593,7 +574,7 @@ class CalibrationSession:
                       "windows_device": self.windows.device_id, "windows_mute": self.windows.get(),
                       "tv_mute": t["mute"], "tv_volume": t["volume"], "restore_volume": restore,
                       "amplifier_mute": a["mute"], "amplifier_volume": a["raw_volume"],
-                      "amplifier_api_ceiling": a["raw_max_volume"], "baseline_verified": True}
+                      "amplifier_api_ceiling": a["raw_max_volume"]}
         self.document["recovery"] = saved
         write_document(self.path, self.document)
         # No mute/volume mutations are allowed before the journal is durable.
@@ -815,26 +796,6 @@ class CalibrationSession:
         self.progress("Relative CEC step confirmed, including changes within one TV display level."
                       + ("" if self.sweep else " No sweep was performed."))
 
-    def repair_legacy_baseline(self):
-        self.progress("Rechecking the CEC pairing in the older recovery record using relative steps.")
-        target = self.saved["restore_volume"]
-        self.seek_volume(tv_target=target)
-        a, _ = self.wait(lambda a, t: t["volume"] == target,
-                         "Settling the saved TV recovery level", windows_muted=True,
-                         stable_for=3.0, min_elapsed=3.0, timeout=15.0)
-        paired_raw = a["raw_volume"]
-        if not 0 <= paired_raw < min(self.saved["amplifier_api_ceiling"], a["raw_max_volume"]):
-            raise CalibrationError("Recovery pairing is outside the observable range.")
-        self.relative_step(-1 if paired_raw > 0 else 1)
-        self.seek_volume(raw_target=paired_raw)
-        self.wait(lambda a, t: t["volume"] == target and a["raw_volume"] == paired_raw,
-                  "Verifying the recovered TV/amplifier pair", windows_muted=True,
-                  stable_for=3.0, min_elapsed=3.0, timeout=15.0)
-        updated = dict(self.saved, amplifier_volume=paired_raw, baseline_verified=True)
-        self.document["recovery"] = updated
-        write_document(self.path, self.document)
-        self.saved = updated
-
     def sweep_limits(self):
         ceiling = self.peers["amplifier"].state["raw_max_volume"]
         upper = ceiling if self.raw_upper is None else self.raw_upper
@@ -927,7 +888,9 @@ class CalibrationSession:
             checks[str(target)] = evidence
             write_document(self.path, self.document)
         mapping = build_canonical_mapping(observations, checks, self.saved, ceiling, top, minimum)
-        self.progress("Canonical lookup complete: " + ", ".join(f"{count} {source}" for source, count in mapping_report(mapping)["counts"].items()))
+        counts = {source: sum(entry["source"] == source for entry in mapping["lookup"])
+                  for source in ("measured", "boundary-clamped", "interpolated")}
+        self.progress("Canonical lookup complete: " + ", ".join(f"{count} {source}" for source, count in counts.items()))
         if self.cancel.is_set():
             raise Cancelled("Cancelled. Restoring saved states; the previous mapping will be preserved.")
         self.pending_mapping = mapping
@@ -944,8 +907,6 @@ class CalibrationSession:
         # Verify identity and input BEFORE issuing any device mutations.
         self.guard()
         self.cec_quiet("Waiting for pending CEC activity to settle before session restoration")
-        if self.recovery and not self.saved.get("baseline_verified", False):
-            self.repair_legacy_baseline()
         target = self.saved["restore_volume"]
         if target == self.saved["tv_volume"]:
             self.seek_volume(raw_target=self.saved["amplifier_volume"], fast_tv_target=target)
@@ -961,9 +922,6 @@ class CalibrationSession:
                   "Verifying restored TV and amplifier mute")
         self.windows.set(self.saved["windows_mute"])
         self.document["recovery"] = None
-        self.document["last_session"] = {"completed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                                         "input": self.saved["input"], "tv_id": self.saved["tv_id"],
-                                         "amplifier_id": self.saved["amplifier_id"], "restoration_verified": True}
         write_document(self.path, self.document)
         self.restoration_verified = True
         self.progress("Volume and mute restoration verified. Windows mute restored last.")
@@ -1105,7 +1063,7 @@ class CalibrationWindow(QWidget):
         self.limit_upper.toggled.connect(self.raw_upper.setEnabled)
         for widget in (self.limit_upper, self.raw_upper):
             layout.addWidget(widget)
-        location = QLabel(f"Mapping and recovery file: {DATA_PATH}\nKeep this file beside SonyRemote.pyw to use it automatically.")
+        location = QLabel(f"Runtime mapping: {DATA_PATH}\nTemporary session journal: {session_path(DATA_PATH)}\nKeep the runtime mapping beside SonyRemote.pyw.")
         location.setWordWrap(True)
         layout.addWidget(location)
         buttons = QHBoxLayout()
@@ -1176,50 +1134,19 @@ class CalibrationWindow(QWidget):
                     self.results.resizeColumnsToContents()
                 self.result_summary.setText("No active saved mapping." + draft_note)
                 return
-            report = mapping_report(mapping)
-            if report.get("canonical"):
-                self.results.setHorizontalHeaderLabels(["Amplifier raw", "TV level", "Origin", "Evidence / method"])
-                self.results.setRowCount(len(report["entries"]))
-                for index, entry in enumerate(report["entries"]):
-                    if entry["source"] == "interpolated":
-                        detail = f"4 verified skipped-value crossings; neighbors {entry['anchors']}; {entry['rounding']}"
-                    elif entry["source"] == "boundary-clamped":
-                        detail = "Below the lowest measured TV-minimum amplifier value"
-                    elif "observed_tv_values" in entry:
-                        detail = f"Lowest of observed TV values {entry['observed_tv_values']}"
-                    else:
-                        detail = "Directly observed through TV/CEC control"
-                    for column, value in enumerate((entry["raw"], entry["tv"], entry["source"], detail)):
-                        self.results.setItem(index, column, QTableWidgetItem(str(value)))
-                self.results.resizeColumnsToContents()
-                counts = report["counts"]
-                self.result_summary.setText(
-                    f"Input {mapping['input']}; complete raw lookup 0–{mapping['raw_max']} → TV {mapping['tv_min']}–{mapping['tv_max']}. "
-                    + ", ".join(f"{count} {source}" for source, count in counts.items())
-                    + f". {len(report['conflicts'])} raw values had multiple TV observations; lowest recorded values are used. "
-                    "API ceiling is a readout/control limit, not the physical maximum." + draft_note)
-                return
-            self.results.setHorizontalHeaderLabels(["TV level", "Upward raw values", "Downward raw values", "Verification"])
-            self.results.setRowCount(len(report["rows"]))
-            for index, (tv, up, down, status) in enumerate(report["rows"]):
-                for column, value in enumerate((tv, ", ".join(map(str, up)), ", ".join(map(str, down)), status)):
-                    if column in (1, 2):
-                        observations = up if column == 1 else down
-                        text = (f"{observations[0]}–{observations[-1]} ({len(observations)} observations)"
-                                if observations else "Not observed")
-                        item = QTableWidgetItem(text)
-                        item.setToolTip(str(value))
-                    else:
-                        item = QTableWidgetItem(str(value))
-                    self.results.setItem(index, column, item)
+            entries = mapping["lookup"]
+            estimated = sum(entry["source"] == "interpolated" for entry in entries)
+            self.results.setHorizontalHeaderLabels(["Amplifier raw", "TV level", "Origin", "Status"])
+            self.results.setRowCount(len(entries))
+            for index, entry in enumerate(entries):
+                values = (entry["raw"], entry["tv"], "Estimated" if entry["source"] == "interpolated" else "Mapped", "Completed lookup")
+                for column, value in enumerate(values):
+                    self.results.setItem(index, column, QTableWidgetItem(str(value)))
             self.results.resizeColumnsToContents()
             self.result_summary.setText(
-                f"Input {mapping['input']}; raw {mapping['raw_min']}–{mapping['raw_max']}; "
-                f"TV {mapping['tv_min']}–{mapping['tv_max']}. "
-                f"{'Observed pairs verified' if report['verified'] else 'Direction differences / unverified observations'}; "
-                f"{len(report['differences'])} conflicting raw values, {len(report['unverified_raw'])} values seen in one pass, "
-                f"{len(report['tv_gaps'])} gaps in observed TV levels. "
-                "The reported API ceiling is a control limit, not the physical maximum." + draft_note)
+                f"Input {mapping['input']}; amplifier raw 0–{mapping['raw_max']} → TV {mapping['tv_min']}–{mapping['tv_max']}. "
+                f"{len(entries)} mapped values, {estimated} estimates. Measurement evidence is not stored in the runtime file."
+                + draft_note)
         except Exception as error:
             self.results.setRowCount(0)
             self.result_summary.setText(f"Cannot display mapping: {error}")

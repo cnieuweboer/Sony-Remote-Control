@@ -3,3 +3,5 @@ VolumeCalibration.json
 VolumeCalibration.json.tmp
 VolumeCalibration.json.lock
 __pycache__/
+VolumeCalibration.session.json
+VolumeCalibration.session.json.tmp

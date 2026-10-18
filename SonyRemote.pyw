@@ -334,7 +334,7 @@ class CalibrationServer(QObject):
 APP_NAME = "Sony Remote"
 
 
-__version__ = "2026.10.18.15"
+__version__ = "2026.10.18.16"
 
 
 CONFIG_PATH = Path(__file__).with_name("SonyRemote.json")
@@ -423,130 +423,36 @@ BOOLEAN_CONFIG_KEYS = (
 )
 
 
-def validate_mapping_v1(value):
-    """Validate observed pairs; never infer a linear scale from endpoints."""
-    if (not isinstance(value, dict) or type(value.get("schema_version")) is not int
-            or value["schema_version"] != 1):
-        raise ValueError("Unsupported volume mapping format.")
-    for key in ("input", "tv_id", "amplifier_id", "created_at"):
-        if not isinstance(value.get(key), str) or not value[key]:
-            raise ValueError(f"Missing mapping field: {key}.")
-    for key in ("raw_min", "raw_max", "api_ceiling"):
-        number = value.get(key)
-        if type(number) not in (int, float) or not math.isfinite(number):
-            raise ValueError(f"Invalid mapping field: {key}.")
-    if not 0 <= value["raw_min"] < value["raw_max"] <= value["api_ceiling"]:
-        raise ValueError("Invalid mapped amplifier range.")
-    for key in ("tv_min", "tv_max"):
-        if type(value.get(key)) is not int or value[key] < 0:
-            raise ValueError("Invalid mapped TV range.")
-    if value["tv_min"] > value["tv_max"]:
-        raise ValueError("Invalid mapped TV range.")
-    for direction in ("up", "down"):
-        rows = value.get(direction)
-        if not isinstance(rows, list) or not 2 <= len(rows) <= 513:
-            raise ValueError("Invalid mapping observations.")
-        previous = None
-        for row in rows:
-            if not isinstance(row, dict) or type(row.get("tv")) is not int:
-                raise ValueError("Invalid observed TV level.")
-            raw = row.get("raw")
-            if (type(raw) not in (int, float) or not math.isfinite(raw)
-                    or not value["raw_min"] <= raw <= value["raw_max"]
-                    or not value["tv_min"] <= row["tv"] <= value["tv_max"]):
-                raise ValueError("Observed volume is outside the mapped range.")
-            if previous is not None:
-                if ((raw - previous["raw"]) * (1 if direction == "up" else -1) <= 0
-                        or (row["tv"] - previous["tv"]) * (1 if direction == "up" else -1) < 0):
-                    raise ValueError("Mapping observations are not monotonic.")
-            previous = row
-        ends = (rows[0]["raw"], rows[-1]["raw"])
-        expected = (value["raw_min"], value["raw_max"]) if direction == "up" else (value["raw_max"], value["raw_min"])
-        if ends != expected:
-            raise ValueError("Mapping passes do not cover the same endpoints.")
-    all_tv = [row["tv"] for direction in ("up", "down") for row in value[direction]]
-    if min(all_tv) != value["tv_min"] or max(all_tv) != value["tv_max"]:
-        raise ValueError("Mapping TV limits do not match observations.")
-    return value
+def validate_runtime_mapping(document):
+    """Validate only the completed lookup and its device-routing information."""
+    if (not isinstance(document, dict) or type(document.get("format_version")) is not int
+            or document["format_version"] != 2):
+        raise ValueError("Unsupported volume calibration document.")
+    for key in ("tv_device_id", "amplifier_device_id", "amplifier_tv_input"):
+        if not isinstance(document.get(key), str) or not document[key].strip():
+            raise ValueError(f"Invalid calibration field: {key}.")
+    levels = document.get("tv_volume_by_amplifier_raw_volume")
+    if not isinstance(levels, list) or not 2 <= len(levels) <= 10001:
+        raise ValueError("Lookup must cover amplifier raw zero through its calibrated maximum.")
+    previous = 0
+    for level in levels:
+        if type(level) is not int or level < previous:
+            raise ValueError("Mapped TV volumes must be nonnegative, integer, and nondecreasing.")
+        previous = level
+    estimated = document.get("estimated_amplifier_raw_volumes", [])
+    if (not isinstance(estimated, list)
+            or any(type(raw) is not int or not 0 <= raw < len(levels) for raw in estimated)
+            or len(set(estimated)) != len(estimated)):
+        raise ValueError("Invalid estimated amplifier raw volumes.")
+    estimated = set(estimated)
+    return {"input": document["amplifier_tv_input"],
+            "tv_id": document["tv_device_id"], "amplifier_id": document["amplifier_device_id"],
+            "raw_min": 0, "raw_max": len(levels) - 1, "tv_min": levels[0], "tv_max": levels[-1],
+            "lookup": [{"raw": raw, "tv": level, "source": "interpolated" if raw in estimated else "mapped"}
+                       for raw, level in enumerate(levels)]}
 
 
-def mapped_tv_volume_v1(mapping, raw, direction="up"):
-    rows = sorted(mapping[direction], key=lambda row: row["raw"])
-    raw = max(mapping["raw_min"], min(mapping["raw_max"], raw))
-    row = min(rows, key=lambda row: (abs(row["raw"] - raw), row["raw"]))
-    return row["tv"], row["raw"] != raw
-
-
-def validate_mapping(value):
-    if isinstance(value, dict) and type(value.get("schema_version")) is int and value["schema_version"] == 1:
-        return validate_mapping_v1(value)
-    if not isinstance(value, dict) or type(value.get("schema_version")) is not int or value["schema_version"] != 2:
-        raise ValueError("Unsupported volume mapping format.")
-    for key in ("input", "tv_id", "amplifier_id", "created_at"):
-        if not isinstance(value.get(key), str) or not value[key]:
-            raise ValueError(f"Invalid mapping field: {key}.")
-    for key in ("raw_max", "tv_min", "tv_max", "observed_min_raw", "api_ceiling"):
-        if type(value.get(key)) is not int or value[key] < 0:
-            raise ValueError(f"Invalid integer mapping field: {key}.")
-    if (type(value.get("raw_min")) is not int or value["raw_min"] != 0 or not 0 <= value["observed_min_raw"] < value["raw_max"] <= min(value["api_ceiling"], 10000)
-            or value["tv_min"] > value["tv_max"]):
-        raise ValueError("Invalid canonical mapping bounds.")
-    observations = value.get("observations")
-    checks = value.get("gap_checks")
-    entries = value.get("lookup")
-    if not isinstance(observations, list) or not 2 <= len(observations) <= 5000 or not isinstance(checks, dict):
-        raise ValueError("Invalid canonical observations/evidence.")
-    measured = {}
-    for row in observations:
-        if (not isinstance(row, dict) or type(row.get("raw")) is not int or type(row.get("tv")) is not int
-                or not value["observed_min_raw"] <= row["raw"] <= value["raw_max"]
-                or not value["tv_min"] <= row["tv"] <= value.get("observed_tv_max", value["tv_max"])):
-            raise ValueError("Invalid canonical observation.")
-        measured.setdefault(row["raw"], []).append(row["tv"])
-    if min(measured) != value["observed_min_raw"] or max(measured) != value["raw_max"]:
-        raise ValueError("Canonical observed bounds do not match measurements.")
-    if not isinstance(entries, list) or len(entries) != value["raw_max"] + 1:
-        raise ValueError("Canonical lookup must cover every integer raw value.")
-    previous = value["tv_min"]
-    for raw, entry in enumerate(entries):
-        if (not isinstance(entry, dict) or type(entry.get("raw")) is not int or entry["raw"] != raw
-                or type(entry.get("tv")) is not int or not previous <= entry["tv"] <= value["tv_max"]):
-            raise ValueError("Canonical lookup must be complete and monotonic.")
-        previous = entry["tv"]
-        source = entry.get("source")
-        if source == "measured":
-            if raw not in measured or entry["tv"] != min(measured[raw]):
-                raise ValueError("Measured entry does not match its evidence.")
-        elif source == "boundary-clamped":
-            if raw >= value["observed_min_raw"] or entry["tv"] != value["tv_min"]:
-                raise ValueError("Invalid lower-boundary clamp.")
-        elif source == "interpolated":
-            evidence = checks.get(str(raw), [])
-            for direction in (-1, 1):
-                crossings = [e for e in evidence if isinstance(e, dict) and type(e.get("direction")) is int and e["direction"] == direction
-                             and type(e.get("from")) is int and type(e.get("to")) is int
-                             and e["from"] in measured and e["to"] in measured
-                             and (e["from"] - raw) * (e["to"] - raw) < 0
-                             and (e["to"] - e["from"]) * direction > 0]
-                if len(crossings) < 2:
-                    raise ValueError("Interpolation requires two verified crossings from each direction.")
-            if raw in measured or raw < value["observed_min_raw"]:
-                raise ValueError("A measured/boundary value cannot be interpolated.")
-            anchors = entry.get("anchors", [])
-            if (not isinstance(anchors, list) or len(anchors) != 2 or not all(type(a) is int for a in anchors)
-                    or not anchors[0] < raw < anchors[1] or any(a not in measured for a in anchors)
-                    or not min(measured[anchors[0]]) <= entry["tv"] <= min(measured[anchors[1]])):
-                raise ValueError("Invalid interpolation anchors.")
-        else:
-            raise ValueError("Unknown lookup provenance.")
-    if entries[0]["tv"] != value["tv_min"] or entries[-1]["tv"] != value["tv_max"]:
-        raise ValueError("Canonical TV limits do not match lookup endpoints.")
-    return value
-
-
-def mapped_tv_volume(mapping, raw, direction="up"):
-    if mapping["schema_version"] == 1:
-        return mapped_tv_volume_v1(mapping, raw, direction)
+def mapped_tv_volume(mapping, raw):
     bounded = max(0, min(mapping["raw_max"], raw))
     index = int(math.floor(bounded + 0.5))
     entry = mapping["lookup"][index]
@@ -1694,8 +1600,6 @@ class SonyRemote(QMainWindow):
         self.volume_mapping = None
         self._mapping_digest = None
         self._mapping_error = None
-        self._mapping_direction = "up"
-        self._previous_amplifier_raw = None
         self._calibration_operation = False
         self._status_sequence = 0
         self._status_observed_at = 0
@@ -2633,13 +2537,10 @@ class SonyRemote(QMainWindow):
                 elif raw < mapping["raw_min"]:
                     display, approximate = mapping["tv_min"], False
                 else:
-                    display, approximate = mapped_tv_volume(mapping, raw, self._mapping_direction)
-                    if mapping["schema_version"] == 1:
-                        values = {row["tv"] for direction in ("up", "down") for row in mapping[direction] if row["raw"] == raw}
-                        approximate = approximate or len(values) > 1
+                    display, approximate = mapped_tv_volume(mapping, raw)
                 prefix = "≈" if approximate else ""
                 self.volume_value.setToolTip(f"Calibrated TV scale; amplifier raw {raw}. "
-                                             "≈ marks an interpolated estimate (or a legacy approximate/directional level). "
+                                             "≈ marks a saved estimate or a fractional amplifier raw reading. "
                                              "Display is capped to the calibrated range.")
             else:
                 display = raw
@@ -2707,11 +2608,7 @@ class SonyRemote(QMainWindow):
                 if path.stat().st_size > 2 * 1024 * 1024:
                     raise ValueError("Volume calibration JSON exceeds the 2 MiB limit.")
                 document = json.loads(path.read_text(encoding="utf-8"))
-                if (not isinstance(document, dict) or type(document.get("format_version")) is not int
-                        or document["format_version"] != 1):
-                    raise ValueError("Unsupported volume calibration document.")
-                mapping = document.get("calibration")
-                self.volume_mapping = validate_mapping(mapping) if mapping is not None else None
+                self.volume_mapping = validate_runtime_mapping(document)
             except (OSError, ValueError, TypeError, OverflowError, RecursionError) as error:
                 # Keep the last valid mapping after a bad edit. On first load
                 # the configured input and raw-volume display remain available.
@@ -2741,13 +2638,6 @@ class SonyRemote(QMainWindow):
                     and self.amplifier_state["global_hotkeys_active"])
 
     def _amplifier_state_changed(self, state):
-        raw = (state or {}).get("raw_volume")
-        if type(raw) in (int, float) and self._previous_amplifier_raw is not None:
-            if raw > self._previous_amplifier_raw:
-                self._mapping_direction = "up"
-            elif raw < self._previous_amplifier_raw:
-                self._mapping_direction = "down"
-        self._previous_amplifier_raw = raw
         self.amplifier_state = state
         routed = self._use_amplifier()
         if routed != self._amplifier_routed:
