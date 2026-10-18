@@ -17,7 +17,7 @@ from PySide6.QtWidgets import (
     QProgressBar, QTextEdit, QVBoxLayout, QWidget,
 )
 
-__version__ = "2026.10.18.31"
+__version__ = "2026.10.18.32"
 DATA_PATH = Path(__file__).resolve().with_name("VolumeCalibration.json")
 IPC_USER_SUFFIX = hashlib.sha256(str(Path.home()).encode("utf-8")).hexdigest()[:16]
 

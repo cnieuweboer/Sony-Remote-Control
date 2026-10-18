@@ -120,3 +120,22 @@ python -m unittest discover -s tests -v
 These development-only tests do not require real devices and are not imported by the applications. Each script remains independently runnable without the tests or a shared module. Endpoint naming is centralized locally in `ipc_server_name`; the user-local socket names and wire protocol are unchanged.
 
 Local cleanup separates runtime-document validation (`validate_runtime_mapping`) from display preparation (`prepare_volume_mapping`). The remote and helper validate the same document structure; only Sony builds its internal display lookup. `_calibration_blocked` centralizes ordinary-command guards, and `_sync_discovered_config` preserves discovered Apps/Inputs settings and JSON order through one implementation.
+
+### Calibration regression coverage
+
+`tests/test_calibration.py` runs the real `CalibrationSession` with injected fake peers, fake Windows mute, and a virtual monotonic clock. Device snapshots arrive at simulated 250 ms intervals; delays and timeouts advance simulated time without sleeping or contacting devices. Temporary directories isolate every mapping write.
+
+| Scenarios | Checked outcome |
+| --- | --- |
+| Complete sweep; TV maximum or amplifier API ceiling | Dense lookup, correct stopping point, original settings restored before publication |
+| Fine amplifier steps within one TV level; delayed/bouncing TV display | Useful raw values retained and TV-scale output preserved |
+| Six-second CEC delay; ignored command; late multiple steps | No duplicate late step, quiet wait before retry, verified rollback before replay |
+| Repeated no-response; lost command acknowledgement | Four-attempt bound for inconclusive steps; no replay after acknowledgement uncertainty |
+| Cancel before starting, during a step, or during cleanup | Issued steps finish safely; cleanup completes; existing mapping stays unchanged |
+| Stale observations, disconnection, lease rejection, changed input | No new mapping; unsafe restoration is refused and Windows remains muted where possible |
+| Windows unmuted during sweep; original device/Windows mute states | Abort and restore where possible; original Windows mute restored last |
+| Skipped raw values | Measured when reached on recheck; interpolation requires two verified crossings from each direction |
+| Mapping boundaries and capped readouts | Lower-boundary clamp, complete monotonic lookup, lowest TV value at the API cap, estimate markers |
+| Failed restoration or atomic file replacement | Existing mapping bytes remain unchanged; temporary file removed |
+
+These tests do not exercise real Windows Core Audio, physical CEC timing, or device firmware. No calibration behavior changes were needed for this coverage release.
