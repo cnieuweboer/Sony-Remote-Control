@@ -165,3 +165,9 @@ After failing to acquire the single-instance lock, a new process contacts the ex
 Connection retries and the handshake share a 1.5-second startup deadline. An unavailable/unresponsive endpoint produces a clear already-running message instead of a silent exit. The server allows four connected clients, bounds frames, and disconnects idle clients after one second. Activation closes before restart/shutdown draining and is recreated if restart fails; it adds no periodic device/IPC polling.
 
 `tests/test_activation.py` launches real second Python processes against isolated local endpoints and private instance locks. It covers hidden/minimized windows, modal dialogs, calibration-disabled state, concurrent launches, delayed startup, malformed/partial requests, idle timeouts, role mismatch, duplicate endpoints, and endpoint recovery. Windows foreground-permission calls are mocked; actual desktop focus behavior requires platform testing.
+
+## Hook startup shutdown safeguard
+
+The hook thread checks its existing stop flag after native message-queue setup and before installation. If shutdown arrives during installation, the thread skips the started notification once it observes the flag and immediately follows its existing unhook cleanup path. Running hooks still use `WM_QUIT` to wake the native message loop. Worker draining, join limits, and restart behavior are unchanged.
+
+`tests/test_hook_lifecycle.py` uses real Python threads with a fake Win32 API and event barriers to force shutdown before thread-ID publication and during hook installation. It also checks normal message-loop shutdown, repeated stop calls, and stopping before start. These tests exercise lifecycle ordering without relying on randomly hitting a race; actual Windows API behavior still requires Windows testing.
