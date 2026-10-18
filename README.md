@@ -138,6 +138,8 @@ Sony loads a successful calibration automatically; no manual `AmplifierTVInput` 
 
 **Input** opens the TV’s input menu and **Settings** opens its settings menu; the separate input dropdown remains available. Use `NavigationControlsCompact` to switch between separate menu rows and a compact three-by-three grid.
 
+With the remote focused, **Insert** opens Input and **Delete** opens Settings; both keep normal editing behavior while Text Input has focus.
+
 ## Text input
 
 - **Enter** — Sends the text to the TV.

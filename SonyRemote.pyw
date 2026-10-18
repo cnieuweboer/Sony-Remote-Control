@@ -339,7 +339,7 @@ class CalibrationServer(QObject):
 APP_NAME = "Sony Remote"
 
 
-__version__ = "2026.10.18.22"
+__version__ = "2026.10.18.23"
 
 
 CONFIG_PATH = Path(__file__).with_name("SonyRemote.json")
@@ -741,6 +741,8 @@ _SHORTCUT_KEYS = {
     0x0D: 'Confirm',
     0x08: 'Return',
     0x24: 'Home',
+    0x2D: 'TvInput',
+    0x2E: 'Settings',
     0x60: 'Num0',
     0x61: 'Num1',
     0x62: 'Num2',
@@ -3277,6 +3279,8 @@ class SonyRemote(QMainWindow):
                 Qt.Key_Enter: "Confirm",
                 Qt.Key_Backspace: "Return",
                 Qt.Key_Home: "Home",
+                Qt.Key_Insert: "TvInput",
+                Qt.Key_Delete: "Settings",
                 Qt.Key_MediaTogglePlayPause: "PlayPause",
                 Qt.Key_MediaPlay: "Play",
                 Qt.Key_MediaPause: "Pause",
