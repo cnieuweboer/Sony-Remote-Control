@@ -17,7 +17,7 @@ from PySide6.QtWidgets import (
     QSpinBox, QTextEdit, QVBoxLayout, QWidget,
 )
 
-__version__ = "2026.10.18.6"
+__version__ = "2026.10.18.7"
 DATA_PATH = Path(__file__).resolve().with_name("VolumeCalibration.json")
 USER_SUFFIX = hashlib.sha256(str(Path.home()).encode()).hexdigest()[:16]
 TIMEOUT = 5.0
@@ -46,6 +46,8 @@ def load_document(path):
 def validate_saved(saved):
     if not isinstance(saved, dict):
         raise CalibrationError("Invalid recovery record.")
+    if "baseline_verified" in saved and type(saved["baseline_verified"]) is not bool:
+        raise CalibrationError("Invalid recovery baseline marker.")
     for key in ("input", "amplifier_id", "tv_id", "windows_device"):
         if not isinstance(saved.get(key), str) or not saved[key]:
             raise CalibrationError(f"Invalid recovery field: {key}.")
@@ -296,16 +298,20 @@ class CalibrationSession:
             raise CalibrationError("Windows was unmuted during the test.")
         return a, t
 
-    def wait(self, predicate, description, *, windows_muted=False, settle=True):
+    def wait(self, predicate, description, *, windows_muted=False, settle=True,
+             stable_for=0.5, min_elapsed=1.0, timeout=TIMEOUT):
         self.progress(description)
         start = time.monotonic()
-        deadline = start + TIMEOUT
+        deadline = start + timeout
         stable = 0
+        stable_since = start
         last_pair = None
         last_values = None
         while time.monotonic() < deadline:
             self.pump()
             if not all(peer.fresh() for peer in self.peers.values()):
+                stable, last_pair, last_values = 0, None, None
+                stable_since = time.monotonic()
                 continue
             a, t = self.guard(require_windows_mute=windows_muted)
             pair = (a["sample_id"], t["sample_id"])
@@ -313,17 +319,26 @@ class CalibrationSession:
             if predicate(a, t):
                 if not settle:
                     return a, t
-                if time.monotonic() - start >= 1 and pair != last_pair:
-                    # Require new observations from BOTH devices, not repeated
-                    # socket broadcasts or repeated reads of the same snapshot.
-                    if last_pair is None or (pair[0] != last_pair[0] and pair[1] != last_pair[1]):
-                        stable = stable + 1 if values == last_values else 1
-                        last_pair, last_values = pair, values
-                    if stable >= 3:
-                        return a, t
+                # Count fresh observations from BOTH devices. Start the quiet
+                # period again whenever either device's value changes.
+                if values != last_values:
+                    stable = 0
+                    stable_since = time.monotonic()
+                    last_pair, last_values = None, values
+                if last_pair is None or (pair[0] != last_pair[0] and pair[1] != last_pair[1]):
+                    stable += 1
+                    last_pair = pair
+                now = time.monotonic()
+                if stable >= 3 and now - start >= min_elapsed and now - stable_since >= stable_for:
+                    return a, t
             else:
                 stable, last_pair, last_values = 0, None, None
-        raise CalibrationError(description + " timed out. No uncertain reading was accepted.")
+                stable_since = time.monotonic()
+        detail = ""
+        if all(peer.state for peer in self.peers.values()):
+            detail = (f" (TV {self.peers['tv'].state.get('volume')}, "
+                      f"amplifier raw {self.peers['amplifier'].state.get('raw_volume')})")
+        raise CalibrationError(description + " timed out" + detail + ". No uncertain reading was accepted.")
 
     @staticmethod
     def number(value):
@@ -347,7 +362,7 @@ class CalibrationSession:
                       "windows_device": self.windows.device_id, "windows_mute": self.windows.get(),
                       "tv_mute": t["mute"], "tv_volume": t["volume"], "restore_volume": restore,
                       "amplifier_mute": a["mute"], "amplifier_volume": a["raw_volume"],
-                      "amplifier_api_ceiling": a["raw_max_volume"]}
+                      "amplifier_api_ceiling": a["raw_max_volume"], "baseline_verified": True}
         self.document["recovery"] = saved
         write_document(self.path, self.document)
         # No mute/volume mutations are allowed before the journal is durable.
@@ -365,9 +380,45 @@ class CalibrationSession:
             raise CalibrationError("The TV exposes no usable volume step.")
         original_raw = a["raw_volume"]
         self.request("tv", "set_volume", target)
-        self.wait(lambda a, t: t["volume"] == target and a["raw_volume"] != original_raw,
+        increasing = target > t["volume"]
+        self.wait(lambda a, t: t["volume"] == target
+                  and (a["raw_volume"] > original_raw if increasing else a["raw_volume"] < original_raw),
                   "Verifying a single TV/CEC volume step on the silent source", windows_muted=True)
         self.progress("Silent-source CEC check passed. No calibration sweep was performed.")
+
+    def repair_legacy_baseline(self):
+        # Older helpers saved a fresh reading without waiting for CEC to catch
+        # up. Verify the saved TV level and its CEC round trip instead of using
+        # that potentially impossible TV/raw-volume pair forever.
+        self.progress("Rechecking the CEC pairing in the older recovery record.")
+        target = self.saved["restore_volume"]
+        ceiling = self.saved["amplifier_api_ceiling"]
+        self.request("tv", "set_volume", target)
+        def usable(a, t):
+            return (t["volume"] == target and self.number(a.get("raw_volume"))
+                    and self.number(a.get("raw_max_volume"))
+                    and 0 <= a["raw_volume"] < min(ceiling, a["raw_max_volume"]))
+        a, t = self.wait(usable, "Settling the saved TV recovery level", windows_muted=True,
+                         stable_for=3.0, min_elapsed=3.0, timeout=15.0)
+        paired_raw = a["raw_volume"]
+        probe = target - 1 if target > t["minimum"] else target + 1
+        if probe > t["maximum"]:
+            raise CalibrationError("There is no usable TV step to verify the older recovery record.")
+        self.request("tv", "set_volume", probe)
+        def responded(a, t):
+            raw = a.get("raw_volume")
+            return (t["volume"] == probe and self.number(raw) and 0 <= raw < ceiling
+                    and (raw < paired_raw if probe < target else raw > paired_raw))
+        self.wait(responded, "Verifying CEC response for the older recovery record", windows_muted=True)
+        self.request("tv", "set_volume", target)
+        self.wait(lambda a, t: t["volume"] == target and a["raw_volume"] == paired_raw,
+                  "Verifying the recovered TV/amplifier pair", windows_muted=True,
+                  stable_for=3.0, min_elapsed=3.0, timeout=15.0)
+        # Persist only after the original target and its round trip are proven.
+        updated = dict(self.saved, amplifier_volume=paired_raw, baseline_verified=True)
+        self.document["recovery"] = updated
+        write_document(self.path, self.document)
+        self.saved = updated
 
     def restore(self):
         self.restoring = True
@@ -377,6 +428,8 @@ class CalibrationSession:
             raise CalibrationError("Windows output device changed. Restore the original output before recovery.")
         # Verify identity and input BEFORE issuing any device mutations.
         self.guard()
+        if self.recovery and not self.saved.get("baseline_verified", False):
+            self.repair_legacy_baseline()
         before_a, before_t = self.guard(require_windows_mute=True)
         before_raw, before_tv = before_a["raw_volume"], before_t["volume"]
         target = self.saved["restore_volume"]
@@ -418,7 +471,8 @@ class CalibrationSession:
                 self.peers[role] = peer
                 peer.connect()
                 self.request(role, "acquire")
-            self.wait(lambda a, t: True, "Waiting for fresh, exclusive device status", settle=False)
+            self.wait(lambda a, t: True, "Waiting for settled TV/amplifier status after earlier CEC commands",
+                      stable_for=3.0, min_elapsed=3.0, timeout=15.0)
             if self.recovery:
                 self.saved = existing
             else:
@@ -436,7 +490,7 @@ class CalibrationSession:
                         self.windows.set(True)
                     except Exception:
                         pass
-                    failure = CalibrationError(f"{failure or 'Session ended'}. Restoration could not be verified: {error}. "
+                    failure = CalibrationError(f"{str(failure or 'Session ended').rstrip('. ')}. Restoration could not be verified: {str(error).rstrip('. ')}. "
                                                "Windows has been left muted where possible. Keep the TV on a silent source, select the original amplifier input and Windows output, "
                                                "start both remotes, and use Recover saved states.")
             self.restoring = True
@@ -477,6 +531,7 @@ class CalibrationWindow(QWidget):
     def __init__(self):
         super().__init__()
         self.worker = None
+        self._recovery_notice_shown = False
         self.setWindowTitle(f"Volume matching helper — {__version__}")
         layout = QVBoxLayout(self)
         instructions = QLabel(
@@ -520,8 +575,9 @@ class CalibrationWindow(QWidget):
             pending = bool(load_document(DATA_PATH).get("recovery"))
             self.start.setEnabled(not pending and sys.platform == "win32" and self.silent_source.isChecked())
             self.recover.setEnabled(pending and sys.platform == "win32" and self.silent_source.isChecked())
-            if pending:
+            if pending and not self._recovery_notice_shown:
                 self.log.append("A saved session needs recovery before another test can start.")
+            self._recovery_notice_shown = pending
             if sys.platform != "win32":
                 self.log.append("Windows is required for this stage's system mute control.")
         except Exception as error:

@@ -141,6 +141,10 @@ The helper first captures the selected amplifier input through IPC. This stage d
 
 ### Running the first-stage helper
 
+Helper `2026.10.18.7` waits for at least three seconds of unchanged TV/amplifier readings after acquiring exclusive control, allowing up to fifteen seconds for earlier CEC commands to settle. Fresh IPC data alone does not establish a settled baseline. If readings keep changing, the helper stops before saving recovery data or changing mute/volume. The probe must move amplifier volume in the expected direction.
+
+Older recovery records may contain a TV/amplifier pair captured while CEC was still catching up. **Recover saved states** rechecks the saved TV restore level, verifies a small CEC step and return to that level, and only then replaces the old amplifier reference. This requires a silent source, valid pairing, and observable readings below the API ceiling. Failed checks preserve the journal and keep Windows muted. New records mark the settled baseline and retain exact amplifier-volume restoration checks. Do not delete the JSON to bypass recovery.
+
 Helper `2026.10.18.6` supports TVs and amplifiers that automatically clear mute on volume changes. It no longer pre-mutes those devices or treats their clearing mute as a test failure. Silence must come from the selected source throughout testing and recovery. Recovery JSON from `2026.10.18.5` remains compatible; preserve it and use **Recover saved states** before starting another test. Both remote scripts can stay at `2026.10.18.5`.
 
 1. Place `VolumeCalibration.pyw` in a writable folder and run it on Windows with the same Python/PySide6 installation as the remotes.
@@ -149,7 +153,7 @@ Helper `2026.10.18.6` supports TVs and amplifiers that automatically clear mute 
 4. Confirm **I confirm the TV source is silent and all other playback is stopped**, then click **Run silent-source CEC check**. The helper saves original states before changing anything, mutes Windows only, and tests one TV volume step through CEC. It prefers a downward step, using an upward step only at the TV's minimum.
 5. Keeping Windows muted, the helper restores TV volume, verifies the corresponding amplifier volume has settled, restores and verifies both original device mute states, and restores Windows mute last. **Cancel and restore**, or closing the helper while running, requests this same cleanup rather than terminating its worker.
 
-Each verification allows five seconds for CEC response. A result must remain stable across at least three distinct observations from **both** devices, following at least a one-second settling period. Repeated reads of one snapshot do not count. The helper stops on failed final mute restoration, missing volume response, stale/offline devices, a changed amplifier input, or lost session ownership. No sweep or mapping is performed yet.
+Ordinary probe and restoration checks allow five seconds for CEC response; initial settling and the older-record pairing checks allow fifteen seconds. A result must remain stable across at least three distinct observations from **both** devices, following at least a one-second settling period. Repeated reads of one snapshot do not count. The helper stops on failed final mute restoration, missing volume response, stale/offline devices, a changed amplifier input, or lost session ownership. No sweep or mapping is performed yet.
 
 `VolumeCalibration.json` is generated next to the helper. It is separate from `SonyRemote.json` and contains a versioned `recovery` record plus a `last_session` report. The `calibration` field is reserved for the next-stage mapping; an existing mapping is preserved. Recovery records contain the captured input, configured-device fingerprints, original mute/volume states, Windows endpoint ID, and requested restore volume—never device credentials. Configured-host fingerprints identify the remote configuration, rather than proving a device's hardware serial number.
 
