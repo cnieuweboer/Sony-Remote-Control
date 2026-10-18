@@ -334,7 +334,7 @@ class CalibrationServer(QObject):
 APP_NAME = "Sony Remote"
 
 
-__version__ = "2026.10.18.5"
+__version__ = "2026.10.18.9"
 
 
 CONFIG_PATH = Path(__file__).with_name("SonyRemote.json")
@@ -1623,7 +1623,7 @@ class SonyRemote(QMainWindow):
                  "online": self.last_power is not None, "power": self.last_power,
                  "volume": volume.get("volume"), "mute": volume.get("mute"),
                  "minimum": volume.get("minVolume"), "maximum": volume.get("maxVolume"),
-                 "sample_id": self._status_sequence,
+                 "sample_id": self._status_sequence, "relative_volume": True,
                  "valid_for_ms": max(0, min(6000, int((6 - age) * 1000)))}
         state.update(calibration_active=self.calibration_active,
                      device_id=hashlib.sha256(self.config["Host"].casefold().encode()).hexdigest())
@@ -1643,20 +1643,15 @@ class SonyRemote(QMainWindow):
         if self._shutting_down or missing_config_settings(self.config):
             done(False, "Device configuration is missing or the app is shutting down.")
             return
-        if action not in ("acquire", "set_mute", "set_volume"):
+        if action not in ("acquire", "set_mute", "adjust_volume"):
             done(False, "Unsupported calibration operation.")
             return
         if action == "set_mute" and type(args.get("value")) is not bool:
             done(False, "Mute must be true or false.")
             return
-        if action == "set_volume":
-            info = self.last_volume or {}
-            value = args.get("value")
-            if (type(value) is not int or type(info.get("minVolume")) is not int
-                    or type(info.get("maxVolume")) is not int
-                    or not info["minVolume"] <= value <= info["maxVolume"]):
-                done(False, "Volume is outside the TV's reported range.")
-                return
+        if action == "adjust_volume" and (type(args.get("value")) is not int or args["value"] not in (-1, 1)):
+            done(False, "Calibration volume steps must be +1 or -1.")
+            return
         self._calibration_operation = True
         token = self.calibration_server.token
         deadline = time.monotonic() + 5
@@ -1677,7 +1672,7 @@ class SonyRemote(QMainWindow):
             if action == "acquire":
                 finish(True)
                 return
-            function = (lambda: self.api.set_mute(args["value"])) if action == "set_mute" else (lambda: self.api.set_volume(args["value"]))
+            function = (lambda: self.api.set_mute(args["value"])) if action == "set_mute" else (lambda: self.api.adjust_volume(args["value"]))
             self.run_worker(function, on_result=lambda _: finish(True),
                             on_error=lambda error: finish(False, f"{type(error).__name__}: {error}"))
         ready()
@@ -2604,7 +2599,7 @@ class SonyRemote(QMainWindow):
             else int(self.last_volume.get("volume", 0))
         )
         target = max(minimum, min(maximum, current + int(amount)))
-        if target == current:
+        if target == current and self.config["VolumeRateLimit"]["Active"]:
             return
 
         self._desired_volume = target
@@ -2613,7 +2608,7 @@ class SonyRemote(QMainWindow):
         rate_limit = self.config["VolumeRateLimit"]
         if not rate_limit["Active"]:
             self.run_worker(
-                lambda: self.api.set_volume(target),
+                lambda: self.api.adjust_volume(1 if amount > 0 else -1),
                 on_finished=lambda: QTimer.singleShot(200, self.poll_status),
             )
             return
