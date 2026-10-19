@@ -83,7 +83,7 @@ def _ipc_frames(socket, buffer):
 
 class AmplifierClient(QObject):
     state_changed = Signal(object)
-    command_failed = Signal(str)
+    command_failed = Signal(str, str)
     command_succeeded = Signal()
 
     def __init__(self, parent=None):
@@ -134,7 +134,7 @@ class AmplifierClient(QObject):
         had_pending = bool(self.pending)
         self.pending.clear()
         if had_pending and not self.stopped:
-            self.command_failed.emit("Amplifier connection lost. Command was not retried.")
+            self.command_failed.emit("Amplifier connection lost. Command was not retried.", "connection")
         if not self.stopped and not self.retry.isActive():
             self.retry.start()
 
@@ -161,14 +161,14 @@ class AmplifierClient(QObject):
                             self.command_succeeded.emit()
                         elif reason != "queue_full":
                             detail = " because its state changed" if reason == "state_changed" else ""
-                            self.command_failed.emit(f"Amplifier command rejected{detail}. Command was not retried.")
+                            self.command_failed.emit(f"Amplifier command rejected{detail}. Command was not retried.", "rejection")
                 else:
                     raise ValueError("Unknown local message")
         except (ValueError, UnicodeError, TypeError, OverflowError) as error:
             record_exception(error, "Amplifier protocol", deduplicate=True)
             self.socket.abort()
             self._lost()
-            self.command_failed.emit("Incompatible amplifier protocol. Update both remotes together. Commands were not retried.")
+            self.command_failed.emit("Incompatible amplifier protocol. Update both remotes together. Commands were not retried.", "protocol")
 
     @staticmethod
     def _validate_state(message):
@@ -213,7 +213,7 @@ class AmplifierClient(QObject):
         def expired():
             self.pending.pop(request_id, None)
             timer.deleteLater()
-            self.command_failed.emit("Amplifier command acknowledgement timed out. Command was not retried.")
+            self.command_failed.emit("Amplifier command acknowledgement timed out. Command was not retried.", "timeout")
         timer.timeout.connect(expired)
         self.pending[request_id] = timer
         timer.start(2500)
@@ -492,7 +492,7 @@ class CalibrationServer(QObject):
 APP_NAME = "Sony Remote"
 
 
-__version__ = "2026.10.19.14"
+__version__ = "2026.10.19.15"
 
 
 CONFIG_PATH = Path(__file__).resolve().with_name("SonyRemote.json")
@@ -1911,6 +1911,7 @@ class SonyRemote(QMainWindow):
         self.amplifier_state = None
         self._amplifier_routed = False
         self._amplifier_error = ""
+        self._amplifier_error_category = ""
         self.amplifier_client = AmplifierClient(self)
         self.amplifier_client.state_changed.connect(self._amplifier_state_changed)
         self.amplifier_client.command_failed.connect(self._show_amplifier_error)
@@ -2924,6 +2925,9 @@ class SonyRemote(QMainWindow):
 
     def _amplifier_state_changed(self, state):
         self.amplifier_state = state
+        if (self._amplifier_error_category == "connection" and state
+                and state["valid_for_ms"] > 0 and self.amplifier_client.state_is_fresh):
+            self._clear_amplifier_error()
         routed = self._use_amplifier()
         if routed != self._amplifier_routed:
             self._desired_volume = None
@@ -2941,13 +2945,15 @@ class SonyRemote(QMainWindow):
             for widget in (self.volume_up, self.volume_down, self.mute_button):
                 widget.setEnabled(enabled)
 
-    def _show_amplifier_error(self, message):
+    def _show_amplifier_error(self, message, category="command"):
         # Match background feedback without changing the TV state or opening a dialog.
         self._amplifier_error = message
+        self._amplifier_error_category = category
         self._update_discovery_feedback()
 
     def _clear_amplifier_error(self):
         self._amplifier_error = ""
+        self._amplifier_error_category = ""
         self._update_discovery_feedback()
 
     def _route_volume_command(self, command):

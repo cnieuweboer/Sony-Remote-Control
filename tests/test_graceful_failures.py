@@ -262,7 +262,7 @@ class DiscoveryTests(unittest.TestCase):
     def test_amplifier_feedback_survives_tv_poll_and_clears_on_accepted_ack(self):
         self.start_and_settle()
         client = self.window.amplifier_client
-        client.command_failed.emit('Command acknowledgement timed out.')
+        client.command_failed.emit('Command acknowledgement timed out.', 'timeout')
         self.wait(lambda: not self.window.poll_running)
         previous_sequence = self.window._status_sequence
         self.window.poll_status()
@@ -276,6 +276,42 @@ class DiscoveryTests(unittest.TestCase):
             client._read()
         self.assertNotIn('Command acknowledgement timed out.', self.window.power_button.toolTip())
         timer.stop.assert_called_once()
+        self.window.show_error.assert_not_called()
+
+    def test_only_connection_feedback_clears_on_fresh_amplifier_state(self):
+        self.start_and_settle()
+        client = self.window.amplifier_client
+        state = json.loads((ROOT / 'tests/fixtures/amplifier_protocol_v1.json').read_text())['states'][0]
+        with patch.object(client, 'send_command') as send:
+            for category in ('connection', 'timeout', 'rejection', 'protocol'):
+                with self.subTest(category=category):
+                    # Identical wording proves recovery uses the category.
+                    client.command_failed.emit('Previous amplifier error.', category)
+                    with patch.dict(REMOTE['AmplifierClient']._read.__globals__,
+                                    _ipc_frames=lambda socket, buffer: [state]):
+                        client._read()
+                    text = self.window.power_button.toolTip()
+                    self.assertEqual('Previous amplifier error.' in text, category != 'connection')
+            send.assert_not_called()
+        client.command_succeeded.emit()
+        self.assertNotIn('Previous amplifier error.', self.window.power_button.toolTip())
+        self.window.show_error.assert_not_called()
+
+    def test_expired_or_invalid_state_does_not_clear_connection_feedback(self):
+        self.start_and_settle()
+        client = self.window.amplifier_client
+        state = json.loads((ROOT / 'tests/fixtures/amplifier_protocol_v1.json').read_text())['states'][0]
+        client.command_failed.emit('Connection lost.', 'connection')
+        with patch.dict(REMOTE['AmplifierClient']._read.__globals__,
+                        _ipc_frames=lambda socket, buffer: [dict(state, valid_for_ms=0)]):
+            client._read()
+        self.assertIn('Connection lost.', self.window.power_button.toolTip())
+        # A malformed state gets protocol feedback, rather than clearing errors.
+        with patch.dict(REMOTE['AmplifierClient']._read.__globals__,
+                        _ipc_frames=lambda socket, buffer: [dict(state, mute='invalid')]), \
+             patch.dict(REMOTE['record_exception'].__globals__, record_exception=Mock()):
+            client._read()
+        self.assertIn('Incompatible amplifier protocol', self.window.power_button.toolTip())
         self.window.show_error.assert_not_called()
 
     def test_pause_and_resume_reset_pending_discovery_and_retry_unfinished_feature(self):

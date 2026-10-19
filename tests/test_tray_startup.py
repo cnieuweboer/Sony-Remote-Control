@@ -10,7 +10,7 @@ from unittest.mock import Mock, patch
 from PySide6.QtWidgets import QApplication, QWidget
 
 ROOT = Path(__file__).resolve().parents[1]
-NAME = 'Sony' if ROOT.name == 'Sony-Remote-Control' else 'Yamaha'
+NAME = 'Sony' if (ROOT / 'SonyRemote.pyw').exists() else 'Yamaha'
 SCRIPT = ROOT / f'{NAME}Remote.pyw'
 REMOTE = runpy.run_path(str(SCRIPT), run_name='tray_startup_tests')
 GLOBALS = REMOTE['_run_application'].__globals__

@@ -4,6 +4,8 @@ Release identifiers below come from the corresponding commits. Some releases upd
 
 ## 2026-10-19
 
+- 2026.10.19.15 — Make tray startup tests independent of the checkout folder name and describe dropdown flicker as a popup fill/frame timing mismatch. Clear connection-loss feedback on fresh valid amplifier state using explicit error categories; preserve timeout/rejection feedback until an accepted command and never replay uncertain commands.
+
 - Sony Remote 2026.10.19.14 — With volume rate limiting disabled, schedule the follow-up status poll only after the volume-command queue drains. Suppress delayed follow-ups superseded by new volume input or active volume work, while retaining final target reconciliation and ordinary periodic polling. Add deterministic queue/delay regression tests.
 
 - 2026.10.19.13 — Replace tracked device settings with a sanitized `SonyRemote.example.json`; ignore local settings, crash logs, and temporary JSON files. Make hook lifecycle tests independent of the checkout folder name. Resolve the configuration path consistently with the calibration helper, including symlink launches.
