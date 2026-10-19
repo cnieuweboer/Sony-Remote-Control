@@ -21,7 +21,7 @@ class VolumeLimiterTests(unittest.TestCase):
         info = {'volume': 20, 'mute': False, 'minVolume': 0, 'maxVolume': 100}
         self.window = SimpleNamespace(
             _shutting_down=False, _volume_rate_loop_running=True,
-            _volume_rate_step_running=False, _desired_volume=20,
+            _volume_rate_step_running=False, _desired_volume=20, _volume_generation=0,
             _use_amplifier=lambda: self.routed, _calibration_blocked=lambda: False,
             _route_volume_command=lambda command: False,
             config={'VolumeRateLimit': {'Active': True, 'RateMs': 500}},

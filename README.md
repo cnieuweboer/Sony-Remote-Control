@@ -117,6 +117,8 @@ Regular status polling pauses while the window is hidden or minimized and refres
 
 Windows shortcuts use native key handling to stay responsive, including when both remotes run. Sony yields volume/mute keys whenever Yamaha Remote owns global volume control. While a dropdown is open, arrows and Enter operate the list instead of the TV.
 
+Hold **Volume +** or **Volume −** to repeat after half a second. With TV volume rate limiting enabled, the number shows your requested target until the TV catches up.
+
 ## Direct amplifier volume
 
 With both remotes running, Sony can send volume/mute commands directly to the amplifier, bypassing the slower TV/CEC path. It falls back to TV control when the amplifier is unavailable, in standby, or using another input.

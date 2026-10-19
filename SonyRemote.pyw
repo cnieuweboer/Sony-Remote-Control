@@ -485,7 +485,7 @@ class CalibrationServer(QObject):
 APP_NAME = "Sony Remote"
 
 
-__version__ = "2026.10.19.7"
+__version__ = "2026.10.19.8"
 
 
 CONFIG_PATH = Path(__file__).with_name("SonyRemote.json")
@@ -1927,6 +1927,8 @@ class SonyRemote(QMainWindow):
         self._desired_volume = None
         self._volume_rate_loop_running = False
         self._volume_rate_step_running = False
+        self._pending_volume_commands = 0
+        self._volume_generation = 0
 
         self.amplifier_state = None
         self._amplifier_routed = False
@@ -2206,8 +2208,12 @@ class SonyRemote(QMainWindow):
         self.volume_up = QPushButton("+")
         self.volume_down.setToolTip("Shortcut: Volume Down")
         self.volume_up.setToolTip("Shortcut: Volume Up")
-        self.volume_down.clicked.connect(lambda: self.adjust_volume(-1))
-        self.volume_up.clicked.connect(lambda: self.adjust_volume(1))
+        for button, amount in ((self.volume_down, -1), (self.volume_up, 1)):
+            button.setAutoRepeat(True)
+            button.setAutoRepeatDelay(500)
+            button.setAutoRepeatInterval(100)
+            # pressed fires immediately and on auto-repeat; release adds no step.
+            button.pressed.connect(lambda amount=amount: self.adjust_volume(amount))
 
         row.addWidget(self.volume_down, 0, 0)
         row.addWidget(self.volume_value, 0, 1)
@@ -2637,6 +2643,8 @@ class SonyRemote(QMainWindow):
         if self.poll_running:
             return
         self.poll_running = True
+        volume_request = (self._volume_generation, self._desired_volume)
+        volume_busy = bool(self._volume_rate_loop_running or self._pending_volume_commands)
 
         def query():
             power = self.api.get_power()
@@ -2647,6 +2655,10 @@ class SonyRemote(QMainWindow):
             return data
 
         def done(data):
+            # Ignore a poll superseded by new input/target completion, rather
+            # than refreshing status freshness with an outdated volume.
+            if data.get("volume") and volume_request != (self._volume_generation, self._desired_volume):
+                return
             self._status_sequence += 1
             self._status_observed_at = data["observed_at"]
             self._update_discovery_feedback()
@@ -2664,10 +2676,10 @@ class SonyRemote(QMainWindow):
             self.update_power_ui(self.last_power)
             if data.get("volume"):
                 self.last_volume = data["volume"]
-                if not self._volume_rate_loop_running:
+                if not (volume_busy or self._volume_rate_loop_running or self._pending_volume_commands):
                     self._desired_volume = None
-                    if self.config["VolumeControls"]:
-                        self.update_volume_ui(self.last_volume)
+                if self.config["VolumeControls"]:
+                    self.update_volume_ui(self.last_volume)
             if self.calibration_server is not None:
                 self.calibration_server.publish()
             if is_active and self.config["InputControls"]:
@@ -2837,6 +2849,10 @@ class SonyRemote(QMainWindow):
             volume = {"volume": display, "mute": self.amplifier_state["mute"]}
         else:
             self.volume_value.setToolTip("TV volume")
+            if self._desired_volume is not None:
+                # Every repaint must preserve the user's pending TV target,
+                # including unrelated amplifier IPC updates. Keep mute factual.
+                volume = dict(volume, volume=self._desired_volume)
         self.volume_value.setText(prefix + str(volume.get("volume", "—")))
         self.mute_button.setText("Unmute" if volume.get("mute") else "Mute")
 
@@ -2983,15 +2999,24 @@ class SonyRemote(QMainWindow):
         if target == current and self.config["VolumeRateLimit"]["Active"]:
             return
 
+        self._volume_generation += 1
         self._desired_volume = target
         self.volume_value.setText(str(target))
 
         rate_limit = self.config["VolumeRateLimit"]
         if not rate_limit["Active"]:
-            self.run_command(
+            self._pending_volume_commands += 1
+            def finished():
+                self._pending_volume_commands -= 1
+                QTimer.singleShot(200, self.poll_status)
+            accepted = self.run_command(
                 lambda: None if self._amplifier_routed else self.api.adjust_volume(1 if amount > 0 else -1),
-                on_finished=lambda: QTimer.singleShot(200, self.poll_status),
+                on_finished=finished,
             )
+            if not accepted:
+                self._pending_volume_commands -= 1
+                self._desired_volume = current if self._pending_volume_commands else None
+                self.update_volume_ui(self.last_volume)
             return
 
         if not self._volume_rate_loop_running:
@@ -3429,6 +3454,7 @@ class SonyRemote(QMainWindow):
         self.command_pool.waitForDone()
         self._workers.clear()
         self._command_workers.clear()
+        self._pending_volume_commands = 0
         self.poll_running = False
         self._input_status_running = False
         self._discovery_pending.clear()

@@ -11,6 +11,8 @@ import unittest
 from unittest.mock import Mock, patch
 
 os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
+from PySide6.QtCore import Qt
+from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QPushButton
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -316,6 +318,159 @@ class DiscoveryTests(unittest.TestCase):
         self.assertTrue(self.buttons('PlayPause')[0].isEnabled())
         self.assertFalse(self.buttons('Rewind')[0].isEnabled())
         self.assertFalse(self.window.channel_buttons['Num2'].isEnabled())
+
+    def settle_volume_controls(self):
+        self.start_and_settle()
+        self.wait(lambda: not self.window._workers and not self.window.poll_running)
+
+    def pending_poll_result(self):
+        jobs = []
+        with patch.object(self.window, 'run_worker', side_effect=lambda *args: jobs.append(args)):
+            self.window.poll_status()
+        query, done, failed, finished = jobs[0]
+        data = query()
+        def deliver():
+            done(data)
+            finished()
+        return deliver
+
+    def test_unrelated_amplifier_updates_keep_pending_tv_target(self):
+        self.settle_volume_controls()
+        self.window._desired_volume = 40
+        self.window._volume_rate_loop_running = True
+        self.window.volume_value.setText('40')
+        self.window.amplifier_client.state_changed.emit(None)
+        self.assertEqual(self.window.volume_value.text(), '40')
+        self.assertEqual(self.window.last_volume['volume'], 20)
+
+    def test_status_poll_keeps_target_and_updates_actual_volume_and_mute(self):
+        self.settle_volume_controls()
+        self.window._desired_volume = 40
+        self.window._volume_rate_loop_running = True
+        self.window.volume_value.setText('40')
+        self.device.get_volume = Mock(return_value={'volume': 25, 'mute': True})
+        self.window.poll_status()
+        self.wait(lambda: not self.window.poll_running)
+        self.assertEqual(self.window.volume_value.text(), '40')
+        self.assertEqual(self.window.last_volume['volume'], 25)
+        self.assertEqual(self.window.mute_button.text(), 'Unmute')
+
+    def test_old_poll_cannot_overwrite_a_completed_target(self):
+        self.settle_volume_controls()
+        self.window._desired_volume = 40
+        self.window._volume_rate_loop_running = True
+        deliver = self.pending_poll_result()  # TV still reported 20.
+        observed_at, sequence = self.window._status_observed_at, self.window._status_sequence
+        self.window._desired_volume = None
+        self.window._volume_rate_loop_running = False
+        self.window.last_volume = dict(self.window.last_volume, volume=40)
+        self.window.update_volume_ui(self.window.last_volume)
+        deliver()
+        self.assertEqual(self.window.volume_value.text(), '40')
+        self.assertEqual(self.window.last_volume['volume'], 40)
+        self.assertEqual(self.window._status_observed_at, observed_at)
+        self.assertEqual(self.window._status_sequence, sequence)
+
+    def test_poll_before_a_new_request_cannot_undo_its_completed_volume(self):
+        self.settle_volume_controls()
+        deliver = self.pending_poll_result()  # No target yet; TV reported 20.
+        with patch.object(self.window, 'run_command', return_value=True):
+            self.window.adjust_volume(1)
+        # A fast request can complete before the older background poll arrives.
+        self.window._volume_rate_loop_running = False
+        self.window._desired_volume = None
+        self.window.last_volume = dict(self.window.last_volume, volume=21)
+        self.window.update_volume_ui(self.window.last_volume)
+        deliver()
+        self.assertEqual(self.window.volume_value.text(), '21')
+        self.assertEqual(self.window.last_volume['volume'], 21)
+
+    def test_unlimited_commands_keep_target_until_a_poll_started_after_completion(self):
+        self.settle_volume_controls()
+        self.window.config['VolumeRateLimit']['Active'] = False
+        jobs = []
+        def enqueue(function, **callbacks):
+            jobs.append(callbacks)
+            return True
+        with patch.object(self.window, 'run_command', side_effect=enqueue):
+            for _ in range(3):
+                self.window.adjust_volume(1)
+        self.assertEqual(self.window._pending_volume_commands, 3)
+        self.window.amplifier_client.state_changed.emit(None)
+        self.assertEqual(self.window.volume_value.text(), '23')
+        deliver = self.pending_poll_result()
+        for callbacks in jobs:
+            callbacks['on_finished']()
+        self.assertEqual(self.window._pending_volume_commands, 0)
+        deliver()  # Began while commands were pending, so cannot erase target.
+        self.window.amplifier_client.state_changed.emit(None)
+        self.assertEqual(self.window.volume_value.text(), '23')
+        self.window.poll_status()  # A fresh idle poll may now reconcile with TV.
+        self.wait(lambda: not self.window.poll_running)
+        self.assertIsNone(self.window._desired_volume)
+        self.assertEqual(self.window.volume_value.text(), '20')
+
+    def test_rejected_unlimited_command_does_not_leave_a_phantom_pending_target(self):
+        self.settle_volume_controls()
+        self.window.config['VolumeRateLimit']['Active'] = False
+        with patch.object(self.window, 'run_command', return_value=False):
+            self.window.adjust_volume(1)
+        self.assertEqual(self.window._pending_volume_commands, 0)
+        self.assertIsNone(self.window._desired_volume)
+        self.assertEqual(self.window.volume_value.text(), '20')
+
+    def check_button_hold(self, button, amount):
+        self.settle_volume_controls()
+        with patch.object(self.window, 'adjust_volume') as adjust:
+            QTest.mousePress(button, Qt.LeftButton)
+            adjust.assert_called_once_with(amount)
+            QTest.qWait(320)
+            self.assertEqual(adjust.call_count, 1)
+            QTest.qWait(300)
+            self.assertGreaterEqual(adjust.call_count, 2)
+            count = adjust.call_count
+            QTest.mouseRelease(button, Qt.LeftButton)
+            QTest.qWait(160)
+            self.assertEqual(adjust.call_count, count)
+            self.assertTrue(all(call.args == (amount,) for call in adjust.call_args_list))
+
+    def test_volume_up_repeats_after_half_second_and_stops_on_release(self):
+        self.check_button_hold(self.window.volume_up, 1)
+
+    def test_volume_down_repeats_after_half_second_and_stops_on_release(self):
+        self.check_button_hold(self.window.volume_down, -1)
+
+    def test_short_volume_click_changes_once(self):
+        self.settle_volume_controls()
+        with patch.object(self.window, 'adjust_volume') as adjust:
+            QTest.mouseClick(self.window.volume_up, Qt.LeftButton)
+            adjust.assert_called_once_with(1)
+
+    def test_disabling_a_held_button_stops_repeats(self):
+        self.settle_volume_controls()
+        with patch.object(self.window, 'adjust_volume') as adjust:
+            QTest.mousePress(self.window.volume_up, Qt.LeftButton)
+            QTest.qWait(550)
+            count = adjust.call_count
+            self.window.volume_up.setEnabled(False)
+            QTest.qWait(200)
+            QTest.mouseRelease(self.window.volume_up, Qt.LeftButton)
+            self.assertEqual(adjust.call_count, count)
+
+    def test_release_keeps_limited_target_until_tv_catches_up(self):
+        self.settle_volume_controls()
+        self.device.adjust_volume = Mock()
+        QTest.mousePress(self.window.volume_up, Qt.LeftButton)
+        QTest.qWait(620)
+        QTest.mouseRelease(self.window.volume_up, Qt.LeftButton)
+        target = self.window._desired_volume
+        self.assertGreaterEqual(target, 22)
+        QTest.qWait(160)
+        self.assertEqual(self.window._desired_volume, target)
+        self.assertTrue(self.window._volume_rate_loop_running)
+        self.device.get_volume = Mock(return_value=dict(self.window.last_volume, volume=target))
+        self.wait(lambda: not self.window._volume_rate_loop_running)
+        self.assertEqual(self.window.volume_value.text(), str(target))
 
 
 if __name__ == '__main__':
