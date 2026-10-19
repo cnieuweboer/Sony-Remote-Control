@@ -492,7 +492,7 @@ class CalibrationServer(QObject):
 APP_NAME = "Sony Remote"
 
 
-__version__ = "2026.10.19.13"
+__version__ = "2026.10.19.14"
 
 
 CONFIG_PATH = Path(__file__).resolve().with_name("SonyRemote.json")
@@ -2995,7 +2995,16 @@ class SonyRemote(QMainWindow):
             self._pending_volume_commands += 1
             def finished():
                 self._pending_volume_commands -= 1
-                QTimer.singleShot(200, self.poll_status)
+                if self._pending_volume_commands:
+                    return
+                generation = self._volume_generation
+                def refresh_if_idle():
+                    # A new press may arrive during the device-settling delay.
+                    if (generation == self._volume_generation
+                            and not self._pending_volume_commands
+                            and not self._volume_rate_loop_running):
+                        self.poll_status()
+                QTimer.singleShot(200, refresh_if_idle)
             accepted = self.run_command(
                 lambda: None if self._amplifier_routed else self.api.adjust_volume(1 if amount > 0 else -1),
                 on_finished=finished,

@@ -223,3 +223,7 @@ Both repositories keep identical `tests/fixtures/amplifier_protocol_v1.json` wir
 ## Local configuration files
 
 `SonyRemote.example.json` is the tracked connection-settings template, with an empty host and pre-shared key. `SonyRemote.json` is local and ignored by Git; the script generates defaults and prompts for missing settings when it is absent. Crash logs and temporary JSON files are also ignored. Existing local configuration bytes are preserved when removing the file from Git tracking; no Git history is rewritten.
+
+## Volume follow-up polling
+
+With volume rate limiting disabled, only the final pending volume-command completion schedules a status refresh after 200 ms. The callback checks the volume input generation and that volume work is still idle before polling, so a newer press suppresses an obsolete follow-up even if its command has already finished. The latest idle completion still reconciles the target with the TV, and regular periodic polling is unchanged.
