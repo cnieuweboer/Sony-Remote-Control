@@ -20,7 +20,7 @@ from pathlib import Path
 from xml.sax.saxutils import escape
 from PySide6.QtCore import QEasingCurve, QElapsedTimer, QRect, QEvent, QFileSystemWatcher, QLockFile, QObject, QProcess, QRunnable, Qt, QThreadPool, QTimer, Signal
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
-from PySide6.QtGui import QAction, QColor, QPainter, QPalette
+from PySide6.QtGui import QAction, QColor, QPalette
 from PySide6.QtWidgets import (
     QApplication, QComboBox, QDialogButtonBox, QFrame, QGridLayout, QHBoxLayout, QLabel,
     QMainWindow, QMenu, QMessageBox, QPushButton, QProxyStyle, QStyle, QTextEdit,
@@ -485,7 +485,7 @@ class CalibrationServer(QObject):
 APP_NAME = "Sony Remote"
 
 
-__version__ = "2026.10.19.9"
+__version__ = "2026.10.19.10"
 
 
 CONFIG_PATH = Path(__file__).with_name("SonyRemote.json")
@@ -1702,31 +1702,6 @@ class TvTextEdit(QTextEdit):
         super().keyPressEvent(event)
 
 
-class _ComboPopupOverlay(QWidget):
-    """Slide captured list contents inside the real Qt popup frame."""
-
-    def __init__(self, popup, pixmap, view_rect, final_height, opens_downward):
-        super().__init__(popup)
-        self._pixmap = pixmap
-        self._final_height = final_height
-        self._height = 2
-        self._opens_downward = opens_downward
-        self.setAttribute(Qt.WA_TransparentForMouseEvents)
-        self.setAttribute(Qt.WA_NoSystemBackground)
-        self.setGeometry(view_rect)
-        self.show()
-        self.raise_()
-
-    def set_popup_height(self, height):
-        self._height = height
-        self.update()
-
-    def paintEvent(self, event):
-        offset = self._height - self._final_height if self._opens_downward else 0
-        painter = QPainter(self)
-        painter.drawPixmap(0, offset, self._pixmap)
-
-
 class CenteredComboBox(QComboBox):
     def __init__(self, parent=None, *, animate_popup=False):
         super().__init__(parent)
@@ -1735,8 +1710,8 @@ class CenteredComboBox(QComboBox):
         self._popup_view = None
         self._final_rect = None
         self._view_rect = None
-        self._popup_mask = None
-        self._overlay = None
+        self._popup_layout = None
+        self._layout_was_enabled = False
         self._opens_downward = True
         self._elapsed = QElapsedTimer()
         self._easing = QEasingCurve(QEasingCurve.OutCubic)
@@ -1771,9 +1746,6 @@ class CenteredComboBox(QComboBox):
         final_rect = popup.geometry()
         if not popup.isVisible() or final_rect.height() <= 2:
             return
-        pixmap = view.grab()
-        if pixmap.isNull():
-            return
 
         # Keep Qt's final placement, including screen-edge clipping and
         # popups that overlap the combo. Never relocate it above/below by hand.
@@ -1781,13 +1753,13 @@ class CenteredComboBox(QComboBox):
         self._popup, self._popup_view = popup, view
         self._final_rect = QRect(final_rect)
         self._view_rect = QRect(view.geometry())
-        self._popup_mask = popup.mask()
-        for widget in (popup, view, view.viewport()):
-            widget.installEventFilter(self)
-        view.hide()
-        self._overlay = _ComboPopupOverlay(
-            popup, pixmap, self._view_rect, final_rect.height(), self._opens_downward)
-        popup.clearMask()
+        self._popup_layout = popup.layout()
+        if self._popup_layout is not None:
+            self._layout_was_enabled = self._popup_layout.isEnabled()
+            # Deferred layout passes must not shrink the live view between
+            # animation frames and change its scrollbar geometry.
+            self._popup_layout.setEnabled(False)
+        popup.installEventFilter(self)
         self._elapsed.start()
         self._animation_tick()
         popup.raise_()
@@ -1806,7 +1778,10 @@ class CenteredComboBox(QComboBox):
         if not self._opens_downward:
             rect.moveBottom(self._final_rect.bottom())
         self._popup.setGeometry(rect)
-        self._overlay.set_popup_height(height)
+        view_rect = QRect(self._view_rect)
+        if self._opens_downward:
+            view_rect.translate(0, height - self._final_rect.height())
+        self._popup_view.setGeometry(view_rect)
         if linear >= 1:
             self._finish_popup_animation(focus_view=True)
 
@@ -1818,29 +1793,25 @@ class CenteredComboBox(QComboBox):
         # Clear the active marker before restoring widgets: restoration itself
         # can generate Qt show/hide/focus events.
         self._popup = None
-        for widget in (popup, view, view.viewport()):
-            widget.removeEventFilter(self)
+        popup.removeEventFilter(self)
         popup.setGeometry(self._final_rect)
-        popup.setMask(self._popup_mask)
-        self._overlay.hide()
-        self._overlay.deleteLater()
-        self._overlay = None
         view.setGeometry(self._view_rect)
         view.show()
         view.raise_()
+        view.update()
+        view.viewport().update()
+        if self._popup_layout is not None:
+            self._popup_layout.setEnabled(self._layout_was_enabled)
+        self._popup_layout = None
         if focus_view and popup.isVisible():
             view.setFocus(Qt.PopupFocusReason)
         self._popup_view = None
-        self._final_rect = self._view_rect = self._popup_mask = None
+        self._final_rect = self._view_rect = None
 
     def eventFilter(self, watched, event):
         if self._popup is not None:
             if watched is self._popup and event.type() in (QEvent.Hide, QEvent.Close):
                 self._finish_popup_animation()
-            elif event.type() in (QEvent.KeyPress, QEvent.MouseButtonPress, QEvent.Wheel):
-                # Restore the live list before handling interaction, rather
-                # than leaving keyboard navigation behind a frozen snapshot.
-                self._finish_popup_animation(focus_view=True)
         return super().eventFilter(watched, event)
 
     def hidePopup(self):

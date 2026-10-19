@@ -4,6 +4,8 @@ Release identifiers below come from the corresponding commits. Some releases upd
 
 ## 2026-10-19
 
+- Sony Remote 2026.10.19.10 — Replace the dropdown screenshot overlay with a live-list animation. Preserve scrolling and keyboard navigation while opening, suspend internal layout resizing until completion, and retain native placement, interruption cleanup, and the existing workaround setting.
+
 - 2026.10.19.9 — Add `--start-in-tray`, gated by both tray settings and actual tray availability. Start hidden without a visible-window flash, keep ordinary fallback/second-launch activation and restart arguments, and add startup regression tests.
 
 - Sony Remote 2026.10.19.8 — Preserve pending TV volume targets across background polling and unrelated amplifier state updates, including queued commands without rate limiting. Ignore polls superseded by newer volume input/completion. Add immediate volume-button presses with repeat after 500 ms at 100 ms intervals; retain rate limiting/routing and add GUI regression tests.

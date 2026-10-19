@@ -5,7 +5,8 @@ from pathlib import Path
 import runpy
 import unittest
 from unittest.mock import patch
-from PySide6.QtCore import QCoreApplication, QEvent, QRect, Qt
+from PySide6.QtCore import QCoreApplication, QEvent, QPoint, QPointF, QRect, Qt
+from PySide6.QtGui import QWheelEvent
 from PySide6.QtTest import QSignalSpy, QTest
 from PySide6.QtWidgets import QApplication, QComboBox, QPushButton, QVBoxLayout, QWidget
 
@@ -61,7 +62,7 @@ class DropdownAnimationTests(unittest.TestCase):
 
     def assert_clean(self):
         self.assertIsNone(self.combo._popup)
-        self.assertIsNone(self.combo._overlay)
+        self.assertIsNone(self.combo._popup_layout)
         self.assertIsNone(self.combo._popup_view)
         self.assertFalse(self.combo._popup_timer.isActive())
 
@@ -74,8 +75,8 @@ class DropdownAnimationTests(unittest.TestCase):
         self.combo.showPopup()
         popup = self.combo.view().window()
         self.assertIs(self.app.activePopupWidget(), popup)
-        self.assertIsNotNone(self.combo._overlay)
-        self.assertFalse(self.combo.view().isVisible())
+        self.assertIsNotNone(self.combo._popup_layout)
+        self.assertTrue(self.combo.view().isVisible())
         self.assertTrue(self.button.isVisible())
         self.assertIsNone(self.button.graphicsEffect())
         self.finish()
@@ -96,15 +97,40 @@ class DropdownAnimationTests(unittest.TestCase):
         self.assertEqual(self.combo.currentData(), 'app:third')
         self.assertFalse(view.window().isVisible())
 
-    def test_keyboard_during_animation_restores_list_before_navigation(self):
+    def test_keyboard_during_animation_keeps_live_navigation(self):
         self.combo.showPopup()
         QTest.keyClick(self.app.focusWidget(), Qt.Key_Down)
-        self.assert_clean()
+        self.assertTrue(self.combo._popup_timer.isActive())
         self.assertEqual(self.combo.view().currentIndex().row(), 1)
         QTest.keyClick(self.app.focusWidget(), Qt.Key_Return)
         self.assertEqual(self.combo.currentIndex(), 1)
         self.assertEqual(self.activated.count(), 1)
         self.assertFalse(self.combo.view().window().isVisible())
+
+    def test_wheel_and_layout_remain_live_during_animation(self):
+        self.combo.clear()
+        self.combo.addItems([f'Entry {i}' for i in range(100)])
+        self.combo.showPopup()
+        view = self.combo.view()
+        popup = self.combo._popup
+        layout = popup.layout()
+        expected_size = self.combo._view_rect.size()
+        self.assertFalse(layout.isEnabled())
+        bar = view.verticalScrollBar()
+        before = bar.value()
+        point = view.viewport().rect().center()
+        wheel = QWheelEvent(QPointF(point),
+                            QPointF(view.viewport().mapToGlobal(point)),
+                            QPoint(), QPoint(0, -120), Qt.NoButton,
+                            Qt.NoModifier, Qt.NoScrollPhase, False)
+        QApplication.sendEvent(view.viewport(), wheel)
+        self.assertGreater(bar.value(), before)
+        for _ in range(3):
+            QTest.qWait(20)
+            self.assertIs(self.combo._popup, popup)
+            self.assertEqual(view.size(), expected_size)
+        self.finish()
+        self.assertTrue(layout.isEnabled())
 
     def test_escape_cancels_animation_and_allows_reopening(self):
         expected = self.native_geometry()
@@ -121,7 +147,7 @@ class DropdownAnimationTests(unittest.TestCase):
         expected = self.native_geometry()
         for _ in range(4):
             self.combo.showPopup()
-            self.assertIsNotNone(self.combo._overlay)
+            self.assertIsNotNone(self.combo._popup_layout)
             self.combo.view().window().hide()  # OS/Qt can bypass hidePopup().
             self.assert_clean()
             self.assertEqual(self.combo.view().window().geometry(), expected)
