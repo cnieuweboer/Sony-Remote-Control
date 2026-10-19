@@ -4,6 +4,8 @@ Release identifiers below come from the corresponding commits. Some releases upd
 
 ## 2026-10-19
 
+- 2026.10.19.19 — Restore the native Qt dropdown arrow in a borderless, transparent right-hand area. Keep labels centered across the full combobox and retain the live-view popup animation; no icon files are required.
+
 - 2026.10.19.15 — Make tray startup tests independent of the checkout folder name and describe dropdown flicker as a popup fill/frame timing mismatch. Clear connection-loss feedback on fresh valid amplifier state using explicit error categories; preserve timeout/rejection feedback until an accepted command and never replay uncertain commands.
 
 - Sony Remote 2026.10.19.14 — With volume rate limiting disabled, schedule the follow-up status poll only after the volume-command queue drains. Suppress delayed follow-ups superseded by new volume input or active volume work, while retaining final target reconciliation and ordinary periodic polling. Add deterministic queue/delay regression tests.

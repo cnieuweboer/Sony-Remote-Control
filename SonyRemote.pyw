@@ -492,7 +492,7 @@ class CalibrationServer(QObject):
 APP_NAME = "Sony Remote"
 
 
-__version__ = "2026.10.19.15"
+__version__ = "2026.10.19.19"
 
 
 CONFIG_PATH = Path(__file__).resolve().with_name("SonyRemote.json")
@@ -1830,7 +1830,17 @@ class CenteredComboBox(QComboBox):
         option = QStyleOptionComboBox()
         self.initStyleOption(option)
 
+        # Let the styled control paint its frame without a separate arrow button.
+        option.subControls &= ~QStyle.SC_ComboBoxArrow
         painter.drawComplexControl(QStyle.CC_ComboBox, option)
+        arrow = QStyleOptionComboBox(option)
+        arrow_rect = self.style().subControlRect(
+            QStyle.CC_ComboBox, option, QStyle.SC_ComboBoxArrow, self)
+        arrow.rect = QRect(0, 0, 12, 12)
+        arrow.rect.moveCenter(arrow_rect.center())
+        group = QPalette.Active if self.isEnabled() else QPalette.Disabled
+        arrow.palette.setColor(QPalette.ButtonText, option.palette.color(group, QPalette.Text))
+        QApplication.style().drawPrimitive(QStyle.PE_IndicatorArrowDown, arrow, painter, self)
 
         rect = self.style().subControlRect(
             QStyle.CC_ComboBox,
@@ -1838,6 +1848,12 @@ class CenteredComboBox(QComboBox):
             QStyle.SC_ComboBoxEditField,
             self,
         )
+
+        # Reserve equal space on both sides so the native arrow does not
+        # shift the label away from the center of the whole button.
+        inset = max(rect.left(), self.width() - rect.right() - 1)
+        rect.setLeft(inset)
+        rect.setRight(self.width() - inset - 1)
 
         text = self.currentText()
         if self.currentIndex() < 0:
@@ -2325,12 +2341,8 @@ class SonyRemote(QMainWindow):
                 }
                 QComboBox::drop-down {
                     border: none;
-                    width: 0px;
-                }
-                QComboBox::down-arrow {
-                    image: none;
-                    width: 0px;
-                    height: 0px;
+                    background: transparent;
+                    width: 20px;
                 }
                 QPushButton:hover, QComboBox:hover {
                     background-color: rgba(68, 68, 68, 205);
@@ -2386,12 +2398,8 @@ class SonyRemote(QMainWindow):
                 }
                 QComboBox::drop-down {
                     border: none;
-                    width: 0px;
-                }
-                QComboBox::down-arrow {
-                    image: none;
-                    width: 0px;
-                    height: 0px;
+                    background: transparent;
+                    width: 20px;
                 }
                 QComboBox QAbstractItemView {
                     background-color: rgb(250, 250, 250);

@@ -194,6 +194,8 @@ The selected rules remain temporary sweep evidence, not additional runtime JSON 
 
 ## Dropdown animation workaround
 
+Closed comboboxes retain Qt's native dropdown arrow. The styled arrow area is transparent and borderless, avoiding a separate inset button; text uses symmetric space reservation to remain centered across the whole control. The arrow follows the active Qt/platform style, including disabled states, with no image assets.
+
 The Windows popup fill can lag a frame behind its outline and shadow during native animation, making underlying text appear to flicker. The live-view animation addresses that rendering mismatch.
 
 `DropdownAnimationWorkaround` enables a 200 ms OutCubic animation inside the real Qt popup. Sony keeps the actual list and its scrollbars live at their final size, temporarily suspends the popup layout, and grows the native popup frame using elapsed time with an 8 ms precise timer. The full-size list slides within the clipping popup; keyboard navigation and wheel scrolling continue during opening. Cleanup restores the original layout-enabled state, including after native dismissal. Underlying favorites and navigation buttons remain untouched. Qt's animation preference is restored immediately after opening; if combo animations are disabled, the popup appears without the custom animation. Disabling the workaround retains the ordinary Qt popup.
