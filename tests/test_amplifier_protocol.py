@@ -3,6 +3,7 @@ import io
 import json
 from pathlib import Path
 import runpy
+import threading
 from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
@@ -126,9 +127,12 @@ class ClientContractTests(unittest.TestCase):
             self.assertIn('Incompatible amplifier protocol', client.command_failed.emit.call_args.args[0])
 
     def test_repeated_protocol_failures_are_deduplicated_in_diagnostics(self):
-        diagnostics = REMOTE['Diagnostics']()
+        # Exercise recording without opening a runtime log or installing hooks.
+        diagnostics = object.__new__(REMOTE['Diagnostics'])
         stream = io.StringIO()
         diagnostics._stream = stream
+        diagnostics._lock = threading.RLock()
+        diagnostics._seen = set()
         function_globals = REMOTE['record_exception'].__globals__
         with patch.dict(function_globals, _diagnostics=diagnostics):
             for _ in range(3):
