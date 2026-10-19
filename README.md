@@ -101,7 +101,7 @@ Set:
   - `Favorite` — show a button for the input directly in the remote.
 - `SystemTray` — show a system tray icon when the desktop supports it. If unavailable, the app runs as an ordinary window.
 - `CloseToTray` — clicking the window close button hides the app to the tray instead of exiting. If no tray is available, closing the window exits normally.
-- `DropdownAnimationWorkaround` — suppress a Qt/Windows repaint glitch where controls underneath an opening dropdown can briefly show through the menu animation. Usually only needed on Windows.
+- `DropdownAnimationWorkaround` — use a custom 200 ms dropdown animation to prevent underlying button text showing through on Windows. Set to `false` for the standard Qt dropdown; disabled system animations remain disabled.
 
 SonyRemote automatically adds newly discovered applications and inputs to `Apps` and `Inputs` with default settings. Existing `NameOverride`, `Hidden`, and `Favorite` values are preserved. Existing entries keep their JSON positions; newly discovered entries append in device discovery order. Dropdowns only include currently discovered, non-hidden entries. Favorite buttons remain independent of `Hidden`. Name sorting affects display only and does not reorder the JSON file.
 

@@ -4,6 +4,8 @@ Release identifiers below come from the corresponding commits. Some releases upd
 
 ## 2026-10-19
 
+- Sony Remote 2026.10.19.7 — Replace favorite-button hiding with a captured-content animation inside the real Qt dropdown, using the existing workaround toggle. Preserve Qt popup placement and disabled-animation preferences; restore live interaction/geometry after interruption and add dropdown regression tests.
+
 - Helper 2026.10.19.5 — Select one rounding method per gap between measured anchors. Retain all three methods and nearest-half-up tie-breaking while preventing per-value rule switches from making an interpolated gap decrease. Add mapping regression tests; remote versions and JSON format are unchanged.
 
 - 2026.10.19.3 — Preserve newer TV volume targets when an older rate-limiter completion reaches the GUI. Stop only when the current target matches the observed volume; add deterministic volume-key timing regression tests.

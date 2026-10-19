@@ -18,12 +18,12 @@ import urllib.request
 from urllib.error import HTTPError, URLError
 from pathlib import Path
 from xml.sax.saxutils import escape
-from PySide6.QtCore import QEvent, QFileSystemWatcher, QLockFile, QObject, QProcess, QRunnable, Qt, QThreadPool, QTimer, Signal
+from PySide6.QtCore import QEasingCurve, QElapsedTimer, QRect, QEvent, QFileSystemWatcher, QLockFile, QObject, QProcess, QRunnable, Qt, QThreadPool, QTimer, Signal
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
-from PySide6.QtGui import QAction, QColor, QPalette
+from PySide6.QtGui import QAction, QColor, QPainter, QPalette
 from PySide6.QtWidgets import (
     QApplication, QComboBox, QDialogButtonBox, QFrame, QGridLayout, QHBoxLayout, QLabel,
-    QGraphicsOpacityEffect, QMainWindow, QMenu, QMessageBox, QPushButton, QProxyStyle, QStyle, QTextEdit,
+    QMainWindow, QMenu, QMessageBox, QPushButton, QProxyStyle, QStyle, QTextEdit,
     QStyleOptionComboBox, QStylePainter, QStyledItemDelegate,
     QSystemTrayIcon, QVBoxLayout, QWidget,
 )
@@ -485,7 +485,7 @@ class CalibrationServer(QObject):
 APP_NAME = "Sony Remote"
 
 
-__version__ = "2026.10.19.3"
+__version__ = "2026.10.19.7"
 
 
 CONFIG_PATH = Path(__file__).with_name("SonyRemote.json")
@@ -506,10 +506,7 @@ MAX_PENDING_COMMANDS = 16
 CONFIG_RESTART_DEBOUNCE_MS = 250
 
 
-POPUP_GUARD_DURATION_MS = 220
-
-
-POPUP_GUARD_FAVORITE_COUNT = 4
+POPUP_ANIMATION_DURATION_MS = 200
 
 
 TEXT_INPUT_STATE_TIMEOUT_SECONDS = 1.5
@@ -1705,63 +1702,150 @@ class TvTextEdit(QTextEdit):
         super().keyPressEvent(event)
 
 
+class _ComboPopupOverlay(QWidget):
+    """Slide captured list contents inside the real Qt popup frame."""
+
+    def __init__(self, popup, pixmap, view_rect, final_height, opens_downward):
+        super().__init__(popup)
+        self._pixmap = pixmap
+        self._final_height = final_height
+        self._height = 2
+        self._opens_downward = opens_downward
+        self.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self.setAttribute(Qt.WA_NoSystemBackground)
+        self.setGeometry(view_rect)
+        self.show()
+        self.raise_()
+
+    def set_popup_height(self, height):
+        self._height = height
+        self.update()
+
+    def paintEvent(self, event):
+        offset = self._height - self._final_height if self._opens_downward else 0
+        painter = QPainter(self)
+        painter.drawPixmap(0, offset, self._pixmap)
+
+
 class CenteredComboBox(QComboBox):
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, *, animate_popup=False):
         super().__init__(parent)
-        self._popup_guard_enabled = False
-        self._popup_guard_widgets = []
-        self._guarded_widgets = []
-
-        self._popup_guard_timer = QTimer(self)
-        self._popup_guard_timer.setSingleShot(True)
-        self._popup_guard_timer.setInterval(POPUP_GUARD_DURATION_MS)
-        self._popup_guard_timer.timeout.connect(self._restore_popup_guard)
-
-    def configure_popup_guard(self, widgets, enabled):
-        self._restore_popup_guard()
-        self._popup_guard_enabled = bool(enabled)
-        self._popup_guard_widgets = [widget for widget in widgets if widget is not None]
-
-    def _restore_popup_guard(self):
-        self._popup_guard_timer.stop()
-        for widget in self._guarded_widgets:
-            try:
-                widget.setGraphicsEffect(None)
-                widget.update()
-            except RuntimeError:
-                pass
-        self._guarded_widgets.clear()
+        self._animate_popup = animate_popup
+        self._popup = None
+        self._popup_view = None
+        self._final_rect = None
+        self._view_rect = None
+        self._popup_mask = None
+        self._overlay = None
+        self._opens_downward = True
+        self._elapsed = QElapsedTimer()
+        self._easing = QEasingCurve(QEasingCurve.OutCubic)
+        self._popup_timer = QTimer(self)
+        self._popup_timer.setTimerType(Qt.PreciseTimer)
+        self._popup_timer.setInterval(8)
+        self._popup_timer.timeout.connect(self._animation_tick)
 
     def showPopup(self):
-        self._restore_popup_guard()
-        super().showPopup()
-
-        if not self._popup_guard_enabled or not self._popup_guard_widgets:
+        if not self._animate_popup:
+            super().showPopup()
+            return
+        if self.view().window().isVisible():
+            self.hidePopup()
             return
 
-        popup = self.view().window()
-        popup_rect = popup.geometry()
+        app = QApplication.instance()
+        effect = Qt.UI_AnimateCombo
+        animate = app.isEffectEnabled(effect)
+        # Suppress Qt's rolling window, then animate only the real popup.
+        # Restore the preference immediately, including when opening fails.
+        app.setEffectEnabled(effect, False)
+        try:
+            super().showPopup()
+        finally:
+            app.setEffectEnabled(effect, animate)
+        if not animate:
+            return  # Respect the user's/system's disabled UI animations.
 
-        for widget in self._popup_guard_widgets:
-            if not widget.isVisible():
-                continue
+        view = self.view()
+        popup = view.window()
+        final_rect = popup.geometry()
+        if not popup.isVisible() or final_rect.height() <= 2:
+            return
+        pixmap = view.grab()
+        if pixmap.isNull():
+            return
 
-            top_left = widget.mapToGlobal(widget.rect().topLeft())
-            widget_rect = widget.rect()
-            widget_rect.moveTopLeft(top_left)
+        # Keep Qt's final placement, including screen-edge clipping and
+        # popups that overlap the combo. Never relocate it above/below by hand.
+        self._opens_downward = final_rect.center().y() >= self.mapToGlobal(self.rect().center()).y()
+        self._popup, self._popup_view = popup, view
+        self._final_rect = QRect(final_rect)
+        self._view_rect = QRect(view.geometry())
+        self._popup_mask = popup.mask()
+        for widget in (popup, view, view.viewport()):
+            widget.installEventFilter(self)
+        view.hide()
+        self._overlay = _ComboPopupOverlay(
+            popup, pixmap, self._view_rect, final_rect.height(), self._opens_downward)
+        popup.clearMask()
+        self._elapsed.start()
+        self._animation_tick()
+        popup.raise_()
+        self._popup_timer.start()
 
-            if popup_rect.intersects(widget_rect):
-                effect = QGraphicsOpacityEffect(widget)
-                effect.setOpacity(0.0)
-                widget.setGraphicsEffect(effect)
-                self._guarded_widgets.append(widget)
+    def _animation_tick(self):
+        if self._popup is None:
+            return
+        linear = min(1.0, self._elapsed.elapsed() / POPUP_ANIMATION_DURATION_MS)
+        progress = self._easing.valueForProgress(linear)
+        # Scroll controls can impose a taller minimum on long popups.
+        minimum = min(self._final_rect.height(), max(2, self._popup.minimumHeight()))
+        height = round(minimum + (self._final_rect.height() - minimum) * progress)
+        rect = QRect(self._final_rect)
+        rect.setHeight(height)
+        if not self._opens_downward:
+            rect.moveBottom(self._final_rect.bottom())
+        self._popup.setGeometry(rect)
+        self._overlay.set_popup_height(height)
+        if linear >= 1:
+            self._finish_popup_animation(focus_view=True)
 
-        if self._guarded_widgets:
-            self._popup_guard_timer.start()
+    def _finish_popup_animation(self, *, focus_view=False):
+        self._popup_timer.stop()
+        popup, view = self._popup, self._popup_view
+        if popup is None:
+            return
+        # Clear the active marker before restoring widgets: restoration itself
+        # can generate Qt show/hide/focus events.
+        self._popup = None
+        for widget in (popup, view, view.viewport()):
+            widget.removeEventFilter(self)
+        popup.setGeometry(self._final_rect)
+        popup.setMask(self._popup_mask)
+        self._overlay.hide()
+        self._overlay.deleteLater()
+        self._overlay = None
+        view.setGeometry(self._view_rect)
+        view.show()
+        view.raise_()
+        if focus_view and popup.isVisible():
+            view.setFocus(Qt.PopupFocusReason)
+        self._popup_view = None
+        self._final_rect = self._view_rect = self._popup_mask = None
+
+    def eventFilter(self, watched, event):
+        if self._popup is not None:
+            if watched is self._popup and event.type() in (QEvent.Hide, QEvent.Close):
+                self._finish_popup_animation()
+            elif event.type() in (QEvent.KeyPress, QEvent.MouseButtonPress, QEvent.Wheel):
+                # Restore the live list before handling interaction, rather
+                # than leaving keyboard navigation behind a frozen snapshot.
+                self._finish_popup_animation(focus_view=True)
+        return super().eventFilter(watched, event)
 
     def hidePopup(self):
+        self._finish_popup_animation()
         super().hidePopup()
-        self._restore_popup_guard()
 
     def paintEvent(self, event):
         painter = QStylePainter(self)
@@ -1991,7 +2075,6 @@ class SonyRemote(QMainWindow):
         if self.config["PlaybackControls"]:
             self._build_playback_controls()
         self._build_favorites_from_config()
-        self._configure_combo_popup_guards()
 
     def _section(self, title):
         frame = QFrame()
@@ -2054,7 +2137,7 @@ class SonyRemote(QMainWindow):
 
     def _build_app_controls(self):
         layout = self._section("Apps")
-        self.app_combo = CenteredComboBox()
+        self.app_combo = CenteredComboBox(animate_popup=self.config["DropdownAnimationWorkaround"])
         self.app_combo.view().setAutoFillBackground(True)
         self.app_combo.view().viewport().setAutoFillBackground(True)
         self.app_combo.setItemDelegate(CenteredComboDelegate(self.app_combo))
@@ -2191,7 +2274,7 @@ class SonyRemote(QMainWindow):
 
     def _build_input_controls(self):
         layout = self._section("Inputs")
-        self.input_combo = CenteredComboBox()
+        self.input_combo = CenteredComboBox(animate_popup=self.config["DropdownAnimationWorkaround"])
         self.input_combo.view().setAutoFillBackground(True)
         self.input_combo.view().viewport().setAutoFillBackground(True)
         self.input_combo.setItemDelegate(CenteredComboDelegate(self.input_combo))
@@ -2335,39 +2418,6 @@ class SonyRemote(QMainWindow):
                 }
             """)
 
-    def _configure_combo_popup_guards(self):
-        # Only guard the first four favorite buttons. They sit directly below
-        # the dropdown and spend the longest time underneath its opening
-        # animation; guarding lower controls is visually more noticeable.
-        app_favorites = []
-        if hasattr(self, "app_favorites_layout"):
-            for index in range(self.app_favorites_layout.count()):
-                item = self.app_favorites_layout.itemAt(index)
-                widget = item.widget()
-                if isinstance(widget, QPushButton):
-                    app_favorites.append(widget)
-
-        input_favorites = []
-        if hasattr(self, "input_favorites_layout"):
-            for index in range(self.input_favorites_layout.count()):
-                item = self.input_favorites_layout.itemAt(index)
-                widget = item.widget()
-                if isinstance(widget, QPushButton):
-                    input_favorites.append(widget)
-
-        enabled = bool(self.config.get("DropdownAnimationWorkaround", False))
-
-        if hasattr(self, "app_combo"):
-            self.app_combo.configure_popup_guard(
-                app_favorites[:POPUP_GUARD_FAVORITE_COUNT],
-                enabled,
-            )
-        if hasattr(self, "input_combo"):
-            self.input_combo.configure_popup_guard(
-                input_favorites[:POPUP_GUARD_FAVORITE_COUNT],
-                enabled,
-            )
-
     # ----------------------------
     # Background work
     # ----------------------------
@@ -2461,7 +2511,6 @@ class SonyRemote(QMainWindow):
                     record_exception(error, "Configuration save")
                     self.show_error(f"Could not update SonyRemote.json:\n\n{error}")
             self._build_favorites_from_config()
-            self._configure_combo_popup_guards()
             self._fit_and_lock_window()
         self._discovery_ready.add(feature)
         self._discovery_errors.pop(feature, None)
