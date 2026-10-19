@@ -492,10 +492,10 @@ class CalibrationServer(QObject):
 APP_NAME = "Sony Remote"
 
 
-__version__ = "2026.10.19.12"
+__version__ = "2026.10.19.13"
 
 
-CONFIG_PATH = Path(__file__).with_name("SonyRemote.json")
+CONFIG_PATH = Path(__file__).resolve().with_name("SonyRemote.json")
 
 
 INSTANCE_MUTEX_NAME = "Local\\SonyRemote.SingleInstance"

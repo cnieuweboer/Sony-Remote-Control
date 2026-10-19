@@ -4,6 +4,8 @@ Release identifiers below come from the corresponding commits. Some releases upd
 
 ## 2026-10-19
 
+- 2026.10.19.13 — Replace tracked device settings with a sanitized `SonyRemote.example.json`; ignore local settings, crash logs, and temporary JSON files. Make hook lifecycle tests independent of the checkout folder name. Resolve the configuration path consistently with the calibration helper, including symlink launches.
+
 - Sony Remote 2026.10.19.12 — Accept version-1 amplifier acknowledgements without the optional rejection reason. Report malformed protocol messages through deduplicated optional diagnostics and persistent non-modal feedback. Keep amplifier errors across TV polls/discovery until a pending command is acknowledged as accepted; retain silent queue-full drops and no replay. Add matching wire fixtures and producer/consumer regression tests in both repositories.
 
 - Sony Remote 2026.10.19.10 — Replace the dropdown screenshot overlay with a live-list animation. Preserve scrolling and keyboard navigation while opening, suspend internal layout resizing until completion, and retain native placement, interruption cleanup, and the existing workaround setting.

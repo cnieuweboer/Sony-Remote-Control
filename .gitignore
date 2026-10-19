@@ -6,3 +6,8 @@ __pycache__/
 # Ignore old release-16 journals if a local copy remains.
 VolumeCalibration.session.json
 VolumeCalibration.session.json.tmp
+
+# Local device settings, credentials, diagnostics, and atomic-write leftovers.
+SonyRemote.json
+*-crash.log
+*.json.tmp

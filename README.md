@@ -6,12 +6,9 @@ Small PySide6 desktop remote for Sony BRAVIA TVs using the Sony BRAVIA IP Contro
 
 ## Installation
 
-Place these files in the same folder.
+Run `SonyRemote.pyw` from a writable folder. On first launch it creates `SonyRemote.json` and prompts you to fill in the missing connection settings; you can also copy `SonyRemote.example.json` to `SonyRemote.json` before starting.
 
-```text
-SonyRemote.pyw
-SonyRemote.json
-```
+Local settings, diagnostic logs, and temporary JSON files are ignored by Git. When updating an older Git checkout, back up `SonyRemote.json` before pulling this change and restore it afterward if Git removes it. Do not put credentials in the example file.
 
 ## Windows
 

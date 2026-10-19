@@ -7,7 +7,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 ROOT = Path(__file__).resolve().parents[1]
-IS_TV = ROOT.name == 'Sony-Remote-Control'
+IS_TV = (ROOT / 'SonyRemote.pyw').exists()
 REMOTE = runpy.run_path(str(ROOT / ('SonyRemote.pyw' if IS_TV else 'YamahaRemote.pyw')), run_name='hook_lifecycle_tests')
 HOOK = REMOTE['_WindowsShortcutHook' if IS_TV else '_WindowsVolumeHook']
 LOADER = '_load_shortcut_hook_api' if IS_TV else '_load_volume_hook_api'

@@ -219,3 +219,7 @@ Protocol version 1 acknowledgements have integer `id`, boolean `accepted`, and a
 Amplifier feedback is stored separately from discovery feedback, survives TV polling, and clears only when a pending amplifier command receives an accepted acknowledgement. Acceptance means queued by the amplifier remote, not confirmation that the physical device completed the command.
 
 Both repositories keep identical `tests/fixtures/amplifier_protocol_v1.json` wire examples. Tests compare Yamaha's actual snapshots and acknowledgement production with those examples and feed the same messages through Sony's actual consumer. Fixtures and tests are development-only; the scripts remain self-contained. Changes to the wire contract should update and verify both copies together.
+
+## Local configuration files
+
+`SonyRemote.example.json` is the tracked connection-settings template, with an empty host and pre-shared key. `SonyRemote.json` is local and ignored by Git; the script generates defaults and prompts for missing settings when it is absent. Crash logs and temporary JSON files are also ignored. Existing local configuration bytes are preserved when removing the file from Git tracking; no Git history is rewritten.
