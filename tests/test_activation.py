@@ -104,15 +104,15 @@ class ActivationTests(unittest.TestCase):
             time.sleep(0.002)
         self.fail('Activation check timed out')
 
-    def child(self):
-        child = subprocess.Popen([sys.executable, '-c', CHILD, str(SCRIPT), self.suffix, str(self.lock_path)],
+    def child(self, *arguments):
+        child = subprocess.Popen([sys.executable, '-c', CHILD, str(SCRIPT), self.suffix, str(self.lock_path), *arguments],
                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                                  env={**os.environ, 'QT_QPA_PLATFORM': 'offscreen'})
         self.children.append(child)
         return child
 
-    def launch(self, expected=0):
-        child = self.child()
+    def launch(self, expected=0, arguments=()):
+        child = self.child(*arguments)
         self.wait(lambda: child.poll() is not None)
         stdout, stderr = child.communicate()
         self.assertEqual(child.returncode, expected, stdout + stderr)
@@ -131,6 +131,12 @@ class ActivationTests(unittest.TestCase):
     def test_second_process_restores_hidden_window_without_loading_config(self):
         self.window.hide()
         self.launch()
+        self.assertTrue(self.window.isVisible())
+        self.assertEqual(self.window.refreshes, 1)
+
+    def test_second_process_with_start_in_tray_still_restores_existing_window(self):
+        self.window.hide()
+        self.launch(arguments=('--start-in-tray',))
         self.assertTrue(self.window.isVisible())
         self.assertEqual(self.window.refreshes, 1)
 

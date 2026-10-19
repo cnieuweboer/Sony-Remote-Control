@@ -485,7 +485,7 @@ class CalibrationServer(QObject):
 APP_NAME = "Sony Remote"
 
 
-__version__ = "2026.10.19.8"
+__version__ = "2026.10.19.9"
 
 
 CONFIG_PATH = Path(__file__).with_name("SonyRemote.json")
@@ -3690,7 +3690,13 @@ def _run_application():
     app.setQuitOnLastWindowClosed(window.tray is None)
     app.aboutToQuit.connect(window._shutdown)
     window._fit_and_lock_window()
-    window.show()
+    if ("--start-in-tray" in sys.argv[1:]
+            and config["SystemTray"] and config["CloseToTray"]
+            and window.tray is not None and QSystemTrayIcon.isSystemTrayAvailable()):
+        # A new window is already hidden: do not show it even for one frame.
+        window._update_polling_state()
+    else:
+        window.show()
     try:
         return app.exec()
     finally:

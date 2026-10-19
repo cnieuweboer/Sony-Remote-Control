@@ -21,6 +21,14 @@ py -m pip install PySide6
 
 Run `SonyRemote.pyw`.
 
+For Windows login startup, add `--start-in-tray` to your shortcut target, for example:
+
+```text
+"C:\Path\To\pythonw.exe" "C:\Remotes\SonyRemote.pyw" --start-in-tray
+```
+
+This starts hidden only when `SystemTray` and `CloseToTray` are both `true` and a tray is available; otherwise the window opens normally. Launching the app again still brings the existing window forward.
+
 ## macOS
 
 ```bash

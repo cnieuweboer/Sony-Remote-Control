@@ -4,6 +4,8 @@ Release identifiers below come from the corresponding commits. Some releases upd
 
 ## 2026-10-19
 
+- 2026.10.19.9 — Add `--start-in-tray`, gated by both tray settings and actual tray availability. Start hidden without a visible-window flash, keep ordinary fallback/second-launch activation and restart arguments, and add startup regression tests.
+
 - Sony Remote 2026.10.19.8 — Preserve pending TV volume targets across background polling and unrelated amplifier state updates, including queued commands without rate limiting. Ignore polls superseded by newer volume input/completion. Add immediate volume-button presses with repeat after 500 ms at 100 ms intervals; retain rate limiting/routing and add GUI regression tests.
 
 - Sony Remote 2026.10.19.7 — Replace favorite-button hiding with a captured-content animation inside the real Qt dropdown, using the existing workaround toggle. Preserve Qt popup placement and disabled-animation preferences; restore live interaction/geometry after interruption and add dropdown regression tests.
