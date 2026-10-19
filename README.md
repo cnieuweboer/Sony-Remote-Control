@@ -26,6 +26,14 @@ For Windows login startup, add `--start-in-tray` to your shortcut target, for ex
 
 This starts hidden only when `SystemTray` and `CloseToTray` are both `true` and a tray is available; otherwise the window opens normally. Launching the app again still brings the existing window forward.
 
+For optional Windows-managed global playback keys, install:
+
+```powershell
+py -m pip install winrt-Windows.Media winrt-Windows.Media.Interop winrt-Windows.Foundation
+```
+
+Then set `"SMTCPlaybackKeys": true` in `SonyRemote.json`. Windows routes Play/Pause, Stop, Next, and Previous between participating apps; the remote can receive them while in the tray.
+
 ## macOS
 
 ```bash
@@ -91,6 +99,7 @@ Set:
 - `InputControls` — show the input selector and favorite input buttons.
 - `VolumeControls` — show volume and mute controls.
 - `PlaybackControls` — show media playback controls.
+- `SMTCPlaybackKeys` — `false` by default. On Windows, use SMTC for global playback keys and disable their focused interception; requires the optional packages above. Participation pauses when the TV is unavailable or during calibration. Volume/mute routing is unchanged.
 - `AmplifierTVInput` — fallback amplifier input ID for the TV (for example `hdmi1`, `optical1`, or `tv`), rather than its display name. Leave empty to use TV controls unless a matching calibration supplies the input.
 - `DiagnosticsEnabled` — `false` by default. Set to `true` to append unexpected errors and crash diagnostics to `SonyRemote-crash.log` beside the script. Logs contain the app version, exception types, and stack locations; exception messages, source lines, request data, and local variable values are omitted. If the log cannot be opened or written, the app continues without logging.
 - `SortByName` — `false` (default) keeps favorites and dropdown entries in JSON insertion order; `true` sorts them alphabetically by `NameOverride`, falling back to `Name`, ignoring case. Apps and inputs are ordered separately.
@@ -116,7 +125,7 @@ The app automatically restarts when it detects that `SonyRemote.json` has change
 
 Only one instance of SonyRemote can run at a time. Launching it again restores the existing window, including from the system tray.
 
-Regular status polling pauses while the window is hidden or minimized and refreshes immediately when restored. Active requests finish normally; configuration file watching remains enabled.
+Regular status polling pauses while the window is hidden or minimized and refreshes immediately when restored. When SMTC playback keys are available and enabled, the same timer continues in the background to detect TV availability. Active requests finish normally; configuration file watching remains enabled.
 
 ## Windows shortcut reliability
 

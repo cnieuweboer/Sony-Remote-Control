@@ -492,7 +492,7 @@ class CalibrationServer(QObject):
 APP_NAME = "Sony Remote"
 
 
-__version__ = "2026.10.19.19"
+__version__ = "2026.10.19.20"
 
 
 CONFIG_PATH = Path(__file__).resolve().with_name("SonyRemote.json")
@@ -554,6 +554,7 @@ DEFAULT_CONFIG = {
         "RateMs": 500,
     },
     "DiagnosticsEnabled": False,
+    "SMTCPlaybackKeys": False,
     "SortByName": False,
     "Apps": {},
     "Inputs": {},
@@ -564,6 +565,7 @@ DEFAULT_CONFIG = {
 
 
 BOOLEAN_CONFIG_KEYS = (
+    "SMTCPlaybackKeys",
     "DiagnosticsEnabled",
     "SortByName",
     "DarkMode",
@@ -1674,6 +1676,124 @@ class Worker(QRunnable):
 
 
 # ----------------------------
+# Optional Windows playback media-key routing
+# ----------------------------
+
+
+_PLAYBACK_KEY_COMMANDS = frozenset(("PlayPause", "Play", "Pause", "Stop", "Next", "Prev"))
+_SMTC_BUTTON_COMMANDS = {"PLAY": "Play", "PAUSE": "Pause", "STOP": "Stop",
+                         "NEXT": "Next", "PREVIOUS": "Prev"}
+
+
+def _load_smtc_api():
+    # Optional dependencies must never be imported for the ordinary key path.
+    from winrt.windows.media import MediaPlaybackStatus
+    from winrt.windows.media.interop import get_for_window
+    return MediaPlaybackStatus, get_for_window
+
+
+class SMTCPlayback(QObject):
+    """Window-local WinRT adapter; callbacks cross to Qt without doing work."""
+
+    button_pressed = Signal(str)
+    failed = Signal(object)
+    _button_event = Signal(int, str)
+    _error_event = Signal(int, object)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.controls = None
+        self._token = None
+        self._generation = 0
+        self._settings = None
+        self._status_api = None
+        self._status = None
+        self._button_event.connect(self._deliver_button, Qt.QueuedConnection)
+        self._error_event.connect(self._deliver_error, Qt.QueuedConnection)
+
+    def start(self, hwnd):
+        self.stop()
+        self._status_api, get_for_window = _load_smtc_api()
+        self.controls = get_for_window(hwnd)
+        try:
+            self.controls.is_enabled = False
+            self.controls.is_fast_forward_enabled = False
+            self.controls.is_rewind_enabled = False
+            self.controls.is_record_enabled = False
+            self._status = self._status_api.PLAYING
+            self.controls.playback_status = self._status
+            generation = self._generation
+            def received(_sender, args):
+                try:
+                    command = _SMTC_BUTTON_COMMANDS.get(args.button.name)
+                    if command is not None:
+                        self._button_event.emit(generation, command)
+                except Exception as error:
+                    try:
+                        self._error_event.emit(generation, error)
+                    except RuntimeError:
+                        pass  # A retired callback can race QObject destruction.
+            self._token = self.controls.add_button_pressed(received)
+        except Exception:
+            self.stop()
+            raise
+
+    def update(self, commands):
+        settings = frozenset(commands)
+        if self.controls is None or settings == self._settings:
+            return
+        try:
+            for command, name in (("Play", "play"), ("Pause", "pause"), ("Stop", "stop"),
+                                  ("Next", "next"), ("Prev", "previous")):
+                setattr(self.controls, f"is_{name}_enabled", command in settings)
+            self.controls.is_enabled = bool(settings)
+            self._settings = settings
+        except Exception as error:
+            self.stop()
+            self.failed.emit(error)
+
+    def note_command(self, command):
+        if self.controls is None or command not in ("Play", "Pause", "PlayPause", "Stop"):
+            return
+        if command == "PlayPause":
+            command = "Pause" if self._status == self._status_api.PLAYING else "Play"
+        status = {"Play": self._status_api.PLAYING, "Pause": self._status_api.PAUSED,
+                  "Stop": self._status_api.STOPPED}[command]
+        try:
+            # Optimistic routing hint, not confirmation of the TV's playback.
+            self.controls.playback_status = status
+            self._status = status
+        except Exception as error:
+            self.stop()
+            self.failed.emit(error)
+
+    def _deliver_button(self, generation, command):
+        if generation == self._generation and command in (self._settings or ()):
+            self.button_pressed.emit(command)
+
+    def _deliver_error(self, generation, error):
+        if generation == self._generation and self.controls is not None:
+            self.stop()
+            self.failed.emit(error)
+
+    def stop(self):
+        self._generation += 1  # Ignore events already queued by a retired session.
+        controls, token = self.controls, self._token
+        self.controls = None
+        self._token = self._settings = None
+        if controls is not None:
+            try:
+                controls.is_enabled = False
+            except Exception as error:
+                record_exception(error, "SMTC disable", deduplicate=True)
+            if token is not None:
+                try:
+                    controls.remove_button_pressed(token)
+                except Exception as error:
+                    record_exception(error, "SMTC unsubscribe", deduplicate=True)
+
+
+# ----------------------------
 # Specialized widgets
 # ----------------------------
 
@@ -1926,6 +2046,9 @@ class SonyRemote(QMainWindow):
 
         self.amplifier_state = None
         self._amplifier_routed = False
+        self._smtc = None
+        self._smtc_failed = False
+        self._smtc_warning_shown = False
         self._amplifier_error = ""
         self._amplifier_error_category = ""
         self.amplifier_client = AmplifierClient(self)
@@ -1941,6 +2064,7 @@ class SonyRemote(QMainWindow):
         self._setup_shortcuts()
         self._setup_calibration()
         self._setup_activation()
+        self._setup_smtc()
         self.set_controls_enabled(False)
         self.amplifier_client.start()
         QTimer.singleShot(0, self.initialize)
@@ -2024,6 +2148,74 @@ class SonyRemote(QMainWindow):
         self.volume_rate_timer = QTimer(self)
         self.volume_rate_timer.setSingleShot(True)
         self.volume_rate_timer.timeout.connect(self._volume_rate_step)
+
+    def _playback_key_mode(self):
+        if not self.config.get("SMTCPlaybackKeys", False):
+            return "focused"
+        if sys.platform != "win32" or self._smtc_failed:
+            return "unavailable"
+        return "smtc"
+
+    def _setup_smtc(self):
+        if not self.config["SMTCPlaybackKeys"]:
+            return
+        self._smtc_failed = False
+        try:
+            if sys.platform != "win32":
+                raise OSError("SMTC playback keys require Windows.")
+            if self._smtc is None:
+                self._smtc = SMTCPlayback(self)
+                self._smtc.button_pressed.connect(self._handle_smtc_button)
+                self._smtc.failed.connect(self._smtc_failure)
+            # winId creates an HWND without showing a start-in-tray window.
+            self._smtc.start(int(self.winId()))
+            self._publish_shortcut_state()
+        except Exception as error:
+            self._smtc_failure(error)
+
+    def _smtc_failure(self, error):
+        self._smtc_failed = True
+        if self._smtc is not None:
+            self._smtc.stop()
+        record_exception(error, "SMTC playback keys", deduplicate=True)
+        self._publish_shortcut_state()
+        self._update_polling_state()
+        if not self._smtc_warning_shown:
+            self._smtc_warning_shown = True
+            QTimer.singleShot(0, self._show_smtc_warning)
+
+    def _show_smtc_warning(self):
+        if self._shutting_down:
+            return
+        details = ("This option requires Windows." if sys.platform != "win32" else
+                   "Install the optional packages and restart:\n\n"
+                   "pip install winrt-Windows.Media winrt-Windows.Media.Interop winrt-Windows.Foundation")
+        QMessageBox.warning(self, APP_NAME,
+                            "SMTC playback keys are unavailable.\n\n" + details +
+                            "\n\nPlayback media keys are not intercepted in this mode. "
+                            "The remote's on-screen buttons remain available. "
+                            "Set SMTCPlaybackKeys to false to restore focused playback keys.")
+
+    def _smtc_commands(self):
+        if (self._playback_key_mode() != "smtc" or self._shutting_down
+                or self._calibration_blocked() or self.last_power != "active"
+                or QApplication.activeModalWidget() is not None
+                or "remote_codes" not in self._discovery_ready):
+            return frozenset()
+        return frozenset(command for command in _SMTC_BUTTON_COMMANDS.values()
+                         if self.api.resolve_remote_command(command) in self.api.remote_codes)
+
+    def _refresh_playback_routing(self):
+        if self._smtc is not None:
+            self._smtc.update(self._smtc_commands())
+
+    def _smtc_background_polling(self):
+        return self._playback_key_mode() == "smtc" and self._smtc is not None
+
+    def _handle_smtc_button(self, command):
+        # Availability may have changed since Windows queued this event.
+        if command in self._smtc_commands():
+            self.send_ircc(command, background=True)
 
     def _setup_shortcuts(self):
         self._popup_shortcut_keys = set()
@@ -2629,7 +2821,8 @@ class SonyRemote(QMainWindow):
 
     def poll_status(self):
         if (self._shutting_down or self._calibration_operation or missing_config_settings(self.config)
-                or (not self.calibration_active and (not self.isVisible() or self.isMinimized()))):
+                or (not self.calibration_active and not self._smtc_background_polling()
+                     and (not self.isVisible() or self.isMinimized()))):
             return
         if self.poll_running:
             return
@@ -2699,7 +2892,8 @@ class SonyRemote(QMainWindow):
             return
 
         should_poll = (
-            (self.calibration_active or (self.isVisible() and not self.isMinimized()))
+            (self.calibration_active or self._smtc_background_polling()
+             or (self.isVisible() and not self.isMinimized()))
             and not missing_config_settings(self.config)
         )
 
@@ -3115,10 +3309,16 @@ class SonyRemote(QMainWindow):
             return
         self.run_command(lambda: self.api.set_input(uri), on_finished=lambda: QTimer.singleShot(300, self.poll_status))
 
-    def send_ircc(self, command):
+    def send_ircc(self, command, *, background=False):
         if self._calibration_blocked():
             return
-        self.run_command(lambda: self.api.ircc(command))
+        accepted = self.run_command(
+            lambda: self.api.ircc(command),
+            on_error=(lambda error: self.handle_request_error(error, background=True)) if background else None,
+        )
+        if accepted and self._smtc is not None:
+            self._smtc.note_command(command)
+        return accepted
 
     def send_text_input(self):
         if self._calibration_blocked():
@@ -3186,6 +3386,8 @@ class SonyRemote(QMainWindow):
         )
 
     def _dispatch_shortcut(self, command):
+        if command in _PLAYBACK_KEY_COMMANDS and self._playback_key_mode() != "focused":
+            return False
         if "remote_codes" not in self._discovery_ready:
             return False
         resolved = self.api.resolve_remote_command(command)
@@ -3215,6 +3417,7 @@ class SonyRemote(QMainWindow):
             self.show_error("Windows keyboard interception is unavailable. Use the remote's buttons.")
 
     def _publish_shortcut_state(self):
+        self._refresh_playback_routing()
         if not hasattr(self, "_shortcut_lock"):
             return
         window = int(self.winId()) if self.isVisible() and not self.isMinimized() else 0
@@ -3226,6 +3429,8 @@ class SonyRemote(QMainWindow):
         if not text_focused and "remote_codes" in self._discovery_ready:
             allowed.update(command for command in _SHORTCUT_KEYS.values()
                            if self.api.resolve_remote_command(command) in self.api.remote_codes)
+        if self._playback_key_mode() != "focused":
+            allowed.difference_update(_PLAYBACK_KEY_COMMANDS)
         # A deadline is checked in the native thread, independent of GUI timers.
         owner_deadline = (self.amplifier_client.state_deadline
                           if self._amplifier_owns_hotkeys() else 0)
@@ -3446,6 +3651,8 @@ class SonyRemote(QMainWindow):
 
     def _pause_background_work(self):
         self._shutting_down = True
+        if self._smtc is not None:
+            self._smtc.stop()
         if self.activation_server is not None:
             self.activation_server.close()
         if self.calibration_server is not None:
@@ -3475,6 +3682,7 @@ class SonyRemote(QMainWindow):
         self._shutting_down = False
         self._setup_activation()
         self._setup_calibration()
+        self._setup_smtc()
         self.amplifier_client.start()
         self._config_restart_pending = False
         self.config_watcher.blockSignals(False)

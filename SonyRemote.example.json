@@ -24,6 +24,7 @@
     "RateMs": 300
   },
   "DiagnosticsEnabled": false,
+  "SMTCPlaybackKeys": false,
   "SortByName": false,
   "Apps": {},
   "Inputs": {},

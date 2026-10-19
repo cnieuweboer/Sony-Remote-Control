@@ -4,6 +4,8 @@ Release identifiers below come from the corresponding commits. Some releases upd
 
 ## 2026-10-19
 
+- Sony Remote 2026.10.19.20 — Add optional Windows SMTC routing for Play, Pause, Stop, Next, and Previous with `SMTCPlaybackKeys` (default false). Disable their focused interception in this mode, preserve volume/amplifier routing, and reuse the existing polling timer while hidden. Add lazy optional imports, clear startup warnings, Qt-thread callback delivery, serialized commands, safe session cleanup/restart recovery, and fake-SDK integration tests.
+
 - 2026.10.19.19 — Restore the native Qt dropdown arrow in a borderless, transparent right-hand area. Keep labels centered across the full combobox and retain the live-view popup animation; no icon files are required.
 
 - 2026.10.19.15 — Make tray startup tests independent of the checkout folder name and describe dropdown flicker as a popup fill/frame timing mismatch. Clear connection-loss feedback on fresh valid amplifier state using explicit error categories; preserve timeout/rejection feedback until an accepted command and never replay uncertain commands.

@@ -231,3 +231,17 @@ Both repositories keep identical `tests/fixtures/amplifier_protocol_v1.json` wir
 ## Volume follow-up polling
 
 With volume rate limiting disabled, only the final pending volume-command completion schedules a status refresh after 200 ms. The callback checks the volume input generation and that volume work is still idle before polling, so a newer press suppresses an obsolete follow-up even if its command has already finished. The latest idle completion still reconciles the target with the TV, and regular periodic polling is unchanged.
+
+## Optional Windows SMTC playback keys
+
+`SMTCPlaybackKeys` defaults to false. Only when enabled on Windows does `SMTCPlayback` lazily import PyWinRT and bind `get_for_window(int(winId()))`; creating the handle does not show the window, so registration also works with `--start-in-tray`. Optional packages are `winrt-Windows.Media`, `winrt-Windows.Media.Interop`, and `winrt-Windows.Foundation` (their runtime dependency is resolved by pip).
+
+`_playback_key_mode()` selects focused, SMTC, or unavailable. The native shortcut allowlist and final focused dispatch both exclude Play/Pause, Play, Pause, Stop, Next, and Previous whenever SMTC is selected, including when its initialization fails. There is no automatic focused-hook fallback. Volume/mute ownership, amplifier IPC, and volume calibration routing are separate and unchanged. On-screen playback controls continue using the ordinary command path; `PlaybackControls` controls their visibility independently of the key-routing option.
+
+`_refresh_playback_routing()` advertises only discovered explicit TV commands while the TV is active, calibration is inactive, and no modal dialog blocks interaction. Missing explicit Play/Pause commands are not replaced with blind toggles. Only the existing status timer is kept active while hidden/minimized when the SMTC backend is available; standby/offline/discovery recovery uses the existing state updates. No new device or IPC polling timer is added.
+
+WinRT callbacks only read the button and emit a queued Qt signal. The GUI rechecks availability and sends playback commands through the same bounded, serialized TV command pool as the on-screen buttons. SMTC command errors use non-modal background feedback. Playing/Paused/Stopped are optimistic routing hints updated when commands are queued, including on-screen Play/Pause; they do not claim to reflect independently observed TV playback. Windows chooses which participating media session receives a media key.
+
+Pausing for restart/shutdown disables the SMTC session and removes the event subscription before waiting for workers. Cleanup attempts unsubscribe even if disabling fails. Event generations discard callbacks queued before a session was retired; restart-launch failure re-registers the existing window. Missing dependencies or SDK errors disable participation, retain other controls, and show one warning per process with installation/fallback instructions; optional diagnostics retain exception types without request contents.
+
+`tests/test_smtc_playback.py` uses a fake WinRT API with real Qt event delivery and the device-free TV fixture. It covers supported buttons including Stop, callback thread handoff, optimistic hints, stale event rejection, dependency/registration/cleanup failures, focused-key exclusion, hidden polling, unavailable TVs, calibration, hidden startup, and restart recovery. Windows media-session arbitration still needs desktop verification; it cannot be exercised by offscreen Linux tests.
