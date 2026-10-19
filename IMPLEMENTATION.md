@@ -211,3 +211,11 @@ The volume buttons use Qt's built-in auto-repeat: an immediate step on press, a 
 `--start-in-tray` leaves the newly constructed window hidden when both `SystemTray` and `CloseToTray` are true, an icon was created, and the tray is still available. It never shows/minimizes the main window first. Initialization, configuration feedback, IPC, and visibility-aware polling retain their existing paths; Yamaha global control or connected TV clients can still keep hidden-window polling active. Missing/disabled tray support falls back to an ordinary visible window.
 
 The switch is checked after single-instance activation, so a second launch restores the existing window regardless of the flag. Configuration-driven replacement already forwards command-line arguments and retains the switch. `tests/test_tray_startup.py` checks the visibility/fallback gates, startup feedback, and argument forwarding without live tray icons or devices; `tests/test_activation.py` also exercises a real second process with the switch.
+
+## Amplifier protocol contract checks
+
+Protocol version 1 acknowledgements have integer `id`, boolean `accepted`, and an optional `reason` (`""`, `queue_full`, or `state_changed`). Missing reasons are treated as empty; rejection without an explanation receives generic feedback. Queue-full drops stay silent and commands are never replayed on uncertain delivery. Sony records invalid messages in optional diagnostics with duplicate suppression and displays brand-neutral incompatibility feedback.
+
+Amplifier feedback is stored separately from discovery feedback, survives TV polling, and clears only when a pending amplifier command receives an accepted acknowledgement. Acceptance means queued by the amplifier remote, not confirmation that the physical device completed the command.
+
+Both repositories keep identical `tests/fixtures/amplifier_protocol_v1.json` wire examples. Tests compare Yamaha's actual snapshots and acknowledgement production with those examples and feed the same messages through Sony's actual consumer. Fixtures and tests are development-only; the scripts remain self-contained. Changes to the wire contract should update and verify both copies together.

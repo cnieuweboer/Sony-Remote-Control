@@ -259,6 +259,25 @@ class DiscoveryTests(unittest.TestCase):
         self.assertTrue(self.window.input_favorites_layout.itemAt(0).widget().isEnabled())
         self.assertEqual(self.window.input_combo.currentData(), 'input')
 
+    def test_amplifier_feedback_survives_tv_poll_and_clears_on_accepted_ack(self):
+        self.start_and_settle()
+        client = self.window.amplifier_client
+        client.command_failed.emit('Command acknowledgement timed out.')
+        self.wait(lambda: not self.window.poll_running)
+        previous_sequence = self.window._status_sequence
+        self.window.poll_status()
+        self.wait(lambda: self.window._status_sequence > previous_sequence)
+        self.assertIn('Command acknowledgement timed out.', self.window.power_button.toolTip())
+        timer = Mock()
+        client.pending[1] = timer
+        with patch.dict(REMOTE['AmplifierClient']._read.__globals__,
+                        _ipc_frames=lambda socket, buffer: [
+                            {'version': 1, 'type': 'ack', 'id': 1, 'accepted': True}]):
+            client._read()
+        self.assertNotIn('Command acknowledgement timed out.', self.window.power_button.toolTip())
+        timer.stop.assert_called_once()
+        self.window.show_error.assert_not_called()
+
     def test_pause_and_resume_reset_pending_discovery_and_retry_unfinished_feature(self):
         self.start_and_settle()
         self.device.holds['apps'] = threading.Event()

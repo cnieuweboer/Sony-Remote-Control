@@ -1,0 +1,96 @@
+{
+  "states": [
+    {
+      "version": 1,
+      "type": "state",
+      "device_id": "12ca17b49af2289436f303e0166030a21e525d266e209267433801a8fd4071a0",
+      "online": true,
+      "power": "on",
+      "input": "tv",
+      "raw_volume": 100,
+      "volume_display": "100",
+      "volume_unit": "raw",
+      "raw_max_volume": 154,
+      "mute": false,
+      "global_hotkeys_enabled": true,
+      "global_hotkeys_active": true,
+      "calibration_active": false,
+      "valid_for_ms": 6000
+    },
+    {
+      "version": 1,
+      "type": "state",
+      "device_id": "12ca17b49af2289436f303e0166030a21e525d266e209267433801a8fd4071a0",
+      "online": true,
+      "power": "on",
+      "input": "tv",
+      "raw_volume": 100,
+      "volume_display": "-47.0 dB",
+      "volume_unit": "dB",
+      "raw_max_volume": 154,
+      "mute": false,
+      "global_hotkeys_enabled": true,
+      "global_hotkeys_active": true,
+      "calibration_active": false,
+      "valid_for_ms": 6000
+    }
+  ],
+  "commands": [
+    {
+      "version": 1,
+      "type": "command",
+      "id": 1,
+      "command": "volume_up",
+      "input": "tv"
+    },
+    {
+      "version": 1,
+      "type": "command",
+      "id": 2,
+      "command": "volume_down",
+      "input": "tv"
+    },
+    {
+      "version": 1,
+      "type": "command",
+      "id": 3,
+      "command": "mute",
+      "input": "tv"
+    }
+  ],
+  "acks": [
+    {
+      "version": 1,
+      "type": "ack",
+      "id": 1,
+      "accepted": true,
+      "reason": ""
+    },
+    {
+      "version": 1,
+      "type": "ack",
+      "id": 1,
+      "accepted": false,
+      "reason": "queue_full"
+    },
+    {
+      "version": 1,
+      "type": "ack",
+      "id": 1,
+      "accepted": false,
+      "reason": "state_changed"
+    },
+    {
+      "version": 1,
+      "type": "ack",
+      "id": 1,
+      "accepted": true
+    },
+    {
+      "version": 1,
+      "type": "ack",
+      "id": 1,
+      "accepted": false
+    }
+  ]
+}
