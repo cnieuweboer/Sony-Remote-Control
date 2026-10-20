@@ -147,8 +147,9 @@ A matching calibration automatically identifies the amplifier's TV input and dis
 - **Before starting:** Update both remotes and the helper, turn on the TV and amplifier, and select the amplifier input connected to the TV. Run both remotes and keep `VolumeCalibration.pyw` in the same folder as `SonyRemote.pyw`.
 - **Silent source:** Put the TV on a silent input/source, stop all other playback, and keep the same Windows audio output selected. Windows mute alone does not silence TV-generated audio or other amplifier sources.
 - **Run:** Open `VolumeCalibration.pyw`, confirm the silent-source checkbox, and choose **Start calibration** or **Replace calibration**. The same button cancels a running sweep; the activity log shows what is happening.
+- **Speaker isolation:** The helper tries to disable amplifier speakers and verifies the result. If unavailable or lost, choose once whether to continue without isolation; a silent source is still required.
 - **During calibration:** Volume can go **VERY HIGH**, and volume changes may unmute the TV/amplifier. Keep the source silent and avoid physical controls until cleanup finishes.
-- **After calibration:** The helper attempts to restore the starting settings, including after cancellation or failure. **Check volume and mute on the TV, amplifier, and computer before playing sound**, especially if the helper was interrupted.
+- **After calibration:** The helper attempts to restore the starting settings, including after cancellation or failure. **Check speaker outputs, volume, and mute on the TV, amplifier, and computer before playing sound**, especially if the helper was interrupted.
 
 Sony loads a successful calibration automatically; no manual `AmplifierTVInput` edit is needed. An **≈** beside the volume marks an estimated value; calibration changes Sony's displayed number without setting the physical TV's volume.
 

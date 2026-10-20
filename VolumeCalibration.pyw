@@ -17,7 +17,7 @@ from PySide6.QtWidgets import (
     QProgressBar, QTextEdit, QVBoxLayout, QWidget,
 )
 
-__version__ = "2026.10.19.5"
+__version__ = "2026.10.20.3"
 DATA_PATH = Path(__file__).resolve().with_name("VolumeCalibration.json")
 IPC_USER_SUFFIX = hashlib.sha256(str(Path.home()).encode("utf-8")).hexdigest()[:16]
 
@@ -37,12 +37,20 @@ MAX_VOLUME_STEPS = 512
 VOLUME_RESTORE_SECONDS = 900.0
 SWEEP_SECONDS = 900.0
 POST_SWEEP_WARNING = (
-    "Before playing any sound, check the volume and mute settings on your TV, "
+    "Before playing any sound, check the volume, mute, and speaker-output settings on your TV, "
     "amplifier, and computer. Automatic restoration cannot be guaranteed after an error or interruption."
 )
 
 
 class CalibrationError(RuntimeError):
+    pass
+
+
+class OperationRejected(CalibrationError):
+    """A completed remote operation explicitly reported failure."""
+
+
+class IsolationUnverified(CalibrationError):
     pass
 
 
@@ -373,7 +381,8 @@ class Peer:
 
 class CalibrationSession:
     def __init__(self, cancel, progress, path=DATA_PATH, mute_factory=WindowsMute,
-                 peer_factory=Peer, silent_source_confirmed=False, cleanup_started=None):
+                 peer_factory=Peer, silent_source_confirmed=False, cleanup_started=None,
+                 confirm_isolation=None):
         self.cancel, self.progress, self.path = cancel, progress, path
         self.mute_factory, self.peer_factory = mute_factory, peer_factory
         self.silent_source_confirmed = silent_source_confirmed
@@ -389,6 +398,87 @@ class CalibrationSession:
         self.in_step = False
         self.saved = None
         self.windows = None
+        self.confirm_isolation = confirm_isolation or (lambda reason, pump: False)
+        self._prompt_pause_total = 0
+        self._isolation_verified = False
+        self.unisolated = False
+        self._last_speaker_report = None
+
+    def now(self):
+        return time.monotonic() - self._prompt_pause_total
+
+    def speaker_state(self, state):
+        outputs, values = state.get("speaker_outputs"), state.get("speaker_state")
+        valid_for = state.get("speaker_valid_for_ms")
+        peer = self.peers["amplifier"]
+        if (not isinstance(outputs, list) or not outputs
+                or any(not isinstance(name, str) or name not in ("a", "b") for name in outputs)
+                or len(set(outputs)) != len(outputs)
+                or not isinstance(values, list) or len(values) != 2
+                or any(type(value) is not bool for value in values)
+                or any(value and name not in outputs for name, value in zip(("a", "b"), values))
+                or type(valid_for) is not int or not 0 < valid_for <= 6000
+                or time.monotonic() - peer.state_at >= valid_for / 1000):
+            return None
+        return tuple(values)
+
+    def allow_without_isolation(self, reason):
+        self._isolation_verified = False
+        if self.unisolated:
+            return
+        self.progress("Speaker isolation could not be verified: " + reason)
+        started = time.monotonic()
+        try:
+            accepted = self.confirm_isolation(reason, self.pump)
+        finally:
+            self._prompt_pause_total += time.monotonic() - started
+        if not accepted:
+            raise Cancelled("Calibration cancelled because speaker isolation was not verified.")
+        self.unisolated = True
+        self.progress("Continuing without verified speaker isolation for this sweep. Keep every source silent.")
+        # A decision does not waive communication, identity, volume, or mute checks.
+        self.pump()
+        self.guard(require_windows_mute=True)
+
+    def isolate_speakers(self):
+        a, _ = self.guard(require_windows_mute=True)
+        if self.saved["speaker_state"] is None:
+            self.allow_without_isolation("Speaker controls or a fresh original speaker state are unavailable.")
+            return
+        try:
+            self.request("amplifier", "set_speakers", [False, False])
+        except OperationRejected as error:
+            self.pump()
+            self.guard(require_windows_mute=True)
+            self.allow_without_isolation(str(error))
+            return
+        try:
+            self.wait(lambda a, t: self.speaker_state(a) == (False, False),
+                      "Verifying amplifier speakers are OFF", windows_muted=True,
+                      timeout_error=IsolationUnverified)
+        except IsolationUnverified as error:
+            self.pump()
+            self.guard(require_windows_mute=True)
+            self.allow_without_isolation(str(error))
+            return
+        self._isolation_verified = True
+        self.progress("Speaker isolation verified; beginning the sweep.")
+
+    def isolation_summary(self):
+        return " Sweep ran without verified speaker isolation; check all speaker outputs." if self.unisolated else ""
+
+    def restore_speakers(self):
+        original = self.saved["speaker_state"]
+        if original is None:
+            self.progress("Original speaker state was unavailable; check speaker outputs manually.")
+            return
+        self.request("amplifier", "set_speakers", list(original))
+        self.wait(lambda a, t: self.speaker_state(a) == tuple(original)
+                  and a["raw_volume"] == self.saved["amplifier_volume"]
+                  and t["volume"] == self.saved["tv_volume"]
+                  and a["mute"] == self.saved["amplifier_mute"] and t["mute"] == self.saved["tv_mute"],
+                  "Verifying restored speakers, volume, and mute", windows_muted=True)
+        self.progress("Original speaker outputs restored after volume and mute verification.")
 
     def pump(self):
         if self.cancel.is_set() and not self.restoring and not self.in_request and not self.in_step:
@@ -419,20 +509,20 @@ class CalibrationSession:
     def request(self, role, action, value=None):
         peer = self.peers[role]
         request_id = peer.send(self.token, action, {} if value is None else {"value": value})
-        deadline = time.monotonic() + 8
+        deadline = self.now() + (30 if action == "set_speakers" else 8)
         # Finish a bounded, already-issued mutation before honouring cancel;
         # restoration must not race a still-running device request.
         self.in_request = True
         try:
             while request_id not in peer.results:
                 self.pump()
-                if time.monotonic() >= deadline:
+                if self.now() >= deadline:
                     raise CalibrationError(f"The {role} {action} operation timed out; it was not retried.")
         finally:
             self.in_request = False
         result = peer.results.pop(request_id)
         if not result["ok"]:
-            raise CalibrationError(result.get("error") or f"The {role} request failed.")
+            raise OperationRejected(result.get("error") or f"The {role} request failed.")
         if action == "acquire":
             peer.acquired = True
         elif action == "release":
@@ -454,22 +544,30 @@ class CalibrationSession:
                 raise CalibrationError("The amplifier input or configured device changed. Original settings cannot be restored to a different pairing.")
         if require_windows_mute and not self.windows.get():
             raise CalibrationError("Windows was unmuted during the test.")
+        speakers = self.speaker_state(a)
+        if self._isolation_verified and speakers != (False, False):
+            self.allow_without_isolation("Previously verified speaker isolation was lost or became unknown.")
+            # The decision may have taken a while: return the current snapshots.
+            return self.guard(require_windows_mute=require_windows_mute)
+        if self.unisolated and not self.restoring and speakers != self._last_speaker_report:
+            self._last_speaker_report = speakers
+            self.progress(f"Unisolated sweep speaker state: {speakers if speakers is not None else 'unknown'}.")
         return a, t
 
     def wait(self, predicate, description, *, windows_muted=False,
              stable_for=0.5, min_elapsed=1.0, timeout=TIMEOUT, timeout_error=CalibrationError):
         self.progress(description)
-        start = time.monotonic()
+        start = self.now()
         deadline = start + timeout
         stable = 0
         stable_since = start
         last_pair = None
         last_values = None
-        while time.monotonic() < deadline:
+        while self.now() < deadline:
             self.pump()
             if not all(peer.fresh() for peer in self.peers.values()):
                 stable, last_pair, last_values = 0, None, None
-                stable_since = time.monotonic()
+                stable_since = self.now()
                 continue
             a, t = self.guard(require_windows_mute=windows_muted)
             pair = (a["sample_id"], t["sample_id"])
@@ -479,17 +577,17 @@ class CalibrationSession:
                 # period again whenever either device's value changes.
                 if values != last_values:
                     stable = 0
-                    stable_since = time.monotonic()
+                    stable_since = self.now()
                     last_pair, last_values = None, values
                 if last_pair is None or (pair[0] != last_pair[0] and pair[1] != last_pair[1]):
                     stable += 1
                     last_pair = pair
-                now = time.monotonic()
+                now = self.now()
                 if stable >= 3 and now - start >= min_elapsed and now - stable_since >= stable_for:
                     return a, t
             else:
                 stable, last_pair, last_values = 0, None, None
-                stable_since = time.monotonic()
+                stable_since = self.now()
         detail = ""
         if all(peer.state for peer in self.peers.values()):
             detail = (f" (TV {self.peers['tv'].state.get('volume')}, "
@@ -513,7 +611,8 @@ class CalibrationSession:
             raise CalibrationError("TV and amplifier mute states differ. Align them before starting.")
         self.saved = {"input": a["input"], "amplifier_id": a["device_id"], "tv_id": t["device_id"],
                       "windows_mute": self.windows.get(), "tv_mute": t["mute"], "tv_volume": t["volume"],
-                      "amplifier_mute": a["mute"], "amplifier_volume": a["raw_volume"]}
+                      "amplifier_mute": a["mute"], "amplifier_volume": a["raw_volume"],
+                      "speaker_state": self.speaker_state(a)}
         self.progress(f"Captured original settings and amplifier TV input: {a['input']}.")
 
     @staticmethod
@@ -585,7 +684,7 @@ class CalibrationSession:
             raise CalibrationError("Cannot step beyond the amplifier's observable range.")
         samples = (a["sample_id"], t["sample_id"])
         self.request("tv", "adjust_volume", direction)
-        deadline = time.monotonic() + TV_VOLUME_CONFIRM_SECONDS
+        deadline = self.now() + TV_VOLUME_CONFIRM_SECONDS
         fresh = False
         candidate = None
         def confirmed(a, t):
@@ -605,7 +704,7 @@ class CalibrationSession:
             # contrary TV reading must correct itself and settle, rather than
             # instantly aborting or being accepted as measurement data.
             return quick or tv_delta * direction >= 0
-        while time.monotonic() < deadline:
+        while self.now() < deadline:
             self.pump()
             a, t = self.guard(require_windows_mute=True)
             if a["sample_id"] == samples[0] or t["sample_id"] == samples[1]:
@@ -625,7 +724,7 @@ class CalibrationSession:
     def restore_step_baseline(self, baseline):
         """Bounded rollback, never recursive and never a calibration measurement."""
         self.progress(f"Restoring previous accepted pair: amplifier {baseline[0]}, TV {baseline[1]} (not measurement data).")
-        started = time.monotonic()
+        started = self.now()
         stalled = 0
         for count in range(CEC_RECOVERY_STEPS + 1):
             a, t = self.guard(require_windows_mute=True)
@@ -638,7 +737,7 @@ class CalibrationSession:
                                  "Verifying the previous accepted TV/amplifier pair before retry",
                                  windows_muted=True, stable_for=CEC_QUIET_SECONDS,
                                  min_elapsed=CEC_QUIET_SECONDS, timeout=20.0)
-            if count == CEC_RECOVERY_STEPS or time.monotonic() - started >= CEC_RECOVERY_SECONDS:
+            if count == CEC_RECOVERY_STEPS or self.now() - started >= CEC_RECOVERY_SECONDS:
                 raise CalibrationError("Previous accepted pair could not be restored within the rollback budget.")
             direction = 1 if current < baseline[0] else -1
             pair = self.volume_pair(a, t)
@@ -656,7 +755,7 @@ class CalibrationSession:
 
     def position_at_tv_minimum(self, minimum):
         self.progress("Positioning at the TV minimum; full step verification starts within five TV levels of minimum.")
-        start = time.monotonic()
+        start = self.now()
         was_quick = False
         for count in range(MAX_VOLUME_STEPS + 1):
             a, t = self.guard(require_windows_mute=True)
@@ -671,14 +770,14 @@ class CalibrationSession:
                 return self.wait(lambda a, t: t["volume"] == minimum,
                                  "Verifying the settled TV-minimum baseline", windows_muted=True,
                                  stable_for=3.0, min_elapsed=3.0, timeout=15.0)
-            if count == MAX_VOLUME_STEPS or time.monotonic() - start >= VOLUME_RESTORE_SECONDS:
+            if count == MAX_VOLUME_STEPS or self.now() - start >= VOLUME_RESTORE_SECONDS:
                 raise CalibrationError("TV-minimum positioning exceeded its step/time limit.")
             was_quick = t["volume"] > minimum + 5
             self.relative_step(-1, quick=was_quick)
 
     def seek_volume(self, raw_target, tv_target):
         """Restore the original raw value, verifying the final approach."""
-        start = time.monotonic()
+        start = self.now()
         was_quick = False
         previous_direction = None
         for step in range(MAX_VOLUME_STEPS + 1):
@@ -695,7 +794,7 @@ class CalibrationSession:
                 direction = 1 if raw < raw_target else -1
             if raw == raw_target:
                 return a, t
-            if step == MAX_VOLUME_STEPS or time.monotonic() - start >= VOLUME_RESTORE_SECONDS:
+            if step == MAX_VOLUME_STEPS or self.now() - start >= VOLUME_RESTORE_SECONDS:
                 raise CalibrationError("Incremental volume restoration exceeded its step/time limit.")
             self.relative_step(direction, quick=quick)
             was_quick, previous_direction = quick, direction
@@ -729,9 +828,9 @@ class CalibrationSession:
         if first["raw"] >= ceiling:
             raise CalibrationError("There is no usable raw range above the TV minimum.")
         upward = [first]
-        start = time.monotonic()
+        start = self.now()
         while upward[-1]["raw"] < ceiling and upward[-1]["tv"] < self.peers["tv"].state["maximum"]:
-            if len(upward) > MAX_VOLUME_STEPS or time.monotonic() - start >= SWEEP_SECONDS:
+            if len(upward) > MAX_VOLUME_STEPS or self.now() - start >= SWEEP_SECONDS:
                 raise CalibrationError("Upward sweep exceeded its step/time limit.")
             self.relative_step(1)
             row = observe()
@@ -742,11 +841,11 @@ class CalibrationSession:
         # Cross each missing integer twice from BOTH directions. A target found
         # during positioning is measured too; any command error is inconclusive,
         # never evidence that the raw value is unreachable.
-        gap_start = time.monotonic()
+        gap_start = self.now()
         gap_steps = 0
         def step(direction):
             nonlocal gap_steps
-            if gap_steps >= 2048 or time.monotonic() - gap_start >= 1800:
+            if gap_steps >= 2048 or self.now() - gap_start >= 1800:
                 raise CalibrationError("Gap verification exceeded its 2048-step/30-minute budget.")
             current = self.guard(require_windows_mute=True)[0]["raw_volume"]
             if (direction > 0 and current >= top) or (direction < 0 and current <= 0):
@@ -795,7 +894,17 @@ class CalibrationSession:
         self.progress("Restoring original settings; cancellation is paused until cleanup finishes.")
         self.windows.set(True)
         # Verify the current device pairing before issuing device mutations.
-        self.guard()
+        a, _ = self.guard()
+        if self.saved["speaker_state"] is not None and self.speaker_state(a) != (False, False):
+            try:
+                self.request("amplifier", "set_speakers", [False, False])
+                self.wait(lambda a, t: self.speaker_state(a) == (False, False),
+                          "Checking speaker isolation before volume restoration", windows_muted=True,
+                          timeout_error=IsolationUnverified)
+            except (OperationRejected, IsolationUnverified) as error:
+                self.pump()
+                self.guard(require_windows_mute=True)
+                self.progress(f"Cleanup cannot verify speaker isolation: {error}. Keeping sources silent is required.")
         self.cec_quiet("Waiting for pending CEC activity to settle before session restoration")
         self.seek_volume(self.saved["amplifier_volume"], self.saved["tv_volume"])
         self.wait(lambda a, t: t["volume"] == self.saved["tv_volume"]
@@ -804,6 +913,9 @@ class CalibrationSession:
         self.request("tv", "set_mute", self.saved["tv_mute"])
         self.wait(lambda a, t: a["mute"] == self.saved["amplifier_mute"] and t["mute"] == self.saved["tv_mute"],
                   "Verifying restored TV and amplifier mute")
+        # Re-enabling the original outputs is intentional only after safe volume/mute verification.
+        self._isolation_verified = False
+        self.restore_speakers()
         self.windows.set(self.saved["windows_mute"])
         self.restoration_verified = True
         self.progress("Original volume and mute settings verified. Windows mute restored last.")
@@ -828,6 +940,7 @@ class CalibrationSession:
             ceiling = self.amplifier_ceiling()
             self.capture()
             self.windows.set(True)
+            self.isolate_speakers()
             self.calibration_sweep(ceiling)
         except Exception as error:
             failure = error
@@ -865,31 +978,47 @@ class CalibrationSession:
         if self.pending_mapping is None or not self.restoration_verified:
             raise CalibrationError("Calibration did not complete; saved mapping unchanged.")
         write_mapping(self.path, self.pending_mapping)
-        return "Calibration completed, original settings restored, and mapping saved."
+        return "Calibration completed, original settings restored, and mapping saved." + self.isolation_summary()
 
 
 class SessionWorker(QThread):
     progress = Signal(str)
     cleanup_started = Signal()
     completed = Signal(str)
+    isolation_warning = Signal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.cancel = threading.Event()
+        self._isolation_answer = threading.Event()
+        self._continue_unisolated = False
+
+    def answer_isolation(self, accepted):
+        self._continue_unisolated = accepted
+        self._isolation_answer.set()
+
+    def confirm_isolation(self, reason, pump):
+        self._isolation_answer.clear()
+        self.isolation_warning.emit(reason)
+        while not self._isolation_answer.wait(0.05):
+            pump()  # Maintain device status and both leases during the dialog.
+        return self._continue_unisolated
 
     def run(self):
+        session = CalibrationSession(
+            self.cancel, self.progress.emit, silent_source_confirmed=True,
+            cleanup_started=self.cleanup_started.emit, confirm_isolation=self.confirm_isolation)
         try:
-            message = CalibrationSession(
-                self.cancel, self.progress.emit, silent_source_confirmed=True,
-                cleanup_started=self.cleanup_started.emit).run()
+            message = session.run()
         except Exception as error:
-            message = str(error)
+            message = str(error) + session.isolation_summary()
         self.completed.emit(message)
 
 
 class CalibrationWindow(QWidget):
     def __init__(self):
         super().__init__()
+        self._isolation_box = None
         self.worker = None
         self.cleaning_up = False
         self.has_mapping = False
@@ -901,7 +1030,8 @@ class CalibrationWindow(QWidget):
             "and start at a comfortable volume below its API ceiling. Select a TV input/source that plays NO sound "
             "and stop all other playback. Keep the same Windows audio output selected. "
             "Windows mute does not silence the TV or other amplifier sources.\n\n"
-            "Volume changes can automatically unmute the TV and amplifier. Windows alone is muted. "
+            "Volume changes can automatically unmute the TV and amplifier. The helper mutes Windows and tries to disable amplifier speaker outputs. "
+            "If isolation cannot be verified, it asks once whether to continue without it. "
             "The sweep starts at the TV minimum and goes to the amplifier API ceiling or TV maximum, "
             "then attempts to restore your original settings. The upper range can be VERY LOUD if the source becomes active. "
             "Do not use physical device controls during the test.")
@@ -967,6 +1097,7 @@ class CalibrationWindow(QWidget):
         self.activity.setRange(0, 0)
         self.worker = SessionWorker(self)
         self.worker.progress.connect(self.log.append)
+        self.worker.isolation_warning.connect(self.show_isolation_warning)
         self.worker.cleanup_started.connect(self.show_restoring)
         self.worker.completed.connect(self.completed)
         self.worker.finished.connect(self.finished)
@@ -979,15 +1110,36 @@ class CalibrationWindow(QWidget):
             self.start.setText("Cancelling…")
             self.log.append("Cancellation requested; the current command will settle before original settings are restored.")
 
+    def show_isolation_warning(self, reason):
+        worker = self.worker
+        box = QMessageBox(self)
+        self._isolation_box = box
+        box.setIcon(QMessageBox.Warning)
+        box.setWindowTitle("Speaker isolation not verified")
+        box.setText(reason + "\n\nThe amplifier may produce sound as volume rises. Keep the TV on a silent source "
+                    "and stop all other playback. Continuing accepts this reduced protection for the entire sweep; "
+                    "further speaker changes are logged without more isolation prompts.")
+        proceed = box.addButton("Continue without speaker isolation", QMessageBox.AcceptRole)
+        cancel = box.addButton(QMessageBox.Cancel)
+        box.setDefaultButton(cancel)
+        box.exec()
+        worker.answer_isolation(box.clickedButton() is proceed)
+        self._isolation_box = None
+        box.deleteLater()
+
     def show_restoring(self):
+        if self._isolation_box is not None:
+            self._isolation_box.reject()
         self.cleaning_up = True
         self.start.setText("Restoring original settings…")
         self.start.setEnabled(False)
 
     def completed(self, message):
+        if self._isolation_box is not None:
+            self._isolation_box.reject()
         self.log.append(message)
         self.log.append(POST_SWEEP_WARNING)
-        QMessageBox.warning(self, "Check volume and mute settings", message + "\n\n" + POST_SWEEP_WARNING)
+        QMessageBox.warning(self, "Check audio settings", message + "\n\n" + POST_SWEEP_WARNING)
 
     def finished(self):
         self.worker.deleteLater()

@@ -8,7 +8,7 @@ import runpy
 import tempfile
 import threading
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 ROOT = Path(__file__).resolve().parents[1]
 HELPER = runpy.run_path(str(ROOT / "VolumeCalibration.pyw"), run_name="calibration_tests")
@@ -48,6 +48,10 @@ class Devices:
         self.tv_max = 100
         self.tv_lag = 0.0
         self.input = "tv"
+        self.speakers = (True, False)
+        self.speaker_outputs = ["a", "b"]
+        self.isolation_rejected = False
+        self.speaker_restore_rejected = False
         self.muted = muted
         self.windows_muted = windows_muted
         self.original = (self.raw, self.tv, muted, windows_muted)
@@ -100,7 +104,9 @@ class Devices:
         common = {"online": True, "calibration_active": peer.acquired,
                   "sample_id": sample, "mute": self.muted, "device_id": role + "-id"}
         if role == "amplifier":
-            common.update(power="on", input=self.input, raw_volume=self.raw, raw_max_volume=self.ceiling)
+            common.update(power="on", input=self.input, raw_volume=self.raw, raw_max_volume=self.ceiling,
+                          speaker_outputs=self.speaker_outputs, speaker_state=list(self.speakers),
+                          speaker_valid_for_ms=6000)
         else:
             common.update(power="active", volume=self.tv, minimum=0, maximum=self.tv_max, relative_volume=True)
         return common
@@ -181,6 +187,15 @@ class FakePeer:
             self.devices.move(args["value"])
         elif action == "set_mute":
             self.devices.muted = args["value"]
+        elif action == "set_speakers":
+            target = tuple(args['value'])
+            ok = not (self.devices.isolation_rejected and target == (False, False))
+            ok = ok and not (self.devices.speaker_restore_rejected and self.devices.restoring)
+            if ok:
+                def apply():
+                    self.devices.speakers = target
+                    self.devices.trace.append((self.devices.clock.monotonic(), 'speakers', target))
+                self.devices.clock.later(0.1, apply)
         # Acquisition flags are updated by the real session's request method.
         if not self.devices.drop_ack or not self.devices.drop_ack(self.role, action):
             self.results[self.sequence] = {"ok": ok, "error": "Fake lease rejected" if not ok else ""}
@@ -513,6 +528,124 @@ class SessionTests(unittest.TestCase):
         self.assert_restored()
         self.assertEqual(self.session.pending_mapping['lookup'][3]['source'], 'measured')
         self.assertEqual(HELPER['load_mapping'](self.path)['estimated_amplifier_raw_volumes'], [])
+
+    def test_speakers_off_before_sweep_and_restored_after_volume_before_windows(self):
+        message = self.session.run()
+        self.assertNotIn('without verified speaker isolation', message)
+        trace = self.devices.trace
+        off = next(i for i, row in enumerate(trace) if row[1:3] == ('speakers', (False, False)))
+        first_volume = next(i for i, row in enumerate(trace) if row[1] == 'volume_command')
+        restored = max(i for i, row in enumerate(trace) if row[1:3] == ('speakers', (True, False)))
+        last_volume = max(i for i, row in enumerate(trace) if row[1] == 'volume_command')
+        windows = max(i for i, row in enumerate(trace) if row[1] == 'windows_mute')
+        self.assertLess(off, first_volume)
+        self.assertGreater(restored, last_volume)
+        self.assertLess(restored, windows)
+        self.assertEqual(self.devices.speakers, (True, False))
+        self.assert_restored()
+
+    def test_unsupported_isolation_can_continue_with_one_explicit_decision(self):
+        self.devices.speaker_outputs = []
+        self.session.confirm_isolation = Mock(return_value=True)
+        message = self.session.run()
+        self.session.confirm_isolation.assert_called_once()
+        self.assertIn('without verified speaker isolation', message)
+        self.assertFalse(any(row[1:3] == ('amplifier', 'set_speakers') for row in self.devices.trace))
+        self.assert_restored()
+
+    def test_declining_isolation_warning_cancels_without_sweeping(self):
+        self.devices.speaker_outputs = []
+        self.session.confirm_isolation = Mock(return_value=False)
+        with self.assertRaises(HELPER['Cancelled']):
+            self.session.run()
+        self.session.confirm_isolation.assert_called_once()
+        self.assertFalse(any(row[1] == 'volume_command' for row in self.devices.trace))
+        self.assert_previous_preserved()
+        self.assert_restored()
+
+    def test_completed_off_rejection_can_continue_and_restore_original_outputs(self):
+        self.devices.isolation_rejected = True
+        self.session.confirm_isolation = Mock(return_value=True)
+        self.session.run()
+        self.session.confirm_isolation.assert_called_once()
+        self.assertEqual(self.devices.speakers, (True, False))
+        self.assert_restored()
+
+    def test_repeated_isolation_loss_is_warned_only_once(self):
+        def behavior(devices, direction):
+            if not devices.restoring:
+                devices.speakers = (bool(devices.moves % 2), False)
+            return False
+        self.devices.behavior = behavior
+        self.session.confirm_isolation = Mock(return_value=True)
+        message = self.session.run()
+        self.session.confirm_isolation.assert_called_once()
+        self.assertIn('without verified speaker isolation', message)
+        self.assertGreater(self.devices.moves, 5)
+        self.assertEqual(self.devices.speakers, (True, False))
+        self.assert_restored()
+
+    def test_long_isolation_decision_renews_leases_and_pauses_step_deadlines(self):
+        def behavior(devices, direction):
+            if not devices.restoring:
+                devices.speakers = (True, False)
+            return False
+        def decide(reason, pump):
+            for _ in range(500):
+                pump()
+            return True
+        self.devices.behavior = behavior
+        self.session.confirm_isolation = Mock(side_effect=decide)
+        self.session.run()
+        self.session.confirm_isolation.assert_called_once()
+        self.assertGreater(self.session._prompt_pause_total, 30)
+        self.assertGreater(sum(row[2] == 'renew' for row in self.devices.trace if row[1] in ('tv', 'amplifier')), 15)
+        self.assert_restored()
+
+    def test_connection_loss_during_warning_still_aborts(self):
+        self.devices.speaker_outputs = []
+        def decide(reason, pump):
+            self.devices.peers['amplifier'].socket.abort()
+            pump()
+            return True
+        self.session.confirm_isolation = decide
+        with self.assertRaises(HELPER['CalibrationError']):
+            self.session.run()
+        self.assertTrue(self.devices.windows_muted)
+        self.assert_previous_preserved()
+        self.assert_released()
+
+    def test_uncertain_speaker_command_timeout_is_not_a_continue_case(self):
+        self.devices.drop_ack = lambda role, action: role == 'amplifier' and action == 'set_speakers' and not self.devices.restoring
+        self.session.confirm_isolation = Mock(return_value=True)
+        with self.assertRaises(HELPER['CalibrationError']):
+            self.session.run()
+        self.session.confirm_isolation.assert_not_called()
+        self.assert_previous_preserved()
+        self.assert_released()
+
+    def test_volume_restore_failure_never_reenables_speakers(self):
+        original = self.session.seek_volume
+        def seek(*args, **kwargs):
+            if self.session.restoring:
+                raise HELPER['CalibrationError']('Restore could not be verified')
+            return original(*args, **kwargs)
+        self.session.seek_volume = seek
+        with self.assertRaises(HELPER['CalibrationError']):
+            self.session.run()
+        self.assertEqual(self.devices.speakers, (False, False))
+        self.assertTrue(self.devices.windows_muted)
+        self.assert_previous_preserved()
+
+    def test_speaker_restoration_failure_is_reported_and_windows_stays_muted(self):
+        self.devices.speaker_restore_rejected = True
+        with self.assertRaises(HELPER['CalibrationError']):
+            self.session.run()
+        self.assertEqual((self.devices.raw, self.devices.tv), self.devices.original[:2])
+        self.assertEqual(self.devices.speakers, (False, False))
+        self.assertTrue(self.devices.windows_muted)
+        self.assert_previous_preserved()
+
 
 
 class MappingTests(unittest.TestCase):

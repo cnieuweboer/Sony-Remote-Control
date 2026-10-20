@@ -2,6 +2,10 @@
 
 Release identifiers below come from the corresponding commits. Some releases updated only the calibration helper; the remote and helper can therefore have different version numbers. Historical behavior may have been superseded by later releases.
 
+## 2026-10-20
+
+- Calibration helper 2026.10.20.3 — Verify amplifier speaker isolation before the sweep, offer one explicit Continue/Cancel choice if unavailable or lost, and keep leases alive during the decision. Restore volume and mute before speaker outputs and Windows mute; preserve the previous mapping on failed cleanup. Add fake-device and Qt coverage. Sony Remote remains 2026.10.19.20.
+
 ## 2026-10-19
 
 - Sony Remote 2026.10.19.20 — Add optional Windows SMTC routing for Play, Pause, Stop, Next, and Previous with `SMTCPlaybackKeys` (default false). Disable their focused interception in this mode, preserve volume/amplifier routing, and reuse the existing polling timer while hidden. Add lazy optional imports, clear startup warnings, Qt-thread callback delivery, serialized commands, safe session cleanup/restart recovery, and fake-SDK integration tests.
