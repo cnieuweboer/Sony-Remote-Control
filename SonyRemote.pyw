@@ -492,7 +492,7 @@ class CalibrationServer(QObject):
 APP_NAME = "Sony Remote"
 
 
-__version__ = "2026.10.20.2"
+__version__ = "2026.10.20.3"
 
 
 CONFIG_PATH = Path(__file__).resolve().with_name("SonyRemote.json")
@@ -2466,22 +2466,29 @@ class SonyRemote(QMainWindow):
 
     def _apply_style(self):
         # Leave colors and control rendering to the platform's Qt style.
-        # Only geometry/typography and the optional Mica surface are customized.
+        # Geometry/typography and the optional Windows Mica section surfaces are customized.
         for kind in (QPushButton, QComboBox):
             for control in self.findChildren(kind):
                 control.setMinimumHeight(max(34, control.minimumHeight()))
         background = "transparent" if self.mica_enabled else "palette(window)"
+        # mica_enabled is only true on supported Windows versions.
+        section_fill = ""
+        if self.mica_enabled:
+            color = "rgba(38, 38, 38, 185)" if self.config["DarkMode"] else "rgba(255,255,255,190)"
+            section_fill = f"background: {color};"
         self.setStyleSheet("""
             ROOT_SELECTOR { background: BACKGROUND; }
             QWidget { font-size: 9pt; }
             QFrame#section {
+                SECTION_FILL
                 border: 1px solid palette(mid);
                 border-radius: 8px;
             }
+            QPushButton, QComboBox { padding: 5px 7px; }
             QLabel { background: transparent; }
             QLabel#sectionTitle { font-weight: 600; }
             QLabel#volumeValue { font-size: 13pt; font-weight: 600; }
-        """.replace("ROOT_SELECTOR", "QMainWindow, QWidget#central").replace("BACKGROUND", background))
+        """.replace("ROOT_SELECTOR", "QMainWindow, QWidget#central").replace("BACKGROUND", background).replace("SECTION_FILL", section_fill))
 
     # ----------------------------
     # Background work
@@ -3822,7 +3829,7 @@ def _run_application():
     show_missing_config_settings(config)
     app.setQuitOnLastWindowClosed(window.tray is None)
     app.aboutToQuit.connect(window._shutdown)
-    # Re-resolve palette roles cached by Qt's stylesheet layer after a native theme update.
+    # Refresh Qt palette roles without changing the explicit JSON light/dark selection.
     app.paletteChanged.connect(lambda palette: window._apply_style())
     window._fit_and_lock_window()
     show_startup_window(window, config)

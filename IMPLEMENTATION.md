@@ -266,3 +266,8 @@ Configuration replacements receive one-shot internal arguments containing Qt's s
 ## Native Qt light/dark appearance
 
 The application requests `QStyleHints.setColorScheme()` before constructing its window, using `DarkMode` to select Dark or Light. This requires PySide6/Qt 6.8 or newer. The platform style and application palette remain Qt-managed, including system-theme notifications. The application palette-change signal reapplies layout styling so the stylesheet layer cannot retain resolved colors from the old palette; no Fusion style or fixed light/dark color palette is installed. The previous DWM dark-title-bar override is removed so Qt owns native theme selection. Stylesheets retain font sizing, section outlines using the palette's mid role, and optional transparent Mica surfaces, without overriding button, text, selection, hover, or disabled colors. The existing centered combobox painting and live popup animation remain in use. Platform support varies; the initial target is Windows, with native appearance and live Windows theme switching checked manually.
+
+
+### Native theme follow-up
+
+`DarkMode` explicitly selects the app scheme; switching the desktop scheme does not replace that selection. The palette-change callback only refreshes Qt-supplied colors cached by stylesheet processing. Compact 5 px vertical/7 px horizontal padding restores the former control sizing without overriding native control colors. When Windows Mica is active, section backgrounds again use the previous translucent dark/light fills; otherwise sections inherit the platform surface.

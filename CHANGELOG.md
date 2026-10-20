@@ -4,6 +4,8 @@ Release identifiers below come from the corresponding commits. Some releases upd
 
 ## 2026-10-20
 
+- 2026.10.20.3 — Restore compact control padding so native playback-button size hints do not widen Sony layouts. Restore previous dark/light section fills only with Windows Mica; retain Qt-managed control colors and explicit JSON theme selection.
+
 - 2026.10.20.2 — Request light/dark appearance through Qt 6.8+ platform integration. Remove fixed control colors and the manual dark title-bar override; retain layout, typography, Mica support, and live dropdown animation. Windows appearance and live desktop-theme changes require visual verification.
 
 - 2026.10.20.1 — Preserve Qt window geometry and visible/minimized/tray state across configuration restarts. Startup-in-tray arguments apply only to the initial launch; disabling tray support makes a hidden replacement visible.
