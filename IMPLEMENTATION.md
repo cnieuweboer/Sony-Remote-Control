@@ -283,3 +283,12 @@ With Windows Mica active, all buttons, comboboxes, and text input now share the 
 The helper allows five minutes of real monotonic time for an isolation decision, with Cancel still the default. The worker continues pumping peer state and renewing leases while waiting; the prompt duration is excluded from sweep/volume-step deadlines. Expiry logs “Speaker isolation decision timed out” and raises cancellation. A timeout during the sweep enters the existing single restoration pass and closes the dialog; one during restoration ends cleanup as unverified, closes the dialog on completion, preserves the mapping, and leaves Windows muted where possible. No restoration retry or second isolation prompt is introduced.
 
 Initial warnings distinguish missing speaker-support fields (suggest updating the amplifier remote), an explicit empty capability list (no controllable outputs), and unavailable/stale/invalid current state. Existing lost-isolation, command-rejection, and verification-timeout explanations remain distinct. Malformed information is not described as merely an older remote. Dialog/worker tests exercise the actual Qt timeout-close handoff both before and during cleanup; fake-device tests cover reason selection, cancellation restoration, and cleanup-time expiry.
+
+
+### Early Qt compatibility check
+
+Immediately after creating QApplication, startup checks for `QStyleHints.setColorScheme` before acquiring the instance lock or reading device configuration. If unavailable, it displays the PySide6 6.8+ requirement and upgrade command, then exits without starting device work. Feature detection avoids version-string parsing and silent theme fallback.
+
+### Protocol feedback recovery
+
+The amplifier consumer distinguishes errors validating state messages, errors validating acknowledgements, and unattributed framing/version/unknown-message errors. A fresh valid state clears only connection and state-protocol feedback. A valid acknowledgement for a pending command clears ack-protocol feedback; a rejection can then replace it with command-rejection feedback, while queue-full remains silent. Unattributed errors retain the existing accepted-command recovery rule. Expired state and unsolicited acknowledgements cannot prove recovery. No recovery path resends or reroutes commands.

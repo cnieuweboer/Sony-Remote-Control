@@ -20,7 +20,7 @@ from pathlib import Path
 from xml.sax.saxutils import escape
 from PySide6.QtCore import QByteArray, QEasingCurve, QElapsedTimer, QRect, QEvent, QFileSystemWatcher, QLockFile, QObject, QProcess, QRunnable, Qt, QThreadPool, QTimer, Signal
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
-from PySide6.QtGui import QAction, QColor, QPalette
+from PySide6.QtGui import QAction, QPalette, QStyleHints
 from PySide6.QtWidgets import (
     QApplication, QComboBox, QDialogButtonBox, QFrame, QGridLayout, QHBoxLayout, QLabel,
     QMainWindow, QMenu, QMessageBox, QPushButton, QProxyStyle, QStyle, QTextEdit,
@@ -85,6 +85,7 @@ class AmplifierClient(QObject):
     state_changed = Signal(object)
     command_failed = Signal(str, str)
     command_succeeded = Signal()
+    command_acknowledged = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -139,15 +140,17 @@ class AmplifierClient(QObject):
             self.retry.start()
 
     def _read(self):
+        message_type = None
         try:
             for message in _ipc_frames(self.socket, self.buffer):
-                if message.get("type") == "state":
+                message_type = message.get("type")
+                if message_type == "state":
                     self._validate_state(message)
                     self.state = message
                     self.state_deadline = time.monotonic() + message["valid_for_ms"] / 1000
                     self.lease.start(max(1, message["valid_for_ms"]))
                     self.state_changed.emit(message)
-                elif message.get("type") == "ack":
+                elif message_type == "ack":
                     if type(message.get("id")) is not int or type(message.get("accepted")) is not bool:
                         raise ValueError("Invalid command acknowledgement")
                     reason = message.get("reason", "")
@@ -157,6 +160,7 @@ class AmplifierClient(QObject):
                     if timer is not None:
                         timer.stop()
                         timer.deleteLater()
+                        self.command_acknowledged.emit()
                         if message["accepted"]:
                             self.command_succeeded.emit()
                         elif reason != "queue_full":
@@ -168,7 +172,9 @@ class AmplifierClient(QObject):
             record_exception(error, "Amplifier protocol", deduplicate=True)
             self.socket.abort()
             self._lost()
-            self.command_failed.emit("Incompatible amplifier protocol. Update both remotes together. Commands were not retried.", "protocol")
+            category = ("protocol_state" if message_type == "state" else
+                        "protocol_ack" if message_type == "ack" else "protocol")
+            self.command_failed.emit("Incompatible amplifier protocol. Update both remotes together. Commands were not retried.", category)
 
     @staticmethod
     def _validate_state(message):
@@ -492,7 +498,7 @@ class CalibrationServer(QObject):
 APP_NAME = "Sony Remote"
 
 
-__version__ = "2026.10.20.5"
+__version__ = "2026.10.20.7"
 
 
 CONFIG_PATH = Path(__file__).resolve().with_name("SonyRemote.json")
@@ -2032,6 +2038,7 @@ class SonyRemote(QMainWindow):
         self.amplifier_client.state_changed.connect(self._amplifier_state_changed)
         self.amplifier_client.command_failed.connect(self._show_amplifier_error)
         self.amplifier_client.command_succeeded.connect(self._clear_amplifier_error)
+        self.amplifier_client.command_acknowledged.connect(self._amplifier_acknowledged)
         self._build_ui()
         self._apply_style()
         self._setup_timers()
@@ -3049,7 +3056,7 @@ class SonyRemote(QMainWindow):
 
     def _amplifier_state_changed(self, state):
         self.amplifier_state = state
-        if (self._amplifier_error_category == "connection" and state
+        if (self._amplifier_error_category in ("connection", "protocol_state") and state
                 and state["valid_for_ms"] > 0 and self.amplifier_client.state_is_fresh):
             self._clear_amplifier_error()
         routed = self._use_amplifier()
@@ -3068,6 +3075,10 @@ class SonyRemote(QMainWindow):
             enabled = not self._shutting_down and (self._use_amplifier() or (self.initialized and self.last_power == "active"))
             for widget in (self.volume_up, self.volume_down, self.mute_button):
                 widget.setEnabled(enabled)
+
+    def _amplifier_acknowledged(self):
+        if self._amplifier_error_category == "protocol_ack":
+            self._clear_amplifier_error()
 
     def _show_amplifier_error(self, message, category="command"):
         # Match background feedback without changing the TV state or opening a dialog.
@@ -3823,6 +3834,17 @@ def launch_replacement(window=None):
         raise OSError("The replacement process could not be started.")
 
 
+def check_qt_theme_support():
+    if hasattr(QStyleHints, "setColorScheme"):
+        return True
+    command = 'py' if sys.platform == "win32" else 'python3'
+    QMessageBox.critical(
+        None, APP_NAME,
+        "PySide6 6.8 or newer is required for light/dark appearance.\n\n"
+        f'Upgrade with:\n{command} -m pip install --upgrade "PySide6>=6.8"')
+    return False
+
+
 def configure_app_theme(config):
     # Qt 6.8+ forwards this override to supported platform theme backends.
     QApplication.styleHints().setColorScheme(
@@ -3831,6 +3853,8 @@ def configure_app_theme(config):
 
 def _run_application():
     app = QApplication(sys.argv)
+    if not check_qt_theme_support():
+        return 1
     app.setStyle(TooltipDelayStyle())
     try:
         acquired = acquire_single_instance()

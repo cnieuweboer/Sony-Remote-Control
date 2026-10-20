@@ -278,12 +278,12 @@ class DiscoveryTests(unittest.TestCase):
         timer.stop.assert_called_once()
         self.window.show_error.assert_not_called()
 
-    def test_only_connection_feedback_clears_on_fresh_amplifier_state(self):
+    def test_connection_and_state_protocol_feedback_clear_on_fresh_amplifier_state(self):
         self.start_and_settle()
         client = self.window.amplifier_client
         state = json.loads((ROOT / 'tests/fixtures/amplifier_protocol_v1.json').read_text())['states'][0]
         with patch.object(client, 'send_command') as send:
-            for category in ('connection', 'timeout', 'rejection', 'protocol'):
+            for category in ('connection', 'timeout', 'rejection', 'protocol', 'protocol_state', 'protocol_ack'):
                 with self.subTest(category=category):
                     # Identical wording proves recovery uses the category.
                     client.command_failed.emit('Previous amplifier error.', category)
@@ -291,11 +291,32 @@ class DiscoveryTests(unittest.TestCase):
                                     _ipc_frames=lambda socket, buffer: [state]):
                         client._read()
                     text = self.window.power_button.toolTip()
-                    self.assertEqual('Previous amplifier error.' in text, category != 'connection')
+                    self.assertEqual('Previous amplifier error.' in text, category not in ('connection', 'protocol_state'))
             send.assert_not_called()
         client.command_succeeded.emit()
         self.assertNotIn('Previous amplifier error.', self.window.power_button.toolTip())
         self.window.show_error.assert_not_called()
+
+    def test_pending_ack_clears_only_ack_protocol_feedback_without_sending(self):
+        self.start_and_settle()
+        client = self.window.amplifier_client
+        with patch.object(client, 'send_command') as send:
+            for category in ('protocol_ack', 'protocol_state', 'protocol', 'timeout', 'rejection'):
+                client.command_failed.emit('Previous amplifier error.', category)
+                client.pending[1] = Mock()
+                with patch.dict(REMOTE['AmplifierClient']._read.__globals__,
+                                _ipc_frames=lambda socket, buffer: [
+                                    {'version': 1, 'type': 'ack', 'id': 1, 'accepted': False, 'reason': 'queue_full'}]):
+                    client._read()
+                self.assertEqual('Previous amplifier error.' in self.window.power_button.toolTip(),
+                                 category != 'protocol_ack')
+            client.command_failed.emit('Previous amplifier error.', 'protocol_ack')
+            with patch.dict(REMOTE['AmplifierClient']._read.__globals__,
+                            _ipc_frames=lambda socket, buffer: [
+                                {'version': 1, 'type': 'ack', 'id': 999, 'accepted': True}]):
+                client._read()
+            self.assertIn('Previous amplifier error.', self.window.power_button.toolTip())
+            send.assert_not_called()
 
     def test_expired_or_invalid_state_does_not_clear_connection_feedback(self):
         self.start_and_settle()

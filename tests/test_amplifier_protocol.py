@@ -72,7 +72,7 @@ class ClientContractTests(unittest.TestCase):
             state=None, state_deadline=0, lease=Mock(), state_changed=Mock(),
             pending={1:Mock()} if pending else {}, _lost=Mock(),
             _validate_state=REMOTE['AmplifierClient']._validate_state,
-            command_failed=Mock(), command_succeeded=Mock())
+            command_failed=Mock(), command_succeeded=Mock(), command_acknowledged=Mock())
 
     def read(self, client):
         REMOTE['AmplifierClient']._read(client)
@@ -109,12 +109,14 @@ class ClientContractTests(unittest.TestCase):
         client = self.client(FIXTURE['acks'][0], pending=False)
         self.read(client)
         client.command_succeeded.emit.assert_not_called()
+        client.command_acknowledged.emit.assert_not_called()
 
     def test_malformed_protocol_is_reported_even_without_pending_commands(self):
         bad_messages = [dict(FIXTURE['acks'][0], reason=None),
                         dict(FIXTURE['acks'][0], accepted=1),
                         dict(FIXTURE['states'][0], volume_unit='invalid'),
-                        {'version':2, 'type':'state'}]
+                        {'version':2, 'type':'state'},
+                        {'version':1, 'type':[]}]
         function_globals = REMOTE['AmplifierClient']._read.__globals__
         for message in bad_messages:
             client = self.client(message, pending=False)
@@ -125,6 +127,19 @@ class ClientContractTests(unittest.TestCase):
             client.socket.abort.assert_called_once()
             client._lost.assert_called_once()
             self.assertIn('Incompatible amplifier protocol', client.command_failed.emit.call_args.args[0])
+
+    def test_protocol_errors_are_attributed_only_after_framing_validation(self):
+        cases = [(dict(FIXTURE['states'][0], mute='invalid'), 'protocol_state'),
+                 (dict(FIXTURE['acks'][0], accepted=1), 'protocol_ack'),
+                 ({'version': 2, 'type': 'state'}, 'protocol'),
+                 ({'version': 1, 'type': 'unknown'}, 'protocol'),
+                 ({'version': 1, 'type': []}, 'protocol')]
+        for message, category in cases:
+            with self.subTest(category=category), patch.dict(
+                    REMOTE['AmplifierClient']._read.__globals__, record_exception=Mock()):
+                client = self.client(message)
+                self.read(client)
+                self.assertEqual(client.command_failed.emit.call_args.args[1], category)
 
     def test_repeated_protocol_failures_are_deduplicated_in_diagnostics(self):
         # Exercise recording without opening a runtime log or installing hooks.

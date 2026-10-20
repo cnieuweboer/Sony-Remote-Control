@@ -125,6 +125,17 @@ class TrayStartupTests(unittest.TestCase):
         self.assertEqual(sum(a.startswith('--restart-window-geometry=') for a in args), 1)
         self.assertIn('--restart-window-state=tray', args)
 
+    def test_missing_theme_api_exits_before_lock_config_or_device_startup(self):
+        with patch.dict(GLOBALS, QStyleHints=object), \
+                patch.object(REMOTE['QMessageBox'], 'critical') as error:
+            self.assertEqual(REMOTE['_run_application'](), 1)
+        self.acquire.assert_not_called()
+        self.config_loader.assert_not_called()
+        self.constructor.assert_not_called()
+        self.assertIn('6.8', error.call_args.args[2])
+        self.assertIn('pip install --upgrade', error.call_args.args[2])
+        self.application.exec.assert_not_called()
+
     def test_flag_with_tray_settings_starts_hidden_without_a_show_event(self):
         self.run_startup('--start-in-tray')
         self.assertFalse(self.window.isVisible())
