@@ -273,3 +273,6 @@ The application requests `QStyleHints.setColorScheme()` before constructing its 
 `DarkMode` explicitly selects the app scheme; switching the desktop scheme does not replace that selection. The palette-change callback only refreshes Qt-supplied colors cached by stylesheet processing. Compact 5 px vertical/7 px horizontal padding restores the former control sizing without overriding native control colors. When Windows Mica is active, section backgrounds again use the previous translucent dark/light fills; otherwise sections inherit the platform surface.
 
 With Windows Mica active, the power/standby button also uses an opaque dark/light fill and matching hover/pressed fills to prevent the backdrop showing through. This override is scoped to its object name; other buttons remain native.
+
+
+With Windows Mica active, all buttons, comboboxes, and text input now share the former dark/light control colors and borders, using opaque fills to prevent backdrop effects within controls. Hover, pressed, disabled, and dropdown selection states are explicitly styled; dropdown surfaces use the previous 40/250 grayscale colors. This replaces the narrower power-button override. Non-Mica configurations keep Qt-managed control palettes.

@@ -492,7 +492,7 @@ class CalibrationServer(QObject):
 APP_NAME = "Sony Remote"
 
 
-__version__ = "2026.10.20.4"
+__version__ = "2026.10.20.5"
 
 
 CONFIG_PATH = Path(__file__).resolve().with_name("SonyRemote.json")
@@ -2224,7 +2224,6 @@ class SonyRemote(QMainWindow):
         self.main_layout.setSpacing(9)
 
         self.power_button = QPushButton("Connecting...")
-        self.power_button.setObjectName("powerButton")
         self.power_button.setMinimumHeight(38)
         self.power_button.clicked.connect(self.toggle_power)
         self.main_layout.addWidget(self.power_button)
@@ -2474,37 +2473,59 @@ class SonyRemote(QMainWindow):
         background = "transparent" if self.mica_enabled else "palette(window)"
         # mica_enabled is only true on supported Windows versions.
         section_fill = ""
-        power_fill = ""
+        mica_controls = ""
         if self.mica_enabled:
-            color = "rgba(38, 38, 38, 185)" if self.config["DarkMode"] else "rgba(255,255,255,190)"
-            section_fill = f"background: {color};"
-            normal, hover, pressed = (("48,48,48", "68,68,68", "38,38,38")
-                                      if self.config["DarkMode"] else
+            dark = self.config["DarkMode"]
+            surface = "rgba(38,38,38,185)" if dark else "rgba(255,255,255,190)"
+            section_border = "rgba(120,120,120,110)" if dark else "rgba(0,0,0,25)"
+            section_fill = f"background: {surface}; border-color: {section_border};"
+            normal, hover, pressed = (("48,48,48", "68,68,68", "38,38,38") if dark else
                                       ("255,255,255", "245,245,245", "235,235,235"))
-            power_fill = f"""
-                QPushButton#powerButton {{
+            text = "235,235,235" if dark else "20,20,20"
+            border = "rgba(120,120,120,150)" if dark else "rgba(0,0,0,35)"
+            menu = "40,40,40" if dark else "250,250,250"
+            menu_border = "120,120,120" if dark else "180,180,180"
+            selection = "80,110,170" if dark else "210,225,250"
+            # Opaque control surfaces prevent native Mica treatment showing through.
+            mica_controls = f"""
+                QPushButton, QComboBox, QTextEdit {{
                     background-color: rgb({normal});
-                    border: 1px solid palette(mid);
+                    color: rgb({text});
+                    border: 1px solid {border};
                     border-radius: 7px;
+                    padding: 5px 7px;
                 }}
-                QPushButton#powerButton:hover {{ background-color: rgb({hover}); }}
-                QPushButton#powerButton:pressed {{ background-color: rgb({pressed}); }}
-                QPushButton#powerButton:disabled {{ background-color: rgb({normal}); }}
+                QComboBox::drop-down {{
+                    border: none; background: transparent; width: 20px;
+                }}
+                QPushButton:hover, QComboBox:hover {{ background-color: rgb({hover}); }}
+                QPushButton:pressed {{ background-color: rgb({pressed}); }}
+                QPushButton:disabled, QComboBox:disabled, QTextEdit:disabled {{
+                    background-color: rgb({normal});
+                    color: rgba({text},100);
+                }}
+                QComboBox QAbstractItemView {{
+                    background-color: rgb({menu});
+                    color: rgb({text});
+                    selection-background-color: rgb({selection});
+                    selection-color: rgb({text});
+                    border: 1px solid rgb({menu_border});
+                }}
             """
         self.setStyleSheet("""
             ROOT_SELECTOR { background: BACKGROUND; }
-            POWER_FILL
             QWidget { font-size: 9pt; }
             QFrame#section {
-                SECTION_FILL
                 border: 1px solid palette(mid);
                 border-radius: 8px;
+                SECTION_FILL
             }
             QPushButton, QComboBox { padding: 5px 7px; }
             QLabel { background: transparent; }
             QLabel#sectionTitle { font-weight: 600; }
             QLabel#volumeValue { font-size: 13pt; font-weight: 600; }
-        """.replace("ROOT_SELECTOR", "QMainWindow, QWidget#central").replace("BACKGROUND", background).replace("SECTION_FILL", section_fill).replace("POWER_FILL", power_fill))
+            MICA_CONTROLS
+        """.replace("ROOT_SELECTOR", "QMainWindow, QWidget#central").replace("BACKGROUND", background).replace("SECTION_FILL", section_fill).replace("MICA_CONTROLS", mica_controls))
 
     # ----------------------------
     # Background work

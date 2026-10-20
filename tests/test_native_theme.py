@@ -77,16 +77,22 @@ class NativeThemeTests(unittest.TestCase):
         self.assertLess(buttons[0].sizeHint().width(), buttons[2].sizeHint().width())
         window.deleteLater()
 
-    def test_mica_restores_only_section_fill_and_root_surface(self):
+    def test_mica_restores_section_and_control_surfaces(self):
         window = QWidget()
         window.mica_enabled = True
         window.config = {"DarkMode": True}
         REMOTE[f"{BRAND}Remote"]._apply_style(window)
         self.assertIn("background: transparent", window.styleSheet())
-        self.assertIn("background: rgba(38, 38, 38, 185)", window.styleSheet())
+        self.assertIn("background: rgba(38,38,38,185)", window.styleSheet())
+        self.assertIn("QPushButton, QComboBox, QTextEdit", window.styleSheet())
+        self.assertIn("background-color: rgb(48,48,48)", window.styleSheet())
+        self.assertIn("border: 1px solid rgba(120,120,120,150)", window.styleSheet())
+        self.assertIn("background-color: rgb(40,40,40)", window.styleSheet())
         window.config["DarkMode"] = False
         REMOTE[f"{BRAND}Remote"]._apply_style(window)
         self.assertIn("background: rgba(255,255,255,190)", window.styleSheet())
+        self.assertIn("background-color: rgb(255,255,255)", window.styleSheet())
+        self.assertIn("background-color: rgb(250,250,250)", window.styleSheet())
         self.assertNotIn("set_dark_titlebar", REMOTE)
         window.deleteLater()
 
