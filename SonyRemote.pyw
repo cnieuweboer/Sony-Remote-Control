@@ -18,7 +18,7 @@ import urllib.request
 from urllib.error import HTTPError, URLError
 from pathlib import Path
 from xml.sax.saxutils import escape
-from PySide6.QtCore import QEasingCurve, QElapsedTimer, QRect, QEvent, QFileSystemWatcher, QLockFile, QObject, QProcess, QRunnable, Qt, QThreadPool, QTimer, Signal
+from PySide6.QtCore import QByteArray, QEasingCurve, QElapsedTimer, QRect, QEvent, QFileSystemWatcher, QLockFile, QObject, QProcess, QRunnable, Qt, QThreadPool, QTimer, Signal
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtGui import QAction, QColor, QPalette
 from PySide6.QtWidgets import (
@@ -492,7 +492,7 @@ class CalibrationServer(QObject):
 APP_NAME = "Sony Remote"
 
 
-__version__ = "2026.10.19.20"
+__version__ = "2026.10.20.1"
 
 
 CONFIG_PATH = Path(__file__).resolve().with_name("SonyRemote.json")
@@ -3567,7 +3567,7 @@ class SonyRemote(QMainWindow):
         active_timers = self._pause_background_work()
         release_single_instance()
         try:
-            launch_replacement()
+            launch_replacement(self)
         except Exception as exc:
             try:
                 if not acquire_single_instance():
@@ -3860,9 +3860,41 @@ class SonyRemote(QMainWindow):
 # ----------------------------
 
 
-def launch_replacement():
+def restart_window_arguments(window):
+    # One-shot process arguments, never persisted to the user's configuration.
+    state = "tray" if not window.isVisible() else "minimized" if window.isMinimized() else "visible"
+    return [f"--restart-window-state={state}",
+            "--restart-window-geometry=" + bytes(window.saveGeometry()).hex()]
+
+
+def show_startup_window(window, config):
+    state = next((arg.split("=", 1)[1] for arg in sys.argv[1:]
+                  if arg.startswith("--restart-window-state=")), None)
+    geometry = next((arg.split("=", 1)[1] for arg in sys.argv[1:]
+                     if arg.startswith("--restart-window-geometry=")), None)
+    if geometry:
+        try:
+            # Qt also adjusts saved geometry when the original screen is unavailable.
+            window.restoreGeometry(QByteArray(bytes.fromhex(geometry)))
+        except ValueError:
+            pass
+    tray_available = (config["SystemTray"] and config["CloseToTray"]
+                      and window.tray is not None and QSystemTrayIcon.isSystemTrayAvailable())
+    if tray_available and (state == "tray" or
+                           (state is None and "--start-in-tray" in sys.argv[1:])):
+        window._update_polling_state()
+    elif state == "minimized":
+        window.showMinimized()
+    else:
+        window.show()
+
+
+def launch_replacement(window=None):
     script_path = Path(__file__).resolve()
-    arguments = list(sys.argv[1:])
+    arguments = [arg for arg in sys.argv[1:]
+                 if not arg.startswith(("--restart-window-state=", "--restart-window-geometry="))]
+    if window is not None:
+        arguments.extend(restart_window_arguments(window))
     if not getattr(sys, "frozen", False):
         arguments.insert(0, str(script_path))
     result = QProcess.startDetached(sys.executable, arguments, str(script_path.parent))
@@ -3908,13 +3940,7 @@ def _run_application():
     app.setQuitOnLastWindowClosed(window.tray is None)
     app.aboutToQuit.connect(window._shutdown)
     window._fit_and_lock_window()
-    if ("--start-in-tray" in sys.argv[1:]
-            and config["SystemTray"] and config["CloseToTray"]
-            and window.tray is not None and QSystemTrayIcon.isSystemTrayAvailable()):
-        # A new window is already hidden: do not show it even for one frame.
-        window._update_polling_state()
-    else:
-        window.show()
+    show_startup_window(window, config)
     try:
         return app.exec()
     finally:

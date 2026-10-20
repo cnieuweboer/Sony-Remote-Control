@@ -80,6 +80,51 @@ class TrayStartupTests(unittest.TestCase):
         self.assertTrue(self.window.isVisible())
         self.assertEqual(self.window.shows, 1)
 
+    def test_visible_restart_overrides_start_in_tray_and_restores_position(self):
+        self.window.setGeometry(140, 160, 303, 300)
+        arguments = REMOTE['restart_window_arguments'](self.window)
+        # A visible source, then a newly constructed hidden replacement.
+        self.window.show()
+        arguments = REMOTE['restart_window_arguments'](self.window)
+        expected = self.window.pos()
+        self.window.hide()
+        self.window.move(20, 20)
+        self.window.shows = 0
+        self.run_startup('--start-in-tray', *arguments)
+        self.assert_visible()
+        self.assertEqual(self.window.pos(), expected)
+
+    def test_minimized_restart_overrides_start_in_tray(self):
+        self.run_startup('--start-in-tray', '--restart-window-state=minimized')
+        self.assertTrue(self.window.isMinimized())
+        self.assertTrue(self.window.isVisible())
+
+    def test_tray_restart_remains_hidden_without_initial_flag(self):
+        self.run_startup('--restart-window-state=tray')
+        self.assertFalse(self.window.isVisible())
+        self.assertEqual(self.window.shows, 0)
+
+    def test_tray_restart_opens_when_tray_disabled(self):
+        self.config['SystemTray'] = False
+        self.run_startup('--start-in-tray', '--restart-window-state=tray')
+        self.assert_visible()
+
+    def test_invalid_geometry_falls_back_to_visible_window(self):
+        self.run_startup('--restart-window-state=visible', '--restart-window-geometry=invalid')
+        self.assert_visible()
+
+    def test_replacement_arguments_do_not_accumulate_old_state(self):
+        with patch.object(sys, 'argv', [str(SCRIPT), '--start-in-tray',
+                                       '--restart-window-state=visible',
+                                       '--restart-window-geometry=00']), \
+                patch.object(REMOTE['QProcess'], 'startDetached', return_value=(True, 123)) as launch:
+            REMOTE['launch_replacement'](self.window)
+        args = launch.call_args.args[1]
+        self.assertIn('--start-in-tray', args)
+        self.assertEqual(sum(a.startswith('--restart-window-state=') for a in args), 1)
+        self.assertEqual(sum(a.startswith('--restart-window-geometry=') for a in args), 1)
+        self.assertIn('--restart-window-state=tray', args)
+
     def test_flag_with_tray_settings_starts_hidden_without_a_show_event(self):
         self.run_startup('--start-in-tray')
         self.assertFalse(self.window.isVisible())
