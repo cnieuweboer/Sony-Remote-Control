@@ -492,7 +492,7 @@ class CalibrationServer(QObject):
 APP_NAME = "Sony Remote"
 
 
-__version__ = "2026.10.20.1"
+__version__ = "2026.10.20.2"
 
 
 CONFIG_PATH = Path(__file__).resolve().with_name("SonyRemote.json")
@@ -1293,29 +1293,6 @@ def apply_mica(hwnd):
     except Exception:
         return False
 
-
-def set_dark_titlebar(hwnd):
-    if sys.platform != "win32":
-        return
-
-    try:
-        value = ctypes.c_int(1)
-        result = ctypes.windll.dwmapi.DwmSetWindowAttribute(
-            ctypes.c_void_p(int(hwnd)),
-            ctypes.c_uint(20),
-            ctypes.byref(value),
-            ctypes.sizeof(value),
-        )
-
-        if result != 0:
-            ctypes.windll.dwmapi.DwmSetWindowAttribute(
-                ctypes.c_void_p(int(hwnd)),
-                ctypes.c_uint(19),
-                ctypes.byref(value),
-                ctypes.sizeof(value),
-            )
-    except Exception:
-        pass
 
 
 def get_app_icon():
@@ -2488,122 +2465,23 @@ class SonyRemote(QMainWindow):
         self.setFixedSize(self.sizeHint())
 
     def _apply_style(self):
-        palette = self.palette()
-
-        if self.config["DarkMode"]:
-            if self.mica_enabled:
-                palette.setColor(QPalette.Window, QColor(0, 0, 0, 0))
-            else:
-                palette.setColor(QPalette.Window, QColor(32, 32, 32))
-
-            palette.setColor(QPalette.WindowText, QColor(235, 235, 235))
-            self.setPalette(palette)
-
-            self.setStyleSheet("""
-                QMainWindow, QWidget#central {
-                    background: transparent;
-                }
-                QWidget {
-                    color: #f0f0f0;
-                    font-size: 9pt;
-                }
-                QFrame#section {
-                    background: rgba(38, 38, 38, 185);
-                    border: 1px solid rgba(120, 120, 120, 110);
-                    border-radius: 8px;
-                }
-                QLabel {
-                    background: transparent;
-                }
-                QLabel#sectionTitle {
-                    color: #d6d6d6;
-                    font-weight: 600;
-                }
-                QLabel#volumeValue {
-                    font-size: 13pt;
-                    font-weight: 600;
-                }
-                QPushButton, QComboBox, QTextEdit {
-                    background-color: rgba(48, 48, 48, 185);
-                    color: rgb(235, 235, 235);
-                    border: 1px solid rgba(120, 120, 120, 150);
-                    border-radius: 7px;
-                    padding: 5px 7px;
-                    min-height: 22px;
-                }
-                QComboBox::drop-down {
-                    border: none;
-                    background: transparent;
-                    width: 20px;
-                }
-                QPushButton:hover, QComboBox:hover {
-                    background-color: rgba(68, 68, 68, 205);
-                }
-                QPushButton:pressed {
-                    background-color: rgba(38, 38, 38, 220);
-                }
-                QPushButton:disabled, QComboBox:disabled, QTextEdit:disabled {
-                    color: rgba(235, 235, 235, 100);
-                    background-color: rgba(48, 48, 48, 100);
-                }
-                QComboBox QAbstractItemView {
-                    background-color: rgb(40, 40, 40);
-                    color: rgb(235, 235, 235);
-                    selection-background-color: rgb(80, 110, 170);
-                    border: 1px solid rgb(120, 120, 120);
-                    text-align: center;
-                }
-            """)
-        else:
-            if self.mica_enabled:
-                palette.setColor(QPalette.Window, QColor(0, 0, 0, 0))
-            self.setPalette(palette)
-
-            self.setStyleSheet("""
-                QMainWindow, QWidget#central {
-                    background: transparent;
-                }
-                QWidget {
-                    font-size: 9pt;
-                }
-                QFrame#section {
-                    background: rgba(255,255,255,190);
-                    border: 1px solid rgba(0,0,0,25);
-                    border-radius: 8px;
-                }
-                QLabel {
-                    background: transparent;
-                }
-                QLabel#sectionTitle {
-                    font-weight: 600;
-                }
-                QLabel#volumeValue {
-                    font-size: 13pt;
-                    font-weight: 600;
-                }
-                QPushButton, QComboBox, QTextEdit {
-                    background: rgba(255,255,255,215);
-                    border: 1px solid rgba(0,0,0,35);
-                    border-radius: 7px;
-                    padding: 5px 7px;
-                    min-height: 22px;
-                }
-                QComboBox::drop-down {
-                    border: none;
-                    background: transparent;
-                    width: 20px;
-                }
-                QComboBox QAbstractItemView {
-                    background-color: rgb(250, 250, 250);
-                    color: rgb(20, 20, 20);
-                    selection-background-color: rgb(210, 225, 250);
-                    border: 1px solid rgb(180, 180, 180);
-                    text-align: center;
-                }
-                QPushButton:hover, QComboBox:hover {
-                    background: rgba(245,245,245,235);
-                }
-            """)
+        # Leave colors and control rendering to the platform's Qt style.
+        # Only geometry/typography and the optional Mica surface are customized.
+        for kind in (QPushButton, QComboBox):
+            for control in self.findChildren(kind):
+                control.setMinimumHeight(max(34, control.minimumHeight()))
+        background = "transparent" if self.mica_enabled else "palette(window)"
+        self.setStyleSheet("""
+            ROOT_SELECTOR { background: BACKGROUND; }
+            QWidget { font-size: 9pt; }
+            QFrame#section {
+                border: 1px solid palette(mid);
+                border-radius: 8px;
+            }
+            QLabel { background: transparent; }
+            QLabel#sectionTitle { font-weight: 600; }
+            QLabel#volumeValue { font-size: 13pt; font-weight: 600; }
+        """.replace("ROOT_SELECTOR", "QMainWindow, QWidget#central").replace("BACKGROUND", background))
 
     # ----------------------------
     # Background work
@@ -3726,8 +3604,6 @@ class SonyRemote(QMainWindow):
         if self.mica_enabled:
             apply_mica(int(self.winId()))
 
-        if self.config["DarkMode"] and sys.platform == "win32":
-            set_dark_titlebar(int(self.winId()))
         self._update_polling_state(refresh=True)
 
     def hideEvent(self, event):
@@ -3903,6 +3779,12 @@ def launch_replacement(window=None):
         raise OSError("The replacement process could not be started.")
 
 
+def configure_app_theme(config):
+    # Qt 6.8+ forwards this override to supported platform theme backends.
+    QApplication.styleHints().setColorScheme(
+        Qt.ColorScheme.Dark if config["DarkMode"] else Qt.ColorScheme.Light)
+
+
 def _run_application():
     app = QApplication(sys.argv)
     app.setStyle(TooltipDelayStyle())
@@ -3934,11 +3816,14 @@ def _run_application():
     except Exception as exc:
         QMessageBox.critical(None, APP_NAME, f"Could not load SonyRemote.json:\n\n{exc}")
         return 1
+    configure_app_theme(config)
     configure_diagnostics(config)
     window = SonyRemote(config)
     show_missing_config_settings(config)
     app.setQuitOnLastWindowClosed(window.tray is None)
     app.aboutToQuit.connect(window._shutdown)
+    # Re-resolve palette roles cached by Qt's stylesheet layer after a native theme update.
+    app.paletteChanged.connect(lambda palette: window._apply_style())
     window._fit_and_lock_window()
     show_startup_window(window, config)
     try:

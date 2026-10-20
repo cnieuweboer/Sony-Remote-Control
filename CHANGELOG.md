@@ -4,6 +4,8 @@ Release identifiers below come from the corresponding commits. Some releases upd
 
 ## 2026-10-20
 
+- 2026.10.20.2 — Request light/dark appearance through Qt 6.8+ platform integration. Remove fixed control colors and the manual dark title-bar override; retain layout, typography, Mica support, and live dropdown animation. Windows appearance and live desktop-theme changes require visual verification.
+
 - 2026.10.20.1 — Preserve Qt window geometry and visible/minimized/tray state across configuration restarts. Startup-in-tray arguments apply only to the initial launch; disabling tray support makes a hidden replacement visible.
 
 - Calibration helper 2026.10.20.3 — Verify amplifier speaker isolation before the sweep, offer one explicit Continue/Cancel choice if unavailable or lost, and keep leases alive during the decision. Restore volume and mute before speaker outputs and Windows mute; preserve the previous mapping on failed cleanup. Add fake-device and Qt coverage. Sony Remote remains 2026.10.19.20.

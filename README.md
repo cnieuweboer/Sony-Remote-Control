@@ -13,7 +13,7 @@ Local settings, diagnostic logs, and temporary JSON files are ignored by Git. Wh
 ## Windows
 
 ```powershell
-py -m pip install PySide6
+py -m pip install "PySide6>=6.8"
 ```
 
 Run `SonyRemote.pyw`.
@@ -37,14 +37,14 @@ Then set `"SMTCPlaybackKeys": true` in `SonyRemote.json`. Windows routes Play/Pa
 ## macOS
 
 ```bash
-python3 -m pip install PySide6
+python3 -m pip install "PySide6>=6.8"
 python3 SonyRemote.pyw
 ```
 
 ## Linux
 
 ```bash
-python3 -m pip install PySide6
+python3 -m pip install "PySide6>=6.8"
 python3 SonyRemote.pyw
 ```
 
@@ -89,7 +89,7 @@ Set:
 
 - `Host` — IP address or hostname of the Sony TV.
 - `PreSharedKey` — pre-shared key configured in the TV's IP Control settings.
-- `DarkMode` — `true` or `false`.
+- `DarkMode` — Requests Qt’s native dark (`true`) or light (`false`) appearance independently of the desktop theme. Requires PySide6 6.8 or newer.
 - `Mica` — Windows-only Mica background. Ignored on macOS and Linux.
 - `TextInputControls` — show the Text Input section. Text is sent to the currently active TV software keyboard or text field by pressing Enter.
 - `ChannelControls` — show number buttons `0`–`9` and channel `−` / `+` controls.

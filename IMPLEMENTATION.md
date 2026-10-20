@@ -261,3 +261,8 @@ Fake-device session tests cover unsupported isolation, rejection, repeated loss 
 ## Window state across configuration restarts
 
 Configuration replacements receive one-shot internal arguments containing Qt's saved window geometry and current visible/minimized/tray state. Prior restart arguments are replaced rather than accumulated, and unrelated startup arguments are preserved. Qt restores screen geometry without platform-specific window-manager code; a hidden window opens visibly if tray support was disabled or is unavailable. Initial launches still honor `--start-in-tray`. Focus is left to the operating system; no forced activation is requested. Window size remains governed by the current control layout.
+
+
+## Native Qt light/dark appearance
+
+The application requests `QStyleHints.setColorScheme()` before constructing its window, using `DarkMode` to select Dark or Light. This requires PySide6/Qt 6.8 or newer. The platform style and application palette remain Qt-managed, including system-theme notifications. The application palette-change signal reapplies layout styling so the stylesheet layer cannot retain resolved colors from the old palette; no Fusion style or fixed light/dark color palette is installed. The previous DWM dark-title-bar override is removed so Qt owns native theme selection. Stylesheets retain font sizing, section outlines using the palette's mid role, and optional transparent Mica surfaces, without overriding button, text, selection, hover, or disabled colors. The existing centered combobox painting and live popup animation remain in use. Platform support varies; the initial target is Windows, with native appearance and live Windows theme switching checked manually.
