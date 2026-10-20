@@ -4,6 +4,8 @@ Release identifiers below come from the corresponding commits. Some releases upd
 
 ## 2026-10-20
 
+- 2026.10.20.4 — Give the power/standby button an opaque dark/light background only with Windows Mica, including hover/pressed states. Other native controls retain Qt-managed styling.
+
 - 2026.10.20.3 — Restore compact control padding so native playback-button size hints do not widen Sony layouts. Restore previous dark/light section fills only with Windows Mica; retain Qt-managed control colors and explicit JSON theme selection.
 
 - 2026.10.20.2 — Request light/dark appearance through Qt 6.8+ platform integration. Remove fixed control colors and the manual dark title-bar override; retain layout, typography, Mica support, and live dropdown animation. Windows appearance and live desktop-theme changes require visual verification.
