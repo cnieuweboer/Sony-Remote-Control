@@ -602,6 +602,66 @@ class SessionTests(unittest.TestCase):
         self.assertGreater(sum(row[2] == 'renew' for row in self.devices.trace if row[1] in ('tv', 'amplifier')), 15)
         self.assert_restored()
 
+    def test_initial_warning_distinguishes_missing_unsupported_and_unknown_state(self):
+        snapshot = self.devices.snapshot
+        for variant, expected in (('missing', 'Update the amplifier remote'),
+                                  ('unsupported', 'no controllable speaker outputs'),
+                                  ('stale', 'current speaker state could not be verified'),
+                                  ('invalid', 'current speaker state could not be verified')):
+            with self.subTest(variant=variant):
+                def changed(role, sample):
+                    state = snapshot(role, sample)
+                    if role == 'amplifier':
+                        if variant == 'missing':
+                            state.pop('speaker_outputs')
+                        elif variant == 'unsupported':
+                            state['speaker_outputs'] = []
+                        elif variant == 'stale':
+                            state['speaker_valid_for_ms'] = 0
+                        else:
+                            state['speaker_outputs'] = 'invalid'
+                    return state
+                self.devices.snapshot = changed
+                self.session.confirm_isolation = Mock(return_value=False)
+                with self.assertRaises(HELPER['Cancelled']):
+                    self.session.run()
+                reason = self.session.confirm_isolation.call_args.args[0]
+                self.assertIn(expected, reason)
+                self.assert_previous_preserved()
+                self.assert_released()
+                # Start an independent session for the next snapshot variant.
+                self.session = SESSION(self.cancel, self.devices.progress, path=self.path,
+                                       mute_factory=self.devices.mute, peer_factory=self.devices.peer,
+                                       silent_source_confirmed=True, cleanup_started=self.devices.cleanup)
+
+    def test_prompt_timeout_restores_and_preserves_mapping(self):
+        self.devices.speaker_outputs = []
+        self.session.confirm_isolation = Mock(side_effect=HELPER['Cancelled']('Speaker isolation decision timed out.'))
+        with self.assertRaises(HELPER['Cancelled']):
+            self.session.run()
+        self.assertGreaterEqual(self.session._prompt_pause_total, 0)
+        self.session.confirm_isolation.assert_called_once()
+        self.assert_restored()
+        self.assert_previous_preserved()
+        self.assert_released()
+
+    def test_prompt_timeout_during_cleanup_stops_without_second_restoration(self):
+        def cleanup():
+            self.devices.cleanup()
+            self.devices.speakers = (True, False)
+            for peer in self.devices.peers.values():
+                peer.read()
+        self.session.cleanup_started = Mock(side_effect=cleanup)
+        self.session.confirm_isolation = Mock(side_effect=HELPER['Cancelled']('Speaker isolation decision timed out.'))
+        with self.assertRaisesRegex(HELPER['CalibrationError'], 'Original settings could not be verified.*timed out'):
+            self.session.run()
+        self.session.cleanup_started.assert_called_once()
+        self.session.confirm_isolation.assert_called_once()
+        self.assertTrue(self.devices.windows_muted)
+        self.assertFalse(self.session.restoration_verified)
+        self.assert_previous_preserved()
+        self.assert_released()
+
     def test_connection_loss_during_warning_still_aborts(self):
         self.devices.speaker_outputs = []
         def decide(reason, pump):

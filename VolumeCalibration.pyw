@@ -17,7 +17,7 @@ from PySide6.QtWidgets import (
     QProgressBar, QTextEdit, QVBoxLayout, QWidget,
 )
 
-__version__ = "2026.10.20.3"
+__version__ = "2026.10.20.6"
 DATA_PATH = Path(__file__).resolve().with_name("VolumeCalibration.json")
 IPC_USER_SUFFIX = hashlib.sha256(str(Path.home()).encode("utf-8")).hexdigest()[:16]
 
@@ -27,6 +27,7 @@ def ipc_server_name(role, *, channel=None):
     return f"remote-control.{channel}.v1.{IPC_USER_SUFFIX}"
 
 
+ISOLATION_DECISION_SECONDS = 300.0
 TIMEOUT = 5.0
 TV_VOLUME_ATTEMPTS = 4
 CEC_QUIET_SECONDS = 5.0
@@ -443,7 +444,15 @@ class CalibrationSession:
     def isolate_speakers(self):
         a, _ = self.guard(require_windows_mute=True)
         if self.saved["speaker_state"] is None:
-            self.allow_without_isolation("Speaker controls or a fresh original speaker state are unavailable.")
+            if not {"speaker_outputs", "speaker_state", "speaker_valid_for_ms"} <= a.keys():
+                reason = ("The amplifier remote does not provide the speaker-support information needed "
+                          "for isolation. Update the amplifier remote and try again.")
+            elif isinstance(a["speaker_outputs"], list) and not a["speaker_outputs"]:
+                reason = "This amplifier advertises no controllable speaker outputs."
+            else:
+                reason = ("The amplifier's current speaker state could not be verified. "
+                          "Speaker-control information may be unavailable, stale, or invalid.")
+            self.allow_without_isolation(reason)
             return
         try:
             self.request("amplifier", "set_speakers", [False, False])
@@ -999,10 +1008,17 @@ class SessionWorker(QThread):
 
     def confirm_isolation(self, reason, pump):
         self._isolation_answer.clear()
+        deadline = time.monotonic() + ISOLATION_DECISION_SECONDS
         self.isolation_warning.emit(reason)
-        while not self._isolation_answer.wait(0.05):
+        while True:
+            answered = self._isolation_answer.wait(0.05)
+            if time.monotonic() >= deadline:
+                message = "Speaker isolation decision timed out. Calibration cancelled."
+                self.progress.emit(message)
+                raise Cancelled(message)
+            if answered:
+                return self._continue_unisolated
             pump()  # Maintain device status and both leases during the dialog.
-        return self._continue_unisolated
 
     def run(self):
         session = CalibrationSession(
@@ -1118,7 +1134,9 @@ class CalibrationWindow(QWidget):
         box.setWindowTitle("Speaker isolation not verified")
         box.setText(reason + "\n\nThe amplifier may produce sound as volume rises. Keep the TV on a silent source "
                     "and stop all other playback. Continuing accepts this reduced protection for the entire sweep; "
-                    "further speaker changes are logged without more isolation prompts.")
+                    "further speaker changes are logged without more isolation prompts.\n\n"
+                    "If you do not choose within five minutes, calibration is cancelled and restoration is attempted. "
+                    "If restoration is already in progress, it stops and reports that settings must be checked manually.")
         proceed = box.addButton("Continue without speaker isolation", QMessageBox.AcceptRole)
         cancel = box.addButton(QMessageBox.Cancel)
         box.setDefaultButton(cancel)

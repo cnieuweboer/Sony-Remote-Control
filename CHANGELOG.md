@@ -4,6 +4,8 @@ Release identifiers below come from the corresponding commits. Some releases upd
 
 ## 2026-10-20
 
+- Calibration helper 2026.10.20.6 — Cancel unanswered speaker-isolation decisions after five minutes while maintaining lease heartbeats; close the prompt through restoration/completion and log timeout explicitly. Distinguish missing amplifier-remote speaker information, unsupported controls, and unverifiable current state. Preserve one decision per sweep, mapping safety, and single-pass restoration. Sony Remote remains 2026.10.20.5.
+
 - 2026.10.20.5 — With Windows Mica, restore custom button/combobox/text-input fills and outlines, hover/pressed/disabled styling, section borders, and matching dropdown colors. Use opaque control fills to keep the backdrop out of controls; other configurations retain Qt-native colors.
 
 - 2026.10.20.4 — Give the power/standby button an opaque dark/light background only with Windows Mica, including hover/pressed states. Other native controls retain Qt-managed styling.

@@ -276,3 +276,10 @@ With Windows Mica active, the power/standby button also uses an opaque dark/ligh
 
 
 With Windows Mica active, all buttons, comboboxes, and text input now share the former dark/light control colors and borders, using opaque fills to prevent backdrop effects within controls. Hover, pressed, disabled, and dropdown selection states are explicitly styled; dropdown surfaces use the previous 40/250 grayscale colors. This replaces the narrower power-button override. Non-Mica configurations keep Qt-managed control palettes.
+
+
+### Calibration isolation decision deadline
+
+The helper allows five minutes of real monotonic time for an isolation decision, with Cancel still the default. The worker continues pumping peer state and renewing leases while waiting; the prompt duration is excluded from sweep/volume-step deadlines. Expiry logs “Speaker isolation decision timed out” and raises cancellation. A timeout during the sweep enters the existing single restoration pass and closes the dialog; one during restoration ends cleanup as unverified, closes the dialog on completion, preserves the mapping, and leaves Windows muted where possible. No restoration retry or second isolation prompt is introduced.
+
+Initial warnings distinguish missing speaker-support fields (suggest updating the amplifier remote), an explicit empty capability list (no controllable outputs), and unavailable/stale/invalid current state. Existing lost-isolation, command-rejection, and verification-timeout explanations remain distinct. Malformed information is not described as merely an older remote. Dialog/worker tests exercise the actual Qt timeout-close handoff both before and during cleanup; fake-device tests cover reason selection, cancellation restoration, and cleanup-time expiry.
