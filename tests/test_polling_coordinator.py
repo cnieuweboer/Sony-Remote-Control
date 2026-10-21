@@ -42,7 +42,7 @@ class PollingTests(unittest.TestCase):
         self.p.request(20)
         self.p.request(40)
         QTest.qWait(80)
-        self.w.poll_status.assert_called_once_with()
+        self.w.poll_status.assert_called_once_with(groups=self.p.GROUPS)
         self.assertFalse(self.p.pending)
 
     def test_active_poll_defers_refresh_until_finished(self):
@@ -53,7 +53,7 @@ class PollingTests(unittest.TestCase):
         self.w.poll_running = False
         self.p.finished()
         QTest.qWait(10)
-        self.w.poll_status.assert_called_once_with()
+        self.w.poll_status.assert_called_once_with(groups=self.p.GROUPS)
 
     def test_hidden_refresh_waits_for_visibility(self):
         self.w.hide()
@@ -63,7 +63,7 @@ class PollingTests(unittest.TestCase):
         self.w.show()
         self.p.update()
         QTest.qWait(10)
-        self.w.poll_status.assert_called_once_with()
+        self.w.poll_status.assert_called_once_with(groups=self.p.GROUPS)
 
     def test_pause_cancels_delayed_callbacks_and_resume_refreshes(self):
         self.p.request(20)
@@ -71,14 +71,14 @@ class PollingTests(unittest.TestCase):
         QTest.qWait(40)
         self.w.poll_status.assert_not_called()
         self.p.resume()
-        self.w.poll_status.assert_called_once_with()
+        self.w.poll_status.assert_called_once_with(groups=self.p.GROUPS)
         self.assertTrue(self.p.periodic.isActive())
 
     def test_latest_conditional_completion_replaces_obsolete_one(self):
         self.p.request(10, lambda: False)
         self.p.request(20, lambda: True)
         QTest.qWait(50)
-        self.w.poll_status.assert_called_once_with()
+        self.w.poll_status.assert_called_once_with(groups=self.p.GROUPS)
 
     def test_unconditional_refresh_is_not_cancelled_by_stale_volume_target(self):
         self.w.poll_running = True
@@ -87,7 +87,7 @@ class PollingTests(unittest.TestCase):
         self.w.poll_running = False
         self.p.finished()
         QTest.qWait(20)
-        self.w.poll_status.assert_called_once_with()
+        self.w.poll_status.assert_called_once_with(groups=self.p.GROUPS)
 
     def test_periodic_tick_does_not_preempt_command_settling(self):
         self.p.request(100)

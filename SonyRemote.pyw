@@ -498,7 +498,7 @@ class CalibrationServer(QObject):
 APP_NAME = "Sony Remote"
 
 
-__version__ = "2026.10.21.12"
+__version__ = "2026.10.21.13"
 
 
 CONFIG_PATH = Path(__file__).resolve().with_name("SonyRemote.json")
@@ -2124,10 +2124,7 @@ class PollingCoordinator(QObject):
             if condition is None or condition():
                 groups.add(group)
         if groups:
-            if groups == self.GROUPS:
-                self.window.poll_status()
-            else:
-                self.window.poll_status(groups=groups)
+            self.window.poll_status(groups=groups)
         self._arm()
 
     def _periodic_due(self):
