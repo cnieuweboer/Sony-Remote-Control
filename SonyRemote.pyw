@@ -498,7 +498,7 @@ class CalibrationServer(QObject):
 APP_NAME = "Sony Remote"
 
 
-__version__ = "2026.10.21.11"
+__version__ = "2026.10.21.12"
 
 
 CONFIG_PATH = Path(__file__).resolve().with_name("SonyRemote.json")
@@ -2000,9 +2000,9 @@ class PollingCoordinator(QObject):
         super().__init__(window)
         self.window = window
         self.paused = False
-        self.pending = False
-        self.deadline = None
-        self.condition = None
+        self._scheduled = {}
+        self._commands = {}
+        self._observed = {}
         self.periodic = QTimer(self)
         self.periodic.timeout.connect(self._periodic_due)
         self.refresh = QTimer(self)
@@ -2019,7 +2019,8 @@ class PollingCoordinator(QObject):
 
     def reads_volume(self):
         w = self.window
-        return (not (w._volume_rate_loop_running or w._volume_rate_step_running)
+        return (not (w._volume_rate_loop_running or w._volume_rate_step_running
+                     or w._pending_volume_commands or self._commands.get("volume"))
                 and (w.calibration_active or not w._amplifier_routed)
                 and (w.config["VolumeControls"] or w.calibration_active))
 
@@ -2029,7 +2030,9 @@ class PollingCoordinator(QObject):
                 and "inputs" in w._discovery_ready and "inputs" not in w._discovery_pending)
 
     def update(self, refresh=False):
-        self.periodic.setInterval(250 if self.window.calibration_active else POLL_INTERVAL_MS)
+        interval = 250 if self.window.calibration_active else POLL_INTERVAL_MS
+        if self.periodic.interval() != interval:
+            self.periodic.setInterval(interval)
         if not self.allowed():
             self.periodic.stop()
             self.refresh.stop()
@@ -2041,48 +2044,107 @@ class PollingCoordinator(QObject):
         elif self.pending:
             self._arm()
 
-    def request(self, delay_ms=0, condition=None):
+    GROUPS = frozenset(("power", "volume", "inputs"))
+    FRESHNESS_SECONDS = POLL_INTERVAL_MS / 2000  # Half the normal interval.
+
+    @property
+    def pending(self):
+        return bool(self._scheduled)
+
+    def invalidate(self, groups=None):
+        for group in self.GROUPS if groups is None else groups:
+            self._observed.pop(group, None)
+
+    def observed(self, group, observed_at):
+        self._observed[group] = max(self._observed.get(group, 0), observed_at)
+
+    def hold(self, groups):
+        # Cover command queue time as well as the device-settling delay.
+        for group in groups:
+            self._observed.pop(group, None)
+            self._commands[group] = self._commands.get(group, 0) + 1
+
+    def release(self, groups):
+        for group in groups:
+            self._commands[group] = max(0, self._commands.get(group, 0) - 1)
+
+    def periodic_groups(self):
+        if self.window.calibration_active:
+            return self.GROUPS
+        now = time.monotonic()
+        groups = {group for group in self.GROUPS
+                  if group not in self._scheduled and not self._commands.get(group)
+                  and now - self._observed.get(group, -math.inf) >= self.FRESHNESS_SECONDS}
+        if not self.reads_volume():
+            groups.discard("volume")
+        if not self.reads_inputs():
+            groups.discard("inputs")
+        return frozenset(groups)
+
+    def request(self, delay_ms=0, condition=None, groups=None, *, replace=False):
         deadline = time.monotonic() + max(0, delay_ms) / 1000
-        # Keep the earliest unconditional refresh. Replace conditional volume
-        # work with the latest completion so a newer target gets its own delay.
-        # Unconditional requests cannot be cancelled by stale keypress state.
-        if not self.pending or self.condition is not None:
-            self.deadline, self.condition = deadline, condition
-        elif condition is None:
-            self.deadline = min(self.deadline, deadline)
-        self.pending = True
+        for group in self.GROUPS if groups is None else groups:
+            self._observed.pop(group, None)
+            old = self._scheduled.get(group)
+            if replace or old is None or old[1] is not None:
+                self._scheduled[group] = (deadline, condition)
+            elif condition is None:
+                self._scheduled[group] = (min(old[0], deadline), None)
+            else:
+                # Retain the unconditional read, but allow a newer volume
+                # completion its settling delay before that read is issued.
+                self._scheduled[group] = (max(old[0], deadline), None)
         if delay_ms <= 0:
             self._dispatch()
         else:
             self._arm()
 
+    def _ready_groups(self):
+        return {group for group in self._scheduled if not self._commands.get(group)
+                and not (group == "inputs" and (self.window._input_status_running
+                                                or "inputs" in self.window._discovery_pending))}
+
     def _arm(self):
-        if self.allowed() and not self.window.poll_running:
-            self.refresh.start(max(0, math.ceil((self.deadline - time.monotonic()) * 1000)))
+        self.refresh.stop()
+        groups = self._ready_groups()
+        if groups and self.allowed() and not self.window.poll_running:
+            deadline = min(self._scheduled[group][0] for group in groups)
+            self.refresh.start(max(0, math.ceil((deadline - time.monotonic()) * 1000)))
 
     def _dispatch(self):
-        if not self.pending or not self.allowed() or self.window.poll_running:
+        if not self.allowed() or self.window.poll_running:
             return
-        condition = self.condition
-        self.pending = False
-        self.deadline = self.condition = None
-        if condition is None or condition():
-            self.window.poll_status()
+        groups = set()
+        now = time.monotonic()
+        for group in self._ready_groups():
+            deadline, condition = self._scheduled[group]
+            if deadline > now:
+                continue
+            del self._scheduled[group]
+            if condition is None or condition():
+                groups.add(group)
+        if groups:
+            if groups == self.GROUPS:
+                self.window.poll_status()
+            else:
+                self.window.poll_status(groups=groups)
+        self._arm()
 
     def _periodic_due(self):
-        # A cycle already running satisfies the periodic tick. A delayed
-        # command refresh keeps its settling delay instead of being preempted.
-        if not self.window.poll_running and not self.pending:
-            self.request()
+        # Preserve the fixed cadence. Pending/fresh groups do not postpone
+        # unrelated reads, and periodic ticks never queue behind active polls.
+        if self.allowed() and not self.window.poll_running:
+            groups = self.periodic_groups()
+            if groups:
+                self.window.poll_status(groups=groups)
 
     def finished(self):
-        if self.pending:
-            self._arm()
+        self._arm()
 
     def pause(self):
         self.paused = True
-        self.pending = False
-        self.deadline = self.condition = None
+        self._scheduled.clear()
+        self._commands.clear()
         self.periodic.stop()
         self.refresh.stop()
 
@@ -2654,8 +2716,24 @@ class SonyRemote(QMainWindow):
     # Background work
     # ----------------------------
 
-    def run_command(self, function, on_result=None, on_error=None, on_finished=None):
-        return self.run_worker(function, on_result, on_error, on_finished, command=True)
+    def run_command(self, function, on_result=None, on_error=None, on_finished=None,
+                    *, refresh_groups=None, refresh_delay_ms=200):
+        if refresh_groups is None:
+            return self.run_worker(function, on_result, on_error, on_finished, command=True)
+        groups = frozenset(refresh_groups)
+        self.polling.hold(groups)
+        def finished():
+            self.polling.release(groups)
+            # Start settling time after this command, including failures whose
+            # device-side outcome is uncertain. Never retry the command itself.
+            self.polling.request(refresh_delay_ms, groups=groups, replace=True)
+            if on_finished:
+                on_finished()
+        accepted = self.run_worker(function, on_result, on_error, finished, command=True)
+        if not accepted:
+            self.polling.release(groups)
+            self.polling.finished()
+        return accepted
 
     def run_worker(self, function, on_result=None, on_error=None, on_finished=None, *, command=False):
         if self._shutting_down or missing_config_settings(self.config):
@@ -2714,17 +2792,24 @@ class SonyRemote(QMainWindow):
             if feature in self._discovery_ready or feature in self._discovery_pending:
                 continue
             self._discovery_pending.add(feature)
+            def discover(function=function):
+                return function(), time.monotonic()
             accepted = self.run_worker(
-                function,
-                on_result=lambda result, feature=feature: self._discovery_succeeded(feature, result),
+                discover,
+                on_result=lambda result, feature=feature: self._discovery_succeeded(feature, *result),
                 on_error=lambda error, feature=feature: self._discovery_failed(feature, error),
-                on_finished=lambda feature=feature: self._discovery_pending.discard(feature),
+                on_finished=lambda feature=feature: self._discovery_finished(feature),
             )
             if not accepted:
                 self._discovery_pending.discard(feature)
         self._update_polling_state()
 
-    def _discovery_succeeded(self, feature, result):
+    def _discovery_finished(self, feature):
+        self._discovery_pending.discard(feature)
+        if feature == "inputs":
+            self.polling.finished()
+
+    def _discovery_succeeded(self, feature, result, observed_at=None):
         if feature in ("apps", "inputs"):
             collection = "Apps" if feature == "apps" else "Inputs"
             try:
@@ -2744,6 +2829,8 @@ class SonyRemote(QMainWindow):
                     self.show_error(f"Could not update SonyRemote.json:\n\n{error}")
             self._build_favorites_from_config()
             self._fit_and_lock_window()
+        if feature == "inputs" and observed_at is not None:
+            self.polling.observed("inputs", observed_at)
         self._discovery_ready.add(feature)
         self._discovery_errors.pop(feature, None)
         self.set_controls_enabled(self.last_power == "active",
@@ -2869,21 +2956,28 @@ class SonyRemote(QMainWindow):
             return False
         self.last_volume = info
         self._volume_observed_at = observed_at
+        self.polling.observed("volume", observed_at)
         return True
 
-    def poll_status(self):
+    def poll_status(self, groups=None):
         if not self.polling.allowed():
             return
         if self.poll_running:
             return
+        groups = self.polling.GROUPS if groups is None else frozenset(groups)
+        if not groups & {"power", "volume"}:
+            if "inputs" in groups and self.last_power == "active" and self.config["InputControls"]:
+                self._poll_input_status()
+            return
         self.poll_running = True
         volume_request = (self._volume_generation, self._desired_volume)
         volume_busy = bool(self._volume_rate_loop_running or self._pending_volume_commands)
-        read_volume = self.polling.reads_volume()
-
+        read_volume = "volume" in groups and self.polling.reads_volume()
+        cached_power = self.last_power
         def query():
-            power = self.api.get_power()
-            data = {"power": power, "observed_at": time.monotonic()}
+            read_power = "power" in groups or cached_power is None
+            power = self.api.get_power() if read_power else cached_power
+            data = {"power": power, "observed_at": time.monotonic() if read_power else None}
             # Recheck after the power request: a limiter may have started
             # while it was in flight. Never delay the limiter behind this poll.
             if (power == "active" and read_volume
@@ -2895,7 +2989,9 @@ class SonyRemote(QMainWindow):
         def done(data):
             # Power remains useful even if this poll's volume was superseded.
             self._status_sequence += 1
-            self._status_observed_at = data["observed_at"]
+            if data["observed_at"] is not None:
+                self._status_observed_at = data["observed_at"]
+                self.polling.observed("power", data["observed_at"])
             self._update_discovery_feedback()
             self.last_power = data.get("power")
 
@@ -2924,7 +3020,7 @@ class SonyRemote(QMainWindow):
                 self.update_volume_ui(self.last_volume or {})
             if self.calibration_server is not None:
                 self.calibration_server.publish()
-            if is_active and self.config["InputControls"]:
+            if is_active and "inputs" in groups and self.config["InputControls"]:
                 self._poll_input_status()
 
         def failed(error):
@@ -2940,10 +3036,20 @@ class SonyRemote(QMainWindow):
         if not self.polling.reads_inputs():
             return
         self._input_status_running = True
+        def query():
+            entries = self.api.get_inputs()
+            return entries, time.monotonic()
+        def done(result):
+            entries, observed_at = result
+            self.update_active_input(entries)
+            self.polling.observed("inputs", observed_at)
+        def finished():
+            self._input_status_running = False
+            self.polling.finished()
         accepted = self.run_worker(
-            self.api.get_inputs, self.update_active_input,
+            query, done,
             lambda error: record_unexpected_exception(error, "Optional input status", background=True),
-            lambda: setattr(self, "_input_status_running", False),
+            finished,
         )
         if not accepted:
             self._input_status_running = False
@@ -2952,8 +3058,8 @@ class SonyRemote(QMainWindow):
         if hasattr(self, "polling"):
             self.polling.update(refresh=refresh)
 
-    def _request_poll(self, delay_ms=0, condition=None):
-        self.polling.request(delay_ms, condition)
+    def _request_poll(self, delay_ms=0, condition=None, groups=None):
+        self.polling.request(delay_ms, condition, groups)
 
     # ----------------------------
     # State and request errors
@@ -3042,6 +3148,7 @@ class SonyRemote(QMainWindow):
         box.exec()
 
     def set_offline(self):
+        self.polling.invalidate()
         self.last_power = None
         self.last_volume = None
         self._volume_observed_at = 0
@@ -3118,10 +3225,8 @@ class SonyRemote(QMainWindow):
         self.power_button.setEnabled(False)
         accepted = self.run_command(
             lambda: self.api.set_power(turn_on),
-            on_finished=lambda: (
-                self.power_button.setEnabled(self.last_power is not None),
-                self._request_poll(300),
-            ),
+            on_finished=lambda: self.power_button.setEnabled(self.last_power is not None),
+            refresh_groups=self.polling.GROUPS, refresh_delay_ms=300,
         )
         if not accepted:
             self.power_button.setEnabled(self.last_power is not None)
@@ -3201,7 +3306,7 @@ class SonyRemote(QMainWindow):
             self.update_volume_ui(self.last_volume or {})
         if (falling_back and not self.calibration_active and self.config["VolumeControls"]
                 and self.last_power == "active"):
-            self._request_poll()
+            self._request_poll(groups={"volume"})
 
     def _update_volume_controls(self):
         if self.config["VolumeControls"]:
@@ -3242,7 +3347,7 @@ class SonyRemote(QMainWindow):
         if not self.last_volume:
             return
         target = not bool(self.last_volume.get("mute"))
-        self.run_command(lambda: self.api.set_mute(target), on_finished=lambda: self._request_poll(200))
+        self.run_command(lambda: self.api.set_mute(target), refresh_groups={"volume"})
 
     def adjust_volume(self, amount):
         if self._calibration_blocked():
@@ -3282,7 +3387,7 @@ class SonyRemote(QMainWindow):
                             and not self._volume_rate_loop_running):
                         return True
                     return False
-                self._request_poll(200, volume_is_idle)
+                self._request_poll(200, volume_is_idle, groups={"volume"})
             accepted = self.run_command(
                 lambda: None if self._amplifier_routed else self.api.adjust_volume(1 if amount > 0 else -1),
                 on_finished=finished,
@@ -3350,7 +3455,7 @@ class SonyRemote(QMainWindow):
             if self.calibration_server is not None:
                 self.calibration_server.publish()
             if finished:
-                self._request_poll(200)
+                self._request_poll(200, groups={"volume"})
             else:
                 self._schedule_volume_rate_step()
 
@@ -3359,7 +3464,7 @@ class SonyRemote(QMainWindow):
             self._volume_rate_loop_running = False
             self._desired_volume = None
             self.handle_request_error(error)
-            self._request_poll(200)
+            self._request_poll(200, groups={"volume"})
 
         if not self.run_command(step, on_result=done, on_error=failed):
             self._volume_rate_step_running = False
@@ -3374,7 +3479,8 @@ class SonyRemote(QMainWindow):
     def launch_app(self, uri):
         if self._calibration_blocked():
             return
-        self.run_command(lambda: self.api.launch_app(uri), on_finished=lambda: self._request_poll(300))
+        self.run_command(lambda: self.api.launch_app(uri),
+                         refresh_groups=self.polling.GROUPS, refresh_delay_ms=300)
 
     def select_input(self, index):
         uri = self.input_combo.itemData(index)
@@ -3384,7 +3490,8 @@ class SonyRemote(QMainWindow):
     def set_input(self, uri):
         if self._calibration_blocked():
             return
-        self.run_command(lambda: self.api.set_input(uri), on_finished=lambda: self._request_poll(300))
+        self.run_command(lambda: self.api.set_input(uri),
+                         refresh_groups=self.polling.GROUPS, refresh_delay_ms=300)
 
     def send_ircc(self, command, *, background=False):
         if self._calibration_blocked():

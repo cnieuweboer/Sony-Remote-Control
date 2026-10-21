@@ -791,5 +791,80 @@ class DiscoveryTests(unittest.TestCase):
         self.assertEqual(self.window.volume_value.text(), str(target))
 
 
+    def test_volume_event_refresh_skips_only_recent_audio_on_periodic_tick(self):
+        self.settle_volume_controls()
+        before = self.device.calls.copy()
+        self.window._request_poll(groups={'volume'})
+        self.wait(lambda: not self.window.poll_running)
+        self.assertEqual(self.device.calls['volume'], before['volume'] + 1)
+        self.assertEqual(self.device.calls['power'], before['power'])
+        self.assertEqual(self.device.calls['inputs'], before['inputs'])
+        self.window.polling.invalidate({'power', 'inputs'})
+        self.window.polling._periodic_due()
+        self.wait(lambda: not self.window.poll_running and not self.window._input_status_running)
+        self.assertEqual(self.device.calls['power'], before['power'] + 1)
+        self.assertEqual(self.device.calls['inputs'], before['inputs'] + 1)
+        self.assertEqual(self.device.calls['volume'], before['volume'] + 1)
+
+    def test_scheduled_audio_refresh_does_not_defer_power_or_inputs(self):
+        self.settle_volume_controls()
+        before = self.device.calls.copy()
+        self.window.polling.invalidate()
+        self.window._request_poll(1000, groups={'volume'})
+        self.window.polling._periodic_due()
+        self.wait(lambda: not self.window.poll_running and not self.window._input_status_running)
+        self.assertEqual(self.device.calls['power'], before['power'] + 1)
+        self.assertEqual(self.device.calls['inputs'], before['inputs'] + 1)
+        self.assertEqual(self.device.calls['volume'], before['volume'])
+        self.assertTrue(self.window.polling.pending)
+
+    def test_input_event_refresh_does_not_read_power_or_volume(self):
+        self.settle_volume_controls()
+        before = self.device.calls.copy()
+        self.window._request_poll(groups={'inputs'})
+        self.wait(lambda: not self.window._input_status_running)
+        self.assertEqual(self.device.calls['inputs'], before['inputs'] + 1)
+        self.assertEqual(self.device.calls['power'], before['power'])
+        self.assertEqual(self.device.calls['volume'], before['volume'])
+        self.assertNotIn('inputs', self.window.polling.periodic_groups())
+
+    def test_failed_event_refresh_leaves_periodic_retry_available(self):
+        self.settle_volume_controls()
+        self.device.failures['volume'] = REMOTE['SonyConnectionError']('TV unavailable')
+        self.window._request_poll(groups={'volume'})
+        self.wait(lambda: not self.window.poll_running)
+        self.assertFalse(self.window.polling.pending)
+        self.assertNotIn('volume', self.window.polling._observed)
+        self.device.failures.clear()
+        before = self.device.calls['volume']
+        self.window.polling._periodic_due()
+        self.wait(lambda: not self.window.poll_running)
+        self.assertEqual(self.device.calls['volume'], before + 1)
+        self.assertEqual(self.window.last_volume['volume'], 20)
+
+    def test_queued_mute_command_reserves_audio_until_followup(self):
+        self.settle_volume_controls()
+        release = threading.Event()
+        started = threading.Event()
+        def set_mute(value):
+            started.set()
+            release.wait(2)
+        self.device.set_mute = set_mute
+        self.addCleanup(release.set)
+        before = self.device.calls.copy()
+        self.window.toggle_mute()
+        self.assertEqual(self.window.polling._commands['volume'], 1)
+        self.wait(started.is_set)
+        self.window.polling.invalidate({'power', 'inputs'})
+        self.window.polling._periodic_due()
+        self.wait(lambda: not self.window.poll_running and not self.window._input_status_running)
+        self.assertEqual(self.device.calls['volume'], before['volume'])
+        self.assertEqual(self.device.calls['power'], before['power'] + 1)
+        self.assertEqual(self.device.calls['inputs'], before['inputs'] + 1)
+        release.set()
+        self.wait(lambda: self.device.calls['volume'] == before['volume'] + 1
+                  and not self.window.poll_running)
+        self.assertFalse(self.window.polling._commands['volume'])
+
 if __name__ == '__main__':
     unittest.main()
