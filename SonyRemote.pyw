@@ -24,7 +24,7 @@ from PySide6.QtGui import QAction, QPalette, QStyleHints
 from PySide6.QtWidgets import (
     QApplication, QComboBox, QDialogButtonBox, QFrame, QGridLayout, QHBoxLayout, QLabel,
     QMainWindow, QMenu, QMessageBox, QPushButton, QProxyStyle, QStyle, QTextEdit,
-    QStyleOptionComboBox, QStylePainter, QStyledItemDelegate,
+    QStyleOptionButton, QSizePolicy, QStyleOptionComboBox, QStylePainter, QStyledItemDelegate,
     QSystemTrayIcon, QVBoxLayout, QWidget,
 )
 
@@ -499,7 +499,7 @@ class CalibrationServer(QObject):
 APP_NAME = "Sony Remote"
 
 
-__version__ = "2026.10.21.14"
+__version__ = "2026.10.21.15"
 
 
 CONFIG_PATH = Path(__file__).resolve().with_name("SonyRemote.json")
@@ -1805,9 +1805,28 @@ class TvTextEdit(QTextEdit):
         super().keyPressEvent(event)
 
 
+class FavoriteButton(QPushButton):
+    """Keep favorite columns equal; elide only the painted label."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+        self.setMinimumHeight(34)
+
+    def paintEvent(self, event):
+        painter = QStylePainter(self)
+        option = QStyleOptionButton()
+        self.initStyleOption(option)
+        contents = self.style().subElementRect(QStyle.SE_PushButtonContents, option, self)
+        option.text = self.fontMetrics().elidedText(
+            option.text, Qt.ElideRight, max(0, contents.width()), Qt.TextShowMnemonic)
+        painter.drawControl(QStyle.CE_PushButton, option)
+
+
 class CenteredComboBox(QComboBox):
     def __init__(self, parent=None, *, animate_popup=False, clear_on_close=False):
         super().__init__(parent)
+        self.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
         self._animate_popup = animate_popup
         self._clear_on_close = clear_on_close
         self._popup = None
@@ -1979,6 +1998,7 @@ class CenteredComboBox(QComboBox):
 
         group = QPalette.Active if self.isEnabled() else QPalette.Disabled
         painter.setPen(option.palette.color(group, QPalette.Text))
+        text = self.fontMetrics().elidedText(text, Qt.ElideRight, max(0, rect.width()))
         painter.drawText(rect, Qt.AlignCenter, text)
 
 
@@ -2623,7 +2643,7 @@ class SonyRemote(QMainWindow):
             for index, (uri, settings) in enumerate(favorites):
                 button = buttons.pop(uri, None)
                 if button is None:
-                    button = QPushButton()
+                    button = FavoriteButton()
                     button.setProperty("remote_id", uri)
                     button.clicked.connect(
                         lambda checked=False, value=uri, callback=action: callback(value)

@@ -105,7 +105,7 @@ Set:
 - `SortByName` — `false` (default) keeps favorites and dropdown entries in JSON insertion order; `true` sorts them alphabetically by `NameOverride`, falling back to `Name`, ignoring case. Apps and inputs are ordered separately.
 - `Apps` — settings for applications discovered from the Sony TV.
   - `Name` — name reported by the TV. This is updated automatically.
-  - `NameOverride` — optional replacement name shown in the dropdown and on favorite buttons.
+  - `NameOverride` — optional replacement name shown in the dropdown and on favorite buttons. Long closed labels end with an ellipsis; favorite buttons keep equal widths.
   - `Hidden` — hide the application from the dropdown menu. Hidden applications can still be favorites.
   - `Favorite` — show a button for the application directly in the remote.
 - `Inputs` — settings for inputs discovered from the Sony TV.
