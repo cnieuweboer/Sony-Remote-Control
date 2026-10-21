@@ -533,7 +533,7 @@ class CalibrationServer(QObject):
 APP_NAME = "Sony Remote"
 
 
-__version__ = "2026.10.21.20"
+__version__ = "2026.10.21.21"
 
 
 CONFIG_PATH = Path(__file__).resolve().with_name("SonyRemote.json")
@@ -1995,6 +1995,7 @@ class SMTCPlayback(QObject):
 
 
 class TvTextEdit(QTextEdit):
+    focusRemoteRequested = Signal(int)
     submitRequested = Signal()
     submitAndConfirmRequested = Signal()
 
@@ -2010,6 +2011,10 @@ class TvTextEdit(QTextEdit):
         self.setFixedHeight(line_height * 2 + 24)
 
     def keyPressEvent(self, event):
+        if event.key() == Qt.Key_Escape:
+            event.accept()
+            self.focusRemoteRequested.emit(event.key())
+            return
         if event.key() in (Qt.Key_Return, Qt.Key_Enter):
             modifiers = event.modifiers()
 
@@ -2801,6 +2806,7 @@ class SonyRemote(QMainWindow):
 
         self.text_input = TvTextEdit()
         self.text_input.setToolTip(_shortcut_tip(self.config, "focus_text_input"))
+        self.text_input.focusRemoteRequested.connect(self._leave_text_input)
         self.text_input.submitRequested.connect(self.send_text_input)
         self.text_input.submitAndConfirmRequested.connect(
             self.send_text_input_and_confirm
@@ -3936,7 +3942,7 @@ class SonyRemote(QMainWindow):
             ),
         )
         if accepted:
-            self._text_submission_queued()
+            self._leave_text_input(self.text_input.submission_key)
 
     def send_text_input_and_confirm(self):
         if self._calibration_blocked():
@@ -3984,13 +3990,13 @@ class SonyRemote(QMainWindow):
             ),
         )
         if accepted:
-            self._text_submission_queued()
+            self._leave_text_input(self.text_input.submission_key)
 
-    def _text_submission_queued(self):
-        # Keep the submitting press through release after moving focus, so
-        # holding Enter cannot activate a button or send a second TV command.
-        if self.text_input.submission_key is not None:
-            self._shortcut_presses[self.text_input.submission_key] = "text_submit"
+    def _leave_text_input(self, key=None):
+        # Retain the editing key through release after focus moves, preventing
+        # held Enter/Escape from becoming a button or TV navigation command.
+        if key is not None:
+            self._shortcut_presses[key] = "text_edit"
         self.power_button.setFocus(Qt.OtherFocusReason)
 
     def _dispatch_shortcut(self, command, *, custom=False):
@@ -4474,7 +4480,7 @@ class SonyRemote(QMainWindow):
 
         if key in self._shortcut_presses:
             owned = previous
-            if (owned and command is not None and owned not in ("mute", "PlayPause", "text_submit")
+            if (owned and command is not None and owned not in ("mute", "PlayPause", "text_edit")
                     and self._focused_shortcut_allowed(owned, custom=custom)):
                 self._run_focused_shortcut(owned, custom=custom)
         else:

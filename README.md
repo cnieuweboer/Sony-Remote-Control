@@ -164,6 +164,7 @@ With the remote focused, **Insert** opens Input and **Delete** opens Settings; b
 
 ## Text input
 
+- **Escape** — Leaves Text Input without sending or clearing anything.
 - **Enter** — Sends the text to the TV.
 - **Ctrl+Enter** — Sends the text and automatically activates the TV keyboard action, such as **Search** or **Go**.
 - **Shift+Enter** — Focuses Text Input from the remote; inside the field, adds a new line. Configure or disable this through `Shortcuts.FocusTextInput`.

@@ -137,3 +137,28 @@ class TextShortcutTests(unittest.TestCase):
             self.assertFalse(self.w._focused_shortcut_allowed('focus_text_input'))
         finally:
             self.w.text_input = self.editor
+
+    def test_escape_leaves_editor_without_sending_or_clearing_text(self):
+        self.editor.setPlainText('keep this text')
+        self.editor.setFocus()
+        with patch.object(self.w,'run_command') as send:
+            QTest.keyClick(self.editor,Qt.Key_Escape)
+            send.assert_not_called()
+        self.assertTrue(self.w.power_button.hasFocus())
+        self.assertEqual(self.editor.toPlainText(),'keep this text')
+        self.w.send_ircc.assert_not_called()
+        QTest.keyClick(self.w.power_button,Qt.Key_Up)
+        self.w.send_ircc.assert_called_once_with('Up')
+
+    def test_held_escape_does_not_trigger_a_configured_remote_action(self):
+        self.w.config['Shortcuts']['Home'] = ['Esc']
+        self.w._shortcut_bindings = self.g['_compile_shortcuts'](self.w.config)
+        self.editor.setFocus()
+        QTest.keyPress(self.editor,Qt.Key_Escape)
+        for _ in range(3):
+            event = QKeyEvent(QEvent.KeyPress,Qt.Key_Escape,Qt.NoModifier,'',True,1)
+            self.app.sendEvent(self.w.power_button,event)
+        QTest.keyRelease(self.w.power_button,Qt.Key_Escape)
+        self.w.send_ircc.assert_not_called()
+        QTest.keyClick(self.w.power_button,Qt.Key_Escape)
+        self.w.send_ircc.assert_called_once_with('Home')

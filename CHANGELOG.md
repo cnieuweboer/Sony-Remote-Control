@@ -4,6 +4,8 @@ Release identifiers below come from the corresponding commits. Some releases upd
 
 ## 2026-10-21
 
+- Sony Remote 2026.10.21.21 — Escape leaves the text editor without sending or clearing text. Share focus-return handling with submission and retain Enter/Escape ownership until key release.
+
 - Sony Remote 2026.10.21.20 — Add configurable FocusTextInput shortcuts (Shift+Enter by default), preserving Shift+Enter newlines inside the editor. Return focus to the remote immediately after a text command is queued, retain focus when queueing is rejected, and allow empty strings through both submission paths. Preserve text and hold the submitting key's ownership until release.
 
 - Sony Remote 2026.10.21.19 — Track automatically maintained `Removed` flags without deleting app/input preferences or JSON positions. Confirm absence with another successful inventory after five seconds, retain entries on errors/standby, restore rediscovered entries, and rebuild dropdowns/favorites with immediate window resizing. Reuse ordinary status/input polling and add a 30-second visible/awake inventory refresh plus guarded verification; preserve unapplied JSON edits.
