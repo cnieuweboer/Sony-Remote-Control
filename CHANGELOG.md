@@ -4,6 +4,8 @@ Release identifiers below come from the corresponding commits. Some releases upd
 
 ## 2026-10-21
 
+- Sony Remote 2026.10.21.5 — Replace the ineffective media-key registrations with a focused Qt nativeEvent handler for WM_APPCOMMAND. Consume Windows media commands Sony owns without redispatching their keyboard events; normalize device-only commands into the existing Qt key filter. Preserve amplifier/SMTC ownership and popup/modal/calibration/focus guards, without a global hook.
+
 - Sony Remote 2026.10.21.4 — Register currently owned Windows media keys with Qt so its WM_APPCOMMAND handling does not also forward them to Windows. Registrations are window-scoped and have no activation handlers; the application event filter remains the only command dispatcher. Release registrations for amplifier global ownership, SMTC playback, popups, calibration, modal dialogs, and inactive windows.
 
 - Sony Remote 2026.10.21.3 — Use the Qt application event filter for focused shortcuts on Windows as well as other platforms. Remove Sony’s low-level Windows hook, thread/queue, and hook-only tests. Preserve popup/text/modal/calibration guards and amplifier/SMTC ownership; consume handled presses/releases, retain navigation/volume repeats, and suppress Mute/Play-Pause repeats. Add real Qt widget, shortcut-override, media-key, popup, and routing regression coverage. Yamaha is unchanged.
