@@ -498,7 +498,7 @@ class CalibrationServer(QObject):
 APP_NAME = "Sony Remote"
 
 
-__version__ = "2026.10.21.1"
+__version__ = "2026.10.21.2"
 
 
 CONFIG_PATH = Path(__file__).resolve().with_name("SonyRemote.json")
@@ -1813,9 +1813,10 @@ class TvTextEdit(QTextEdit):
 
 
 class CenteredComboBox(QComboBox):
-    def __init__(self, parent=None, *, animate_popup=False):
+    def __init__(self, parent=None, *, animate_popup=False, clear_on_close=False):
         super().__init__(parent)
         self._animate_popup = animate_popup
+        self._clear_on_close = clear_on_close
         self._popup = None
         self._popup_view = None
         self._final_rect = None
@@ -1833,6 +1834,8 @@ class CenteredComboBox(QComboBox):
     def _widen_popup(self):
         popup = self.view().window()
         if popup.isVisible():
+            if self._clear_on_close:
+                popup.installEventFilter(self)
             popup.setGeometry(popup.geometry().adjusted(-1, 0, 1, 0))
             if popup.layout() is not None:
                 popup.layout().activate()
@@ -1912,7 +1915,8 @@ class CenteredComboBox(QComboBox):
         # Clear the active marker before restoring widgets: restoration itself
         # can generate Qt show/hide/focus events.
         self._popup = None
-        popup.removeEventFilter(self)
+        if not self._clear_on_close:
+            popup.removeEventFilter(self)
         popup.setGeometry(self._final_rect)
         view.setGeometry(self._view_rect)
         view.show()
@@ -1927,7 +1931,16 @@ class CenteredComboBox(QComboBox):
         self._popup_view = None
         self._final_rect = self._view_rect = None
 
+    def _clear_closed_selection(self):
+        if not self.view().window().isVisible():
+            self.setCurrentIndex(-1)
+            self.view().selectionModel().clear()
+
     def eventFilter(self, watched, event):
+        if (self._clear_on_close and watched is self.view().window()
+                and event.type() in (QEvent.Hide, QEvent.Close)):
+            # Qt may emit activated after hiding; let that handler consume its index first.
+            QTimer.singleShot(0, self._clear_closed_selection)
         if self._popup is not None:
             if watched is self._popup and event.type() in (QEvent.Hide, QEvent.Close):
                 self._finish_popup_animation()
@@ -2321,7 +2334,7 @@ class SonyRemote(QMainWindow):
 
     def _build_app_controls(self):
         layout = self._section("Apps")
-        self.app_combo = CenteredComboBox(animate_popup=self.config["DropdownAnimationWorkaround"])
+        self.app_combo = CenteredComboBox(animate_popup=self.config["DropdownAnimationWorkaround"], clear_on_close=True)
         self.app_combo.view().setAutoFillBackground(True)
         self.app_combo.view().viewport().setAutoFillBackground(True)
         self.app_combo.setItemDelegate(CenteredComboDelegate(self.app_combo))

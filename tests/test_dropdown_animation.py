@@ -132,6 +132,39 @@ class DropdownAnimationTests(unittest.TestCase):
         self.finish()
         self.assertTrue(layout.isEnabled())
 
+    def test_action_dropdown_clears_cancelled_selection_and_highlight(self):
+        self.combo._clear_on_close = True
+        for animated in (False, True):
+            with self.subTest(animated=animated):
+                self.combo._animate_popup = animated
+                self.combo.setCurrentIndex(2)
+                self.combo.showPopup()
+                QTest.keyClick(self.app.focusWidget(), Qt.Key_Down)
+                QTest.keyClick(self.app.focusWidget(), Qt.Key_Escape)
+                self.app.processEvents()
+                self.assertEqual(self.combo.currentIndex(), -1)
+                self.assertFalse(self.combo.view().currentIndex().isValid())
+                self.assertEqual(self.activated.count(), 0)
+                self.combo.showPopup()
+                self.combo.view().window().hide()
+                self.app.processEvents()
+                self.assertEqual(self.combo.currentIndex(), -1)
+                self.assertFalse(self.combo.view().currentIndex().isValid())
+
+    def test_action_dropdown_preserves_activation_before_clearing(self):
+        self.combo._clear_on_close = True
+        received = []
+        self.combo.activated.connect(lambda index: received.append(self.combo.itemText(index)))
+        self.combo.setCurrentIndex(2)
+        self.combo.showPopup()
+        QTest.keyClick(self.app.focusWidget(), Qt.Key_Down)
+        expected = self.combo.view().currentIndex().data()
+        QTest.keyClick(self.app.focusWidget(), Qt.Key_Return)
+        self.app.processEvents()
+        self.assertEqual(received, [expected])
+        self.assertEqual(self.combo.currentIndex(), -1)
+        self.assertFalse(self.combo.view().currentIndex().isValid())
+
     def test_escape_cancels_animation_and_allows_reopening(self):
         expected = self.native_geometry()
         self.combo.showPopup()
