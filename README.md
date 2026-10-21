@@ -99,7 +99,7 @@ Set:
 - `InputControls` — show the input selector and favorite input buttons.
 - `VolumeControls` — show volume and mute controls.
 - `PlaybackControls` — show media playback controls.
-- `SMTCPlaybackKeys` — `false` by default. On Windows, use SMTC for global playback keys and disable focused interception of physical playback keys; requires the optional packages above. Participation pauses when the TV is unavailable or during calibration. Volume/mute routing is unchanged.
+- `SMTCPlaybackKeys` — `false` by default. On Windows, use SMTC for global playback keys and disable focused interception of physical playback keys; requires the optional packages above. Participation pauses when the TV is unavailable or during calibration. Active amplifier global bindings take priority over conflicting playback keys.
 - `AmplifierTVInput` — fallback amplifier input ID for the TV (for example `hdmi1`, `optical1`, or `tv`), rather than its display name. Leave empty to use TV controls unless a matching calibration supplies the input.
 - `Shortcuts` — focused action-to-key lists; see the keyboard shortcut section below.
 - `DiagnosticsEnabled` — `false` by default. Set to `true` to append unexpected errors and crash diagnostics to `SonyRemote-crash.log` beside the script. Logs contain the app version, exception types, and stack locations; exception messages, source lines, request data, and local variable values are omitted. If the log cannot be opened or written, the app continues without logging.
@@ -185,3 +185,6 @@ SonyRemote includes Windows Mica integration code inspired by
 [win32mica](https://github.com/marticliment/win32mica), licensed under the MIT License.
 
 The relevant license text is included in `THIRD_PARTY_LICENSES.txt`.
+
+
+Amplifier global shortcuts take priority over overlapping SMTC playback keys and focused shortcuts. Sony follows the amplifier's published ownership automatically; other bindings remain usable, and conflicts are released when global control becomes unavailable.

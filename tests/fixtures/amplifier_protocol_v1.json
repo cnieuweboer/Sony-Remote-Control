@@ -15,7 +15,12 @@
       "global_hotkeys_enabled": true,
       "global_hotkeys_active": true,
       "calibration_active": false,
-      "valid_for_ms": 6000
+      "valid_for_ms": 6000,
+      "global_shortcuts": [
+        16777330,
+        16777328,
+        16777329
+      ]
     },
     {
       "version": 1,
@@ -32,7 +37,12 @@
       "global_hotkeys_enabled": true,
       "global_hotkeys_active": true,
       "calibration_active": false,
-      "valid_for_ms": 6000
+      "valid_for_ms": 6000,
+      "global_shortcuts": [
+        16777330,
+        16777328,
+        16777329
+      ]
     }
   ],
   "commands": [

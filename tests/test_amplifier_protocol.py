@@ -40,11 +40,13 @@ class WireContractTests(unittest.TestCase):
         for expected in FIXTURE['states']:
             config = REMOTE['_default_config_copy']()
             config.update(Host='127.0.0.1', VolumeDb=expected['volume_unit'] == 'dB',
-                          GlobalVolumeHotkeys=True)
+                          GlobalShortcuts=REMOTE["DEFAULT_SHORTCUTS"])
             window = SimpleNamespace(config=config, last_status={
                 'power':'on', 'input':'tv', 'volume':100, 'max_volume':154, 'mute':False},
                 _last_status_at=100, connected=True, _shutting_down=False,
                 global_volume_hotkeys_active=True, calibration_active=False,
+                _global_bindings=REMOTE["_compile_shortcuts"](config, "GlobalShortcuts"),
+                _active_global_codes=lambda: [16777330, 16777328, 16777329],
                 api=REMOTE['YamahaApi']('127.0.0.1', config))
             with patch.object(REMOTE['time'], 'monotonic', return_value=100):
                 actual = REMOTE['YamahaRemote']._amplifier_snapshot(window)

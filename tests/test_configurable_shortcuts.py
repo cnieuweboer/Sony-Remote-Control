@@ -171,7 +171,7 @@ class FocusedBindingTests(unittest.TestCase):
     def test_native_modifier_resolution_and_disabled_physical_key(self):
         self.configure(VolumeUp=['Ctrl+Volume Up'])
         if not IS_TV:
-            self.window._hotkey_state = (True, False, 123, time.monotonic(), False)
+            self.window._hotkey_state = (True, 123, time.monotonic(), False)
         self.assertIsNone(self.window._resolve_native_volume(0xAF, 0))
         self.assertEqual(self.window._resolve_native_volume(0xAF, Qt.ControlModifier.value), 'volume_up')
         self.configure(VolumeUp=[])
@@ -186,8 +186,11 @@ class FocusedBindingTests(unittest.TestCase):
             self.window.adjust_volume.assert_not_called()
         else:
             self.configure(VolumeUp=['A'])
-            self.window._hotkey_state = (True, True, 123, time.monotonic(), False)
-            self.assertEqual(self.window._resolve_native_volume(0xAF, 0), 'volume_up')
+            self.window._hotkey_state = (True, 123, time.monotonic(), False)
+            self.window._global_native_bindings = {(0xAF, 0): 'volume_up'}
+            self.window._global_bindings = {Qt.Key_VolumeUp.value: 'volume_up'}
+            self.window._hotkey_state = (True, 0, time.monotonic(), False)
+            self.assertEqual(self.window._resolve_native_volume(0xAF, 0)[-1], 'volume_up')
 
     def test_smtc_keeps_custom_focused_playback(self):
         if not IS_TV:
@@ -212,11 +215,11 @@ class FocusedBindingTests(unittest.TestCase):
         self.configure(VolumeUp=['Ctrl+Volume Up'])
         window = self.window
         if not IS_TV:
-            window.config['GlobalVolumeHotkeys'] = False
+            window._global_bindings = {}
             window._publish_hotkey_state()
             # Exercise the Windows callback using an explicit foreground handle
             # even when this device-free suite runs on Linux.
-            window._hotkey_state = (True, False, int(window.winId()), time.monotonic(), False)
+            window._hotkey_state = (True, int(window.winId()), time.monotonic(), False)
         callback = window._accept_native_volume if IS_TV else window._accept_native_hotkey
         hook = self.g['_WindowsVolumeHook'](callback, resolve=window._resolve_native_volume)
         control_held = [True]

@@ -8,7 +8,8 @@ import threading
 from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
-from PySide6.QtCore import QCoreApplication, QEvent
+from PySide6.QtCore import QCoreApplication, QEvent, Qt
+from PySide6.QtGui import QKeyEvent
 from PySide6.QtTest import QSignalSpy
 from PySide6.QtWidgets import QApplication
 
@@ -375,7 +376,8 @@ class RoutingTests(unittest.TestCase):
         self.window.amplifier_client.state_deadline = window_fixture.time.monotonic() + 5
         with patch.object(self.window, '_amplifier_owns_hotkeys', return_value=True):
             self.window._refresh_playback_routing()
-            self.assertFalse(self.window._focused_shortcut_allowed('volume_up'))
+            event = QKeyEvent(QEvent.KeyPress, Qt.Key_VolumeUp, Qt.NoModifier)
+            self.assertIsNone(self.window._qt_shortcut_command(event))
         self.window.api.ircc.assert_not_called()
         self.assertEqual(self.window._playback_key_mode(), 'smtc')
 

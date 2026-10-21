@@ -115,7 +115,8 @@ class FocusedNativeVolumeTests(unittest.TestCase):
         self.window.amplifier_client.state_deadline = fixture.time.monotonic() + 10
         with patch.object(self.window, '_amplifier_owns_hotkeys', return_value=True):
             self.window._publish_native_volume_state()
-        self.assertFalse(self.window._accept_native_volume('volume_up', self.handle))
+        self.window._native_owned_codes = None  # Legacy producer owns physical volume keys.
+        self.assertIsNone(self.window._resolve_native_volume(0xAF, 0))
         with self.window._native_volume_lock:
             self.window._native_volume_state = (self.handle, False, fixture.time.monotonic() - 1)
         self.assertTrue(self.window._accept_native_volume('volume_up', self.handle))
