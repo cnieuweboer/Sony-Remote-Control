@@ -41,6 +41,71 @@ class FocusedShortcutTests(unittest.TestCase):
     def release(self, key):
         return self.event(key, kind=QEvent.KeyRelease)
 
+    def windows_media_registry(self):
+        with patch.dict(fixture.GLOBALS, sys=SimpleNamespace(platform='win32')):
+            self.window._setup_shortcuts()
+        self.window._refresh_shortcut_context()
+        return self.window._media_shortcuts
+
+    def test_windows_media_registrations_claim_owned_keys_without_second_dispatch(self):
+        shortcuts = self.windows_media_registry()
+        self.assertEqual(len(shortcuts), 9)
+        fired = Mock()
+        for shortcut in shortcuts.values():
+            self.assertEqual(shortcut.context(), Qt.WindowShortcut)
+            shortcut.activated.connect(fired)
+            self.assertTrue(shortcut.isEnabled())
+        for _ in range(25):
+            QTest.keyClick(self.window.power_button, Qt.Key_VolumeUp)
+        QTest.keyClick(self.window.power_button, Qt.Key_VolumeMute)
+        QTest.keyClick(self.window.power_button, Qt.Key_MediaTogglePlayPause)
+        self.assertEqual(self.window.adjust_volume.call_count, 25)
+        self.window.toggle_mute.assert_called_once()
+        self.window.send_ircc.assert_called_once_with('PlayPause')
+        fired.assert_not_called()
+
+    def test_media_registry_yields_to_amplifier_and_smtc(self):
+        shortcuts = self.windows_media_registry()
+        with patch.object(self.window, '_amplifier_owns_hotkeys', return_value=True):
+            self.window._refresh_playback_routing()
+            for command in ('volume_up', 'volume_down', 'mute'):
+                self.assertFalse(shortcuts[command].isEnabled())
+            self.assertFalse(self.event(Qt.Key_VolumeUp))
+        # An initially unowned press is not reserved halfway through its hold.
+        self.window._refresh_playback_routing()
+        self.assertFalse(shortcuts['volume_up'].isEnabled())
+        self.release(Qt.Key_VolumeUp)
+        self.assertTrue(shortcuts['volume_up'].isEnabled())
+        self.window.config['SMTCPlaybackKeys'] = True
+        self.window._refresh_playback_routing()
+        for command in ('PlayPause', 'Play', 'Pause', 'Stop', 'Next', 'Prev'):
+            self.assertFalse(shortcuts[command].isEnabled())
+        self.assertTrue(shortcuts['volume_up'].isEnabled())
+
+    def test_media_registry_releases_popup_calibration_text_and_inactive_contexts(self):
+        shortcuts = self.windows_media_registry()
+        self.window.text_input.setFocus()
+        self.window._refresh_shortcut_context()
+        self.assertTrue(shortcuts['volume_up'].isEnabled())
+        self.assertFalse(shortcuts['PlayPause'].isEnabled())
+        self.window.power_button.setFocus()
+        combo = self.window.input_combo
+        combo.showPopup()
+        self.window._refresh_shortcut_context()
+        self.assertFalse(any(shortcut.isEnabled() for shortcut in shortcuts.values()))
+        combo.hidePopup()
+        self.window.activateWindow()
+        self.window.power_button.setFocus()
+        self.app.processEvents()
+        self.window.calibration_active = True
+        self.window._refresh_playback_routing()
+        self.assertFalse(any(shortcut.isEnabled() for shortcut in shortcuts.values()))
+        self.window.calibration_active = False
+        self.window.hide()
+        self.app.processEvents()
+        self.window._refresh_shortcut_context()
+        self.assertFalse(any(shortcut.isEnabled() for shortcut in shortcuts.values()))
+
     def test_windows_and_other_platforms_share_the_qt_path(self):
         for platform in ('win32', 'linux', 'darwin'):
             with self.subTest(platform=platform), patch.dict(

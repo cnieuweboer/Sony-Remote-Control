@@ -19,7 +19,7 @@ from pathlib import Path
 from xml.sax.saxutils import escape
 from PySide6.QtCore import QByteArray, QEasingCurve, QElapsedTimer, QRect, QEvent, QFileSystemWatcher, QLockFile, QObject, QProcess, QRunnable, Qt, QThreadPool, QTimer, Signal
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
-from PySide6.QtGui import QAction, QPalette, QStyleHints
+from PySide6.QtGui import QAction, QKeySequence, QPalette, QShortcut, QStyleHints
 from PySide6.QtWidgets import (
     QApplication, QComboBox, QDialogButtonBox, QFrame, QGridLayout, QHBoxLayout, QLabel,
     QMainWindow, QMenu, QMessageBox, QPushButton, QProxyStyle, QStyle, QTextEdit,
@@ -497,7 +497,7 @@ class CalibrationServer(QObject):
 APP_NAME = "Sony Remote"
 
 
-__version__ = "2026.10.21.3"
+__version__ = "2026.10.21.4"
 
 
 CONFIG_PATH = Path(__file__).resolve().with_name("SonyRemote.json")
@@ -1966,6 +1966,16 @@ class SonyRemote(QMainWindow):
     def _refresh_playback_routing(self):
         if self._smtc is not None:
             self._smtc.update(self._smtc_commands())
+        self._refresh_media_shortcuts()
+
+    def _refresh_media_shortcuts(self):
+        # Windows' Qt backend checks the shortcut registry when deciding
+        # whether WM_APPCOMMAND is handled. Event.accept() alone is insufficient.
+        for command, shortcut in getattr(self, "_media_shortcuts", {}).items():
+            key = shortcut.key()[0].key()
+            owner = self._shortcut_presses.get(key, command)
+            shortcut.setEnabled(owner == command and self._focused_shortcut_allowed(command))
+
 
     def _smtc_background_polling(self):
         return self._playback_key_mode() == "smtc" and self._smtc is not None
@@ -1979,6 +1989,21 @@ class SonyRemote(QMainWindow):
         self._popup_shortcut_keys = set()
         self._shortcut_presses = {}
         self._shortcut_refresh_pending = False
+        self._media_shortcuts = {}
+        if sys.platform == "win32":
+            for key, command in (
+                    (Qt.Key_VolumeUp, "volume_up"), (Qt.Key_VolumeDown, "volume_down"),
+                    (Qt.Key_VolumeMute, "mute"), (Qt.Key_MediaTogglePlayPause, "PlayPause"),
+                    (Qt.Key_MediaPlay, "Play"), (Qt.Key_MediaPause, "Pause"),
+                    (Qt.Key_MediaStop, "Stop"), (Qt.Key_MediaNext, "Next"),
+                    (Qt.Key_MediaPrevious, "Prev")):
+                shortcut = QShortcut(QKeySequence(key), self)
+                shortcut.setContext(Qt.WindowShortcut)
+                shortcut.setAutoRepeat(False)
+                shortcut.setEnabled(False)
+                # No activation handler: the application event filter is the
+                # sole dispatcher and accepts ShortcutOverride before shortcuts fire.
+                self._media_shortcuts[command] = shortcut
         QApplication.instance().installEventFilter(self)
 
     # ----------------------------
@@ -3452,11 +3477,13 @@ class SonyRemote(QMainWindow):
             else:
                 self._popup_shortcut_keys.discard(key)
                 owned = self._shortcut_presses.pop(key, None)
+                self._refresh_media_shortcuts()
             if owned:
                 event.accept()
                 return True
             return super().eventFilter(watched, event)
 
+        self._refresh_media_shortcuts()
         if QApplication.activePopupWidget() is not None:
             self._popup_shortcut_keys.add(key)
             return super().eventFilter(watched, event)
@@ -3490,6 +3517,7 @@ class SonyRemote(QMainWindow):
                 self._shortcut_presses[key] = owned
             if owned:
                 self._run_focused_shortcut(owned)
+        self._refresh_media_shortcuts()
         if owned:
             event.accept()
             return True

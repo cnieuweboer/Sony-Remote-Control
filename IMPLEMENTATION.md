@@ -299,3 +299,12 @@ Open popups retain navigation and the entire Enter press, including delivery aft
 Palette/GUI events still refresh SMTC availability on the Qt thread. Shutdown/restart no longer install, pause, or remove a Sony native keyboard hook. The dedicated native-hook lifecycle test file was removed with that implementation; Yamaha retains its own hook and tests.
 
 `tests/test_focused_shortcuts.py` uses real Qt application-filter delivery to buttons, comboboxes, text input, popups, and a competing QShortcut. It covers press/release and repeat ownership, popup Enter forwarding, media commands, rapid volume input, SMTC/amplifier ownership, calibration/modal/focus guards, and the Windows/non-Windows dispatch branches. Offscreen Linux tests cannot establish Windows OS-level media-key suppression or physical keyboard-wheel behavior; these require desktop verification, including both remotes running together.
+
+
+### Windows media-command registration
+
+Qt's Windows backend decides whether to consume WM_APPCOMMAND by checking `QShortcutMap::hasShortcutForKeySequence`; accepting the delivered QKeyEvent does not satisfy that check. Sony therefore registers window-scoped QShortcut entries for its eligible volume and playback keys on Windows. They have no activation handlers: the application filter accepts ShortcutOverride and dispatches the key once, while the registry tells Qt's native backend that the associated Windows media command is owned.
+
+Registrations refresh with Qt focus/popup changes, device/IPC/SMTC state, lifecycle changes, and key handling. They respect original press ownership, including a held key initially yielded to the amplifier. Popup/modal/calibration and inactive states release the registrations, SMTC releases playback keys, and amplifier global ownership releases volume/mute keys. No Windows keyboard hook or second command-dispatch path is added. Tests verify actual Qt shortcut registration and eligibility, release/recovery, and one dispatch per media press; native Windows forwarding still requires a desktop check.
+
+Reference: [Qt 6.10.2 Windows multimedia-key handling](https://github.com/qt/qtbase/blob/v6.10.2/src/plugins/platforms/windows/qwindowskeymapper.cpp), `translateMultimediaKeyEventInternal`.
