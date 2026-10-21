@@ -322,3 +322,14 @@ Prepared entries retain their integer `tv` and estimate source and add an in-mem
 ### TV power gates the volume UI
 
 Volume/mute button availability requires an initialized, active TV and a running remote, independently of amplifier routing eligibility. Standby/offline updates immediately repaint the volume placeholder and “Mute”; amplifier IPC updates and cached mute/volume values cannot overwrite that inactive display. Once a fresh TV status reports active, ordinary amplifier/TV routing supplies the displayed value and mute state again. Device state tracking and routing ownership remain separate from this UI presentation rule.
+
+
+## Rate-limited volume read ownership
+
+While the TV volume rate-limit loop or one of its steps is active, normal status cycles skip `getVolumeInformation` but continue power and input polling. They check ownership both when scheduled and after the power request, avoiding an audio read when rate limiting starts during that request. The limiter is never delayed by an ordinary poll or by a recent-read cooldown; a volume request already in flight may finish.
+
+Normal poll callbacks always process their power result. Audio is accepted only if the request generation/target still matches, the limiter no longer owns reads, and its observation time is not older than the last accepted volume response. Limiter reads update cached volume/mute and their observation timestamp, repaint through the existing target-preserving UI path, and publish cached state without additional device reads. Late results from cancelled/routed-away loops are ignored. Completion/failure resumes normal audio polling through the existing follow-up; standby cancels the limiter, and in-flight steps retain ownership until their callback finishes.
+
+`_status_observed_at` records the actual power-response time and `_volume_observed_at` the actual audio-response time, captured before any subsequent command. An active-TV calibration snapshot uses the older observation for its combined freshness. Limiter reads cannot refresh old power facts, nor can power-only polls refresh old audio facts. The mapping, IPC schema, limiter interval and relative-command behavior remain unchanged.
+
+Tests cover audio-read counts during ownership, continued power/input polling, limiter startup during a power read, no waiting behind an existing poll, target/mute presentation, stale callback delivery, cancellation/failure/resumption, and combined freshness.

@@ -477,24 +477,29 @@ class DiscoveryTests(unittest.TestCase):
         self.assertEqual(self.window.volume_value.text(), '40')
         self.assertEqual(self.window.last_volume['volume'], 20)
 
-    def test_status_poll_keeps_target_and_updates_actual_volume_and_mute(self):
+    def test_status_poll_skips_volume_but_keeps_power_and_input_polling(self):
         self.settle_volume_controls()
         self.window._desired_volume = 40
         self.window._volume_rate_loop_running = True
         self.window.volume_value.setText('40')
         self.device.get_volume = Mock(return_value={'volume': 25, 'mute': True})
+        previous_power = self.device.calls['power']
+        previous_inputs = self.device.calls['inputs']
         self.window.poll_status()
-        self.wait(lambda: not self.window.poll_running)
+        self.wait(lambda: not self.window.poll_running and not self.window._input_status_running)
+        self.device.get_volume.assert_not_called()
+        self.assertGreater(self.device.calls['power'], previous_power)
+        self.assertGreater(self.device.calls['inputs'], previous_inputs)
         self.assertEqual(self.window.volume_value.text(), '40')
-        self.assertEqual(self.window.last_volume['volume'], 25)
-        self.assertEqual(self.window.mute_button.text(), 'Unmute')
+        self.assertEqual(self.window.last_volume['volume'], 20)
+        self.assertEqual(self.window.mute_button.text(), 'Mute')
 
     def test_old_poll_cannot_overwrite_a_completed_target(self):
         self.settle_volume_controls()
         self.window._desired_volume = 40
         self.window._volume_rate_loop_running = True
         deliver = self.pending_poll_result()  # TV still reported 20.
-        observed_at, sequence = self.window._status_observed_at, self.window._status_sequence
+        volume_at, sequence = self.window._volume_observed_at, self.window._status_sequence
         self.window._desired_volume = None
         self.window._volume_rate_loop_running = False
         self.window.last_volume = dict(self.window.last_volume, volume=40)
@@ -502,8 +507,8 @@ class DiscoveryTests(unittest.TestCase):
         deliver()
         self.assertEqual(self.window.volume_value.text(), '40')
         self.assertEqual(self.window.last_volume['volume'], 40)
-        self.assertEqual(self.window._status_observed_at, observed_at)
-        self.assertEqual(self.window._status_sequence, sequence)
+        self.assertEqual(self.window._volume_observed_at, volume_at)
+        self.assertGreater(self.window._status_sequence, sequence)
 
     def test_poll_before_a_new_request_cannot_undo_its_completed_volume(self):
         self.settle_volume_controls()
@@ -518,6 +523,82 @@ class DiscoveryTests(unittest.TestCase):
         deliver()
         self.assertEqual(self.window.volume_value.text(), '21')
         self.assertEqual(self.window.last_volume['volume'], 21)
+
+    def test_limiter_owns_mute_feedback_and_does_not_wait_for_existing_poll(self):
+        self.settle_volume_controls()
+        self.window._desired_volume = 40
+        self.window._volume_rate_loop_running = True
+        self.window.poll_running = True
+        self.device.get_volume = Mock(return_value={'volume': 25, 'mute': True})
+        self.device.adjust_volume = Mock()
+        jobs = []
+        power_time = self.window._status_observed_at
+        with patch.object(self.window, 'run_command', side_effect=lambda function, **callbacks:
+                          jobs.append((function, callbacks)) or True):
+            self.window._volume_rate_step()
+        self.assertEqual(len(jobs), 1)
+        function, callbacks = jobs[0]
+        result = function()
+        callbacks['on_result'](result)
+        self.window.poll_running = False
+        self.device.get_volume.assert_called_once()
+        self.device.adjust_volume.assert_called_once_with(1)
+        self.assertEqual(self.window.volume_value.text(), '40')
+        self.assertEqual(self.window.mute_button.text(), 'Unmute')
+        self.assertEqual(self.window.last_volume['volume'], 25)
+        self.assertEqual(self.window._status_observed_at, power_time)
+        self.assertGreaterEqual(self.window._volume_observed_at, power_time)
+
+    def test_limiter_start_during_power_read_skips_ordinary_audio_read(self):
+        self.settle_volume_controls()
+        def power():
+            self.window._volume_rate_loop_running = True
+            self.window._desired_volume = 40
+            return 'active'
+        self.device.get_power = power
+        self.device.get_volume = Mock()
+        self.window.poll_status()
+        self.wait(lambda: not self.window.poll_running)
+        self.device.get_volume.assert_not_called()
+        self.assertEqual(self.window._desired_volume, 40)
+
+    def test_inflight_ordinary_audio_cannot_overwrite_newer_limiter_feedback(self):
+        self.settle_volume_controls()
+        deliver = self.pending_poll_result()
+        with patch.object(self.window, 'run_command', return_value=True):
+            self.window.adjust_volume(20)
+        info = dict(self.window.last_volume, volume=25, mute=True)
+        self.window._accept_volume_status(info, time.monotonic())
+        observed_at = self.window._volume_observed_at
+        self.window.update_volume_ui(info)
+        deliver()
+        self.assertEqual(self.window.last_volume, info)
+        self.assertEqual(self.window._volume_observed_at, observed_at)
+        self.assertEqual(self.window.volume_value.text(), '40')
+        self.assertEqual(self.window.mute_button.text(), 'Unmute')
+
+    def test_volume_polling_resumes_after_limiter_stops(self):
+        self.settle_volume_controls()
+        self.window._volume_rate_loop_running = True
+        self.device.get_volume = Mock(return_value={'volume': 30, 'mute': False})
+        self.window.poll_status()
+        self.wait(lambda: not self.window.poll_running)
+        self.device.get_volume.assert_not_called()
+        self.window._volume_rate_loop_running = False
+        self.window._desired_volume = None
+        self.window.poll_status()
+        self.wait(lambda: not self.window.poll_running)
+        self.device.get_volume.assert_called_once()
+        self.assertEqual(self.window.last_volume['volume'], 30)
+
+    def test_calibration_freshness_uses_oldest_power_or_volume_observation(self):
+        self.settle_volume_controls()
+        for power_at, volume_at, expected in ((90, 100, 0), (100, 90, 0), (99, 98, 4000)):
+            self.window._status_observed_at = power_at
+            self.window._volume_observed_at = volume_at
+            with patch.dict(GLOBALS, time=Mock(monotonic=Mock(return_value=100))):
+                state = self.window._calibration_snapshot()
+            self.assertEqual(state['valid_for_ms'], expected)
 
     def test_unlimited_commands_keep_target_until_a_poll_started_after_completion(self):
         self.settle_volume_controls()

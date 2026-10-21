@@ -498,7 +498,7 @@ class CalibrationServer(QObject):
 APP_NAME = "Sony Remote"
 
 
-__version__ = "2026.10.21.8"
+__version__ = "2026.10.21.9"
 
 
 CONFIG_PATH = Path(__file__).resolve().with_name("SonyRemote.json")
@@ -2005,6 +2005,7 @@ class SonyRemote(QMainWindow):
         self._calibration_operation = False
         self._status_sequence = 0
         self._status_observed_at = 0
+        self._volume_observed_at = 0
         self.calibration_server = None
         self.activation_server = None
         self.mica_enabled = bool(config["Mica"] and supports_mica())
@@ -2074,7 +2075,10 @@ class SonyRemote(QMainWindow):
 
     def _calibration_snapshot(self):
         volume = self.last_volume or {}
-        age = time.monotonic() - self._status_observed_at
+        observed_at = self._status_observed_at
+        if self.last_power == "active":
+            observed_at = min(observed_at, self._volume_observed_at)
+        age = time.monotonic() - observed_at
         state = {"version": 1, "type": "state", "role": "tv",
                  "online": self.last_power is not None, "power": self.last_power,
                  "volume": volume.get("volume"), "mute": volume.get("mute"),
@@ -2760,6 +2764,13 @@ class SonyRemote(QMainWindow):
         self.input_combo.setCurrentIndex(active_index)
         self.input_combo.blockSignals(False)
 
+    def _accept_volume_status(self, info, observed_at):
+        if not info or observed_at < self._volume_observed_at:
+            return False
+        self.last_volume = info
+        self._volume_observed_at = observed_at
+        return True
+
     def poll_status(self):
         if (self._shutting_down or self._calibration_operation or missing_config_settings(self.config)
                 or (not self.calibration_active and not self._smtc_background_polling()
@@ -2770,20 +2781,22 @@ class SonyRemote(QMainWindow):
         self.poll_running = True
         volume_request = (self._volume_generation, self._desired_volume)
         volume_busy = bool(self._volume_rate_loop_running or self._pending_volume_commands)
+        read_volume = not (self._volume_rate_loop_running or self._volume_rate_step_running)
 
         def query():
             power = self.api.get_power()
-            data = {"power": power}
-            if power == "active" and (self.config["VolumeControls"] or self.calibration_active):
+            data = {"power": power, "observed_at": time.monotonic()}
+            # Recheck after the power request: a limiter may have started
+            # while it was in flight. Never delay the limiter behind this poll.
+            if (power == "active" and read_volume
+                    and not (self._volume_rate_loop_running or self._volume_rate_step_running)
+                    and (self.config["VolumeControls"] or self.calibration_active)):
                 data["volume"] = self.api.get_volume()
-            data["observed_at"] = time.monotonic()
+                data["volume_observed_at"] = time.monotonic()
             return data
 
         def done(data):
-            # Ignore a poll superseded by new input/target completion, rather
-            # than refreshing status freshness with an outdated volume.
-            if data.get("volume") and volume_request != (self._volume_generation, self._desired_volume):
-                return
+            # Power remains useful even if this poll's volume was superseded.
             self._status_sequence += 1
             self._status_observed_at = data["observed_at"]
             self._update_discovery_feedback()
@@ -2799,9 +2812,14 @@ class SonyRemote(QMainWindow):
                 app_enabled=True,
             )
             self.update_power_ui(self.last_power)
-            if data.get("volume"):
-                self.last_volume = data["volume"]
-                if not (volume_busy or self._volume_rate_loop_running or self._pending_volume_commands):
+            if not is_active:
+                self._desired_volume = None
+                self._volume_rate_loop_running = False
+                self.volume_rate_timer.stop()
+            elif (volume_request == (self._volume_generation, self._desired_volume)
+                    and not (self._volume_rate_loop_running or self._volume_rate_step_running)
+                    and self._accept_volume_status(data.get("volume"), data.get("volume_observed_at", 0))):
+                if not (volume_busy or self._pending_volume_commands):
                     self._desired_volume = None
                 if self.config["VolumeControls"]:
                     self.update_volume_ui(self.last_volume)
@@ -2935,6 +2953,7 @@ class SonyRemote(QMainWindow):
     def set_offline(self):
         self.last_power = None
         self.last_volume = None
+        self._volume_observed_at = 0
         self._desired_volume = None
         self._volume_rate_loop_running = False
         self.volume_rate_timer.stop()
@@ -3195,34 +3214,41 @@ class SonyRemote(QMainWindow):
 
         def step():
             info = self.api.get_volume()
+            observed_at = time.monotonic()
             current = int(info.get("volume", 0))
             target = self._desired_volume
             if target is None or current == target:
-                return {"done": True, "info": info}
+                return {"done": True, "info": info, "observed_at": observed_at}
             direction = 1 if current < target else -1
             self.api.adjust_volume(direction)
-            return {"done": False, "info": info}
+            return {"done": False, "info": info, "observed_at": observed_at}
 
         def done(result):
             self._volume_rate_step_running = False
-            if self._use_amplifier():
+            if self._use_amplifier() or not self._volume_rate_loop_running:
                 return
             info = result.get("info")
-            if info:
-                self.last_volume = info
+            if not self._accept_volume_status(info, result["observed_at"]):
+                self._schedule_volume_rate_step()
+                return
             # A newer keypress may have changed the target while this result
             # waited for GUI delivery. Only finish against the current target.
-            if result.get("done") and (
+            finished = result.get("done") and (
                 self._desired_volume is None
                 or int(info.get("volume", 0)) == self._desired_volume
-            ):
+            )
+            if finished:
                 self._volume_rate_loop_running = False
                 self._desired_volume = None
-                if self.last_volume:
-                    self.update_volume_ui(self.last_volume)
+            self._status_sequence += 1
+            if self.config["VolumeControls"]:
+                self.update_volume_ui(self.last_volume)
+            if self.calibration_server is not None:
+                self.calibration_server.publish()
+            if finished:
                 QTimer.singleShot(200, self.poll_status)
-                return
-            self._schedule_volume_rate_step()
+            else:
+                self._schedule_volume_rate_step()
 
         def failed(error):
             self._volume_rate_step_running = False

@@ -24,13 +24,15 @@ class VolumeLimiterTests(unittest.TestCase):
             _volume_rate_step_running=False, _desired_volume=20, _volume_generation=0,
             _use_amplifier=lambda: self.routed, _calibration_blocked=lambda: False,
             _route_volume_command=lambda command: False,
-            config={'VolumeRateLimit': {'Active': True, 'RateMs': 500}},
-            last_volume=info, volume_value=SimpleNamespace(setText=Mock()),
+            config={'VolumeRateLimit': {'Active': True, 'RateMs': 500}, 'VolumeControls': True},
+            last_volume=info, _volume_observed_at=0, _status_observed_at=90,
+            _status_sequence=0, calibration_server=None, volume_value=SimpleNamespace(setText=Mock()),
             update_volume_ui=Mock(), _schedule_volume_rate_step=Mock(),
             handle_request_error=Mock(), poll_status=Mock(),
             api=SimpleNamespace(get_volume=self.get_volume, adjust_volume=self.adjust_device),
             run_command=self.enqueue,
         )
+        self.window._accept_volume_status = lambda info, at: CLS._accept_volume_status(self.window, info, at)
         self.timer = patch.object(REMOTE['QTimer'], 'singleShot')
         self.refresh = self.timer.start()
         self.addCleanup(self.timer.stop)
@@ -72,7 +74,7 @@ class VolumeLimiterTests(unittest.TestCase):
         self.assertEqual(self.window._desired_volume, 20 + amount)
         self.assertTrue(self.window._volume_rate_loop_running)
         self.assertEqual(self.window.volume_value.setText.call_args.args, (str(20 + amount),))
-        self.window.update_volume_ui.assert_not_called()
+        self.window.update_volume_ui.assert_called_with(self.window.last_volume)
         self.finish_target()
         self.assertEqual(self.volume, 20 + amount)
         self.assertEqual(self.commands, [amount])
@@ -121,6 +123,44 @@ class VolumeLimiterTests(unittest.TestCase):
         self.finish_target()
         self.assertEqual(self.volume, 21)
         self.assertEqual(self.commands, [1, 1])
+
+    def test_limiter_read_updates_volume_freshness_without_refreshing_power(self):
+        self.window._desired_volume = 21
+        deliver = self.pending_result()
+        deliver()
+        self.assertGreater(self.window._volume_observed_at, 0)
+        self.assertEqual(self.window._status_observed_at, 90)
+        self.assertEqual(self.window._status_sequence, 1)
+        self.window.update_volume_ui.assert_called_with(self.window.last_volume)
+
+    def test_older_limiter_result_cannot_replace_a_newer_volume_observation(self):
+        deliver = self.pending_result()
+        newer = dict(self.window.last_volume, volume=30, mute=True)
+        self.window._accept_volume_status(newer, REMOTE['time'].monotonic() + 1)
+        deliver()
+        self.assertEqual(self.window.last_volume, newer)
+        self.window._schedule_volume_rate_step.assert_called_once()
+        self.assertTrue(self.window._volume_rate_loop_running)
+
+    def test_cancelled_limiter_result_is_ignored_and_does_not_resume_loop(self):
+        deliver = self.pending_result()
+        self.window._volume_rate_loop_running = False
+        self.window._desired_volume = None
+        previous = self.window.last_volume
+        deliver()
+        self.assertIs(self.window.last_volume, previous)
+        self.window._schedule_volume_rate_step.assert_not_called()
+        self.window.update_volume_ui.assert_not_called()
+        self.assertFalse(self.window._volume_rate_step_running)
+
+    def test_limiter_failure_releases_volume_poll_ownership(self):
+        CLS._volume_rate_step(self.window)
+        _, callbacks = self.work.popleft()
+        callbacks['on_error'](RuntimeError('device failure'))
+        self.assertFalse(self.window._volume_rate_loop_running)
+        self.assertFalse(self.window._volume_rate_step_running)
+        self.assertIsNone(self.window._desired_volume)
+        self.refresh.assert_called_once_with(200, self.window.poll_status)
 
     def test_routing_change_does_not_restart_cancelled_tv_loop(self):
         deliver = self.pending_result()
