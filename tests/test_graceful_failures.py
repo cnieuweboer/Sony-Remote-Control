@@ -238,6 +238,21 @@ class DiscoveryTests(unittest.TestCase):
         self.assertFalse(self.window.app_combo.isEnabled())
         self.window.show_error.assert_not_called()
 
+    def test_calibrated_volume_shows_bucket_decimals_and_integer_first_step(self):
+        self.start_and_settle()
+        document = {"format_version": 2, "tv_device_id": "tv-id", "amplifier_device_id": "amp-id",
+                    "amplifier_tv_input": "tv",
+                    "tv_volume_by_amplifier_raw_volume": [19] * 51 + [20, 20, 20, 21],
+                    "estimated_amplifier_raw_volumes": [53]}
+        mapping = REMOTE['prepare_volume_mapping'](document)
+        with patch.object(self.window, '_use_amplifier', return_value=True), \
+                patch.object(self.window, '_matched_volume_mapping', return_value=mapping):
+            for raw, expected in ((51, '20'), (52, '20.3'), (53, '≈20.7'), (54, '21')):
+                self.window.amplifier_state = {'raw_volume': raw, 'mute': False}
+                self.window.update_volume_ui({'volume': 20, 'mute': False})
+                self.assertEqual(self.window.volume_value.text(), expected)
+                self.assertEqual(self.window.volume_value.toolTip(), 'Calibrated TV scale')
+
     def test_remote_codes_recovery_restores_navigation_and_shortcut_capabilities(self):
         self.device.failures['remote_codes'] = REMOTE['DeviceResponseError']('Unavailable')
         self.start_and_settle()

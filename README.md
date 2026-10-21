@@ -153,7 +153,7 @@ A matching calibration automatically identifies the amplifier's TV input and dis
 - **During calibration:** Volume can go **VERY HIGH**, and volume changes may unmute the TV/amplifier. Keep the source silent and avoid physical controls until cleanup finishes.
 - **After calibration:** The helper attempts to restore the starting settings, including after cancellation or failure. **Check speaker outputs, volume, and mute on the TV, amplifier, and computer before playing sound**, especially if the helper was interrupted.
 
-Sony loads a successful calibration automatically; no manual `AmplifierTVInput` edit is needed. An **≈** beside the volume marks an estimated value; calibration changes Sony's displayed number without setting the physical TV's volume.
+Sony loads a successful calibration automatically; no manual `AmplifierTVInput` edit is needed. Calibrated volume shows decimal steps within each TV-number group (for example **20**, **20.5**). An **≈** beside the volume marks an estimated value; calibration changes Sony's displayed number without setting the physical TV's volume.
 
 ## Navigation
 

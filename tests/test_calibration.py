@@ -800,7 +800,7 @@ class MappingTests(unittest.TestCase):
 
     def test_display_marks_estimates_and_fractional_values_without_reinterpolation(self):
         mapping = REMOTE['prepare_volume_mapping'](HELPER['runtime_document'](self.mapping()))
-        for raw, expected in ((-1, (0, False)), (0, (0, False)), (1, (0, False)),
+        for raw, expected in ((-1, (0, False)), (0, (0, False)), (1, (0.5, False)),
                               (2, (1, False)), (3, (2, True)), (2.5, (2, True)),
                               (4.2, (3, True)), (100, (4, False))):
             with self.subTest(raw=raw):

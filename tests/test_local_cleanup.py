@@ -107,12 +107,50 @@ class RuntimeMappingTests(unittest.TestCase):
                     with self.assertRaises(ValueError):
                         module["validate_runtime_mapping"](document)
 
+    def test_decimal_buckets_follow_exact_group_size(self):
+        for size, expected in ((1, [20]), (2, [20, 20.5]), (3, [20, 20.3, 20.7]),
+                               (4, [20, 20.3, 20.5, 20.8])):
+            with self.subTest(size=size):
+                document = self.document()
+                levels = [19] + [20] * size + [24, 24]
+                document['tv_volume_by_amplifier_raw_volume'] = levels
+                document['estimated_amplifier_raw_volumes'] = []
+                mapping = REMOTE['prepare_volume_mapping'](document)
+                values = [REMOTE['mapped_tv_volume'](mapping, raw)[0] for raw in range(1, size + 1)]
+                self.assertEqual(values, expected)
+                # A missing adjacent TV value does not change this bucket.
+                self.assertEqual(REMOTE['mapped_tv_volume'](mapping, size + 2)[0], 24.5)
+                self.assertEqual(document['tv_volume_by_amplifier_raw_volume'], levels)
+
+    def test_large_buckets_never_round_into_next_tv_integer(self):
+        document = self.document()
+        document['tv_volume_by_amplifier_raw_volume'] = [20] * 101 + [21]
+        document['estimated_amplifier_raw_volumes'] = []
+        mapping = REMOTE['prepare_volume_mapping'](document)
+        values = [REMOTE['mapped_tv_volume'](mapping, raw)[0] for raw in range(101)]
+        self.assertEqual(values[0], 20)
+        self.assertEqual(values[-1], 20.9)
+        self.assertEqual(values, sorted(values))
+        self.assertTrue(all(20 <= value < 21 for value in values))
+        self.assertEqual(REMOTE['mapped_tv_volume'](mapping, 101), (21, False))
+
+    def test_decimal_clamping_preserves_final_bucket_and_estimate_flags(self):
+        document = self.document()
+        document['tv_volume_by_amplifier_raw_volume'] = [0, 0, 20, 20, 20]
+        document['estimated_amplifier_raw_volumes'] = [3]
+        mapping = REMOTE['prepare_volume_mapping'](document)
+        self.assertEqual(REMOTE['mapped_tv_volume'](mapping, -1), (0, False))
+        self.assertEqual(REMOTE['mapped_tv_volume'](mapping, 3), (20.3, True))
+        self.assertEqual(REMOTE['mapped_tv_volume'](mapping, 4), (20.7, False))
+        self.assertEqual(REMOTE['mapped_tv_volume'](mapping, 100), (20.7, False))
+        self.assertEqual(str(REMOTE['mapped_tv_volume'](mapping, 2)[0]), '20')
+
     def test_display_preparation_preserves_scale_and_estimates(self):
         document = self.document()
         mapping = REMOTE["prepare_volume_mapping"](document)
         self.assertEqual((mapping["raw_min"], mapping["raw_max"], mapping["tv_min"], mapping["tv_max"]), (0, 3, 0, 2))
         self.assertEqual((mapping["tv_id"], mapping["amplifier_id"], mapping["input"]), ("tv-id", "amp-id", "tv"))
-        for raw, expected in ((0, (0, False)), (1, (0, False)), (2, (1, True)), (3, (2, False))):
+        for raw, expected in ((0, (0, False)), (1, (0.5, False)), (2, (1, True)), (3, (2, False))):
             self.assertEqual(REMOTE["mapped_tv_volume"](mapping, raw), expected)
         with self.assertRaises(ValueError):
             REMOTE["prepare_volume_mapping"]({})

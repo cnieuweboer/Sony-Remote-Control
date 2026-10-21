@@ -310,3 +310,10 @@ The native callback consumes keys only for Sony's foreground window when popup/m
 Pause/restart blocks interception and clears pending work while the hook keeps its native message loop responsive. Restart-launch recovery republishes ownership; final shutdown stops the hook using the existing bounded join and callback-retention safeguards. There is no Sony global-volume mode. A focused volume hook on Windows is the intentional platform exception; SMTC playback and Yamaha global volume remain separate.
 
 `tests/test_native_volume.py` covers the actual native callback's return values for both key edges, 100 rapid presses, repeat ownership, volume-only allowlisting, queue overflow, foreground/lease ownership, Qt-volume exclusion, and pause/recovery. `tests/test_hook_lifecycle.py` restores startup/stop race coverage with a fake Win32 API and real threads. Qt focused-shortcut and SMTC tests remain; actual Windows suppression still requires desktop verification.
+
+
+## Fractional calibrated volume display
+
+The saved runtime mapping still contains integer TV values for each amplifier raw value. During display preparation, Sony groups consecutive raw values with the same TV integer T and assigns raw position i within a group of N values the representative display T+i/N. Each bucket starts at its integer; singleton buckets remain integers. Fractions are rounded half-up to tenths using integer arithmetic and capped at .9 to prevent large buckets rounding into T+1. The grouping uses only the exact bucket, independent of neighboring TV values or gaps. This is display preparation, not a change to the calibration sweep or measured integer mapping.
+
+Prepared entries retain their integer `tv` and estimate source and add an in-memory `display_tenths`. Raw lookup clamping uses the prepared endpoint display, including the final fractional bucket. Whole display values omit .0; existing estimated-raw and fractional-raw approximation markers and the “Calibrated TV scale” tooltip remain unchanged. Uncalibrated amplifier raw/dB display, native TV values, commands, IPC, and persisted JSON are unchanged; existing mappings work without recalibration.

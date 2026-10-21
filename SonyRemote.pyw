@@ -498,7 +498,7 @@ class CalibrationServer(QObject):
 APP_NAME = "Sony Remote"
 
 
-__version__ = "2026.10.21.6"
+__version__ = "2026.10.21.7"
 
 
 CONFIG_PATH = Path(__file__).resolve().with_name("SonyRemote.json")
@@ -620,18 +620,34 @@ def prepare_volume_mapping(document):
     validate_runtime_mapping(document)
     levels = document["tv_volume_by_amplifier_raw_volume"]
     estimated = set(document.get("estimated_amplifier_raw_volumes", []))
+    lookup = []
+    start = 0
+    while start < len(levels):
+        end = start + 1
+        while end < len(levels) and levels[end] == levels[start]:
+            end += 1
+        count = end - start
+        for raw in range(start, end):
+            # Round i/N to tenths without floating-point ties, and never
+            # round a member of TV bucket T into the next integer T+1.
+            fraction = min(9, (20 * (raw - start) + count) // (2 * count))
+            lookup.append({"raw": raw, "tv": levels[raw],
+                           "display_tenths": 10 * levels[raw] + fraction,
+                           "source": "interpolated" if raw in estimated else "mapped"})
+        start = end
     return {"input": document["amplifier_tv_input"],
             "tv_id": document["tv_device_id"], "amplifier_id": document["amplifier_device_id"],
             "raw_min": 0, "raw_max": len(levels) - 1, "tv_min": levels[0], "tv_max": levels[-1],
-            "lookup": [{"raw": raw, "tv": level, "source": "interpolated" if raw in estimated else "mapped"}
-                       for raw, level in enumerate(levels)]}
+            "lookup": lookup}
 
 
 def mapped_tv_volume(mapping, raw):
     bounded = max(0, min(mapping["raw_max"], raw))
     index = int(math.floor(bounded + 0.5))
     entry = mapping["lookup"][index]
-    return entry["tv"], bounded != index or entry["source"] == "interpolated"
+    tenths = entry["display_tenths"]
+    display = tenths // 10 if tenths % 10 == 0 else tenths / 10
+    return display, bounded != index or entry["source"] == "interpolated"
 
 
 class ConfigError(ValueError):
@@ -2943,12 +2959,7 @@ class SonyRemote(QMainWindow):
             raw = self.amplifier_state["raw_volume"]
             mapping = self._matched_volume_mapping()
             if mapping:
-                if raw > mapping["raw_max"]:
-                    display, approximate = mapping["tv_max"], False
-                elif raw < mapping["raw_min"]:
-                    display, approximate = mapping["tv_min"], False
-                else:
-                    display, approximate = mapped_tv_volume(mapping, raw)
+                display, approximate = mapped_tv_volume(mapping, raw)
                 prefix = "≈" if approximate else ""
                 self.volume_value.setToolTip("Calibrated TV scale")
             else:
