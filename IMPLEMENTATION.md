@@ -2,13 +2,9 @@
 
 For setup and everyday use, see the [README](README.md). Dated changes are in the [release history](CHANGELOG.md).
 
-## Windows shortcut reliability
+## Focused shortcut handling
 
-All Windows shortcuts still use a low-level Windows keyboard hook. Qt only observes focus changes and delivers queued commands to the GUI; it does not intercept Windows hotkeys.
-
-The hook uses pointer-sized Win32 arguments and return values throughout, so forwarding an unclaimed key preserves its original event pointer on 64-bit Windows. A dedicated native message thread keeps forwarding responsive during GUI work and restart waits. The callback reads a plain focus/ownership snapshot and queues commands; device and IPC requests run outside it. Other apps' keys are forwarded unchanged.
-
-A physical press keeps its original owner until release. Mute toggles once per press; volume and navigation keys can repeat while held. Commands use a bounded queue; an unaccepted new press passes through. Sony defers volume/mute keys while the amplifier's global ownership is valid, regardless of which remote started first. Hook failures are reported while the remote remains usable through its buttons. Focused shortcuts are suspended while a Qt popup is open, including combo dropdowns; pending native shortcut delivery also checks popup state. Show/Hide and focus events refresh ownership when the popup closes.
+Focused shortcuts use an application-wide Qt event filter on every platform. It handles mapped keys before buttons and comboboxes, preserves text editing and popup navigation, and retains physical-press ownership until release. Sony yields focused volume/mute to valid amplifier global ownership; optional Windows SMTC remains a separate playback path. See [Cross-platform focused shortcuts](#cross-platform-focused-shortcuts-202610213) for event ordering and regression coverage.
 
 ## Local amplifier routing
 
@@ -154,7 +150,7 @@ Successful power/status polling establishes core availability independently of r
 
 Buttons, dropdowns, favorites, and keyboard shortcuts use the availability of their required feature. IRCC buttons also check whether their command is advertised. Applications can remain available in standby. Discovery failures are non-modal and appear in the power/dropdown tooltips; unavailable sections recover automatically after successful retry. Text entry and direct volume/power operations do not depend on remote-code discovery. Calibration pauses discovery retries, and restart/shutdown clear pending-discovery bookkeeping after draining workers.
 
-`tests/test_graceful_failures.py` uses offscreen Qt windows and fake devices to check isolated and combined discovery failures, delayed discovery/input refresh, feature recovery, standby, connection loss, and restart recovery. Tests disable IPC endpoints and native keyboard-hook installation.
+`tests/test_graceful_failures.py` uses offscreen Qt windows and fake devices to check isolated and combined discovery failures, delayed discovery/input refresh, feature recovery, standby, connection loss, and restart recovery. Tests disable production IPC endpoints while retaining Qt shortcut handling.
 
 ## Second-launch activation
 
@@ -165,12 +161,6 @@ After failing to acquire the single-instance lock, a new process contacts the ex
 Connection retries and the handshake share a 1.5-second startup deadline. An unavailable/unresponsive endpoint produces a clear already-running message instead of a silent exit. The server allows four connected clients, bounds frames, and disconnects idle clients after one second. Activation closes before restart/shutdown draining and is recreated if restart fails; it adds no periodic device/IPC polling.
 
 `tests/test_activation.py` launches real second Python processes against isolated local endpoints and private instance locks. It covers hidden/minimized windows, modal dialogs, calibration-disabled state, concurrent launches, delayed startup, malformed/partial requests, idle timeouts, role mismatch, duplicate endpoints, and endpoint recovery. Windows foreground-permission calls are mocked; actual desktop focus behavior requires platform testing.
-
-## Hook startup shutdown safeguard
-
-The hook thread checks its existing stop flag after native message-queue setup and before installation. If shutdown arrives during installation, the thread skips the started notification once it observes the flag and immediately follows its existing unhook cleanup path. Running hooks still use `WM_QUIT` to wake the native message loop. Worker draining, join limits, and restart behavior are unchanged.
-
-`tests/test_hook_lifecycle.py` uses real Python threads with a fake Win32 API and event barriers to force shutdown before thread-ID publication and during hook installation. It also checks normal message-loop shutdown, repeated stop calls, and stopping before start. These tests exercise lifecycle ordering without relying on randomly hitting a race; actual Windows API behavior still requires Windows testing.
 
 ## Discovery saves and user configuration edits
 
@@ -236,7 +226,7 @@ With volume rate limiting disabled, only the final pending volume-command comple
 
 `SMTCPlaybackKeys` defaults to false. Only when enabled on Windows does `SMTCPlayback` lazily import PyWinRT and bind `get_for_window(int(winId()))`; creating the handle does not show the window, so registration also works with `--start-in-tray`. Optional packages are `winrt-Windows.Media`, `winrt-Windows.Media.Interop`, and `winrt-Windows.Foundation` (their runtime dependency is resolved by pip).
 
-`_playback_key_mode()` selects focused, SMTC, or unavailable. The native shortcut allowlist and final focused dispatch both exclude Play/Pause, Play, Pause, Stop, Next, and Previous whenever SMTC is selected, including when its initialization fails. There is no automatic focused-hook fallback. Volume/mute ownership, amplifier IPC, and volume calibration routing are separate and unchanged. On-screen playback controls continue using the ordinary command path; `PlaybackControls` controls their visibility independently of the key-routing option.
+`_playback_key_mode()` selects focused, SMTC, or unavailable. The Qt shortcut eligibility check and final focused dispatch both exclude Play/Pause, Play, Pause, Stop, Next, and Previous whenever SMTC is selected, including when its initialization fails. There is no automatic focused-shortcut fallback. Volume/mute ownership, amplifier IPC, and volume calibration routing are separate and unchanged. On-screen playback controls continue using the ordinary command path; `PlaybackControls` controls their visibility independently of the key-routing option.
 
 `_refresh_playback_routing()` advertises only discovered explicit TV commands while the TV is active, calibration is inactive, and no modal dialog blocks interaction. Missing explicit Play/Pause commands are not replaced with blind toggles. Only the existing status timer is kept active while hidden/minimized when the SMTC backend is available; standby/offline/discovery recovery uses the existing state updates. No new device or IPC polling timer is added.
 
@@ -296,3 +286,16 @@ The amplifier consumer distinguishes errors validating state messages, errors va
 Dropdown popups expand one Qt logical pixel left and right after native placement, without changing combobox button geometry. The expanded popup and live view geometry are captured before the custom animation starts and retained at completion; the expansion also applies with the workaround or UI animations disabled.
 
 The Apps combobox alone enables clear-on-close: a popup hide/close schedules clearing both its selected index and the view selection/current index after activation delivery. Native dismissal is observed even after animation ends or when animation is disabled. A queued clear skips a popup already reopened; input/speaker selectors retain their device-backed state.
+
+
+## Cross-platform focused shortcuts (2026.10.21.3)
+
+Sony now uses its application-wide Qt event filter on every platform, including Windows, replacing its low-level Windows keyboard hook and the hook's thread, queue, and foreground-state publication. The filter handles ShortcutOverride, KeyPress, and KeyRelease before focused buttons/comboboxes can navigate or click. Key maps include navigation, Insert/Delete, keypad digits/channel keys, volume/mute, and explicit Play/Pause/Stop/Next/Previous. Ctrl/Alt/Meta combinations are left to normal application/desktop handling.
+
+A physical press records its initial owner until release. Navigation and volume repeats dispatch while their current context remains eligible; Mute and Play/Pause dispatch once per press. Synthetic repeat releases do not release ownership, and auto-repeat cannot acquire a key whose initial press belonged elsewhere. Owned events are consumed even if routing eligibility changes, preventing a held press from falling through to another Qt handler. Focus loss, hiding, and lifecycle pause clear press state.
+
+Open popups retain navigation and the entire Enter press, including delivery after dismissal until release. Text input retains non-volume editing keys. Inactive/minimized windows, modal dialogs, shutdown, and local or amplifier calibration block dispatch. Unknown device commands are not claimed. Amplifier global ownership releases focused volume/mute handling; optional SMTC selection excludes focused playback keys even when its backend is unavailable. SMTC remains Windows-specific and Yamaha's global-volume hook is unchanged.
+
+Palette/GUI events still refresh SMTC availability on the Qt thread. Shutdown/restart no longer install, pause, or remove a Sony native keyboard hook. The dedicated native-hook lifecycle test file was removed with that implementation; Yamaha retains its own hook and tests.
+
+`tests/test_focused_shortcuts.py` uses real Qt application-filter delivery to buttons, comboboxes, text input, popups, and a competing QShortcut. It covers press/release and repeat ownership, popup Enter forwarding, media commands, rapid volume input, SMTC/amplifier ownership, calibration/modal/focus guards, and the Windows/non-Windows dispatch branches. Offscreen Linux tests cannot establish Windows OS-level media-key suppression or physical keyboard-wheel behavior; these require desktop verification, including both remotes running together.

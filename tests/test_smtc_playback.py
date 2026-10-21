@@ -216,17 +216,20 @@ class RoutingTests(unittest.TestCase):
         self.window._setup_smtc()
         self.loader.assert_not_called()
         self.assertEqual(self.window._playback_key_mode(), 'focused')
-        self.window._publish_shortcut_state()
-        self.assertTrue({'PlayPause', 'Stop', 'Next', 'Prev'} <= self.window._shortcut_state[2])
+        self.window._refresh_playback_routing()
+        self.assertTrue(all(self.window._focused_shortcut_allowed(command)
+                            for command in ('PlayPause', 'Stop', 'Next', 'Prev')))
 
     def test_smtc_excludes_focused_playback_keys_but_keeps_volume_and_navigation(self):
         controls = self.enable()
         self.assertTrue(controls.is_enabled)
-        allowed = self.window._shortcut_state[2]
+        allowed = {command for command in ('PlayPause', 'Stop', 'Next', 'Prev',
+                                          'volume_up', 'volume_down', 'mute', 'Up', 'Confirm')
+                   if self.window._focused_shortcut_allowed(command)}
         self.assertFalse(REMOTE['_PLAYBACK_KEY_COMMANDS'] & allowed)
         self.assertTrue({'volume_up', 'volume_down', 'mute', 'Up', 'Confirm'} <= allowed)
         for command in ('PlayPause', 'Stop', 'Next', 'Prev'):
-            self.assertFalse(self.window._accept_native_shortcut(command, int(self.window.winId())))
+            self.assertFalse(self.window._focused_shortcut_allowed(command))
             self.assertFalse(self.window._dispatch_shortcut(command))
         self.window.api.ircc.assert_not_called()
 
@@ -272,14 +275,14 @@ class RoutingTests(unittest.TestCase):
         for power, calibrated in (('standby', False), (None, False), ('active', True)):
             self.window.last_power = power
             self.window.calibration_active = calibrated
-            self.window._publish_shortcut_state()
+            self.window._refresh_playback_routing()
             self.assertFalse(controls.is_enabled)
             controls.press('NEXT')
             self.fixture.app.processEvents()
             self.window.api.ircc.assert_not_called()
         self.window.calibration_active = False
         self.window.last_power = 'active'
-        self.window._publish_shortcut_state()
+        self.window._refresh_playback_routing()
         self.assertTrue(controls.is_enabled)
 
     def test_queued_button_is_rechecked_after_state_changes(self):
@@ -295,7 +298,8 @@ class RoutingTests(unittest.TestCase):
         self.window._setup_smtc()
         self.fixture.app.processEvents()
         self.assertEqual(self.window._playback_key_mode(), 'unavailable')
-        self.assertFalse(REMOTE['_PLAYBACK_KEY_COMMANDS'] & self.window._shortcut_state[2])
+        self.assertFalse(any(self.window._focused_shortcut_allowed(command)
+                             for command in REMOTE['_PLAYBACK_KEY_COMMANDS']))
         self.window._setup_smtc()
         self.fixture.app.processEvents()
         self.window._show_smtc_warning.assert_called_once_with()
@@ -325,10 +329,10 @@ class RoutingTests(unittest.TestCase):
     def test_empty_remote_code_discovery_releases_smtc_until_recovery(self):
         controls = self.enable()
         self.window._discovery_ready.discard('remote_codes')
-        self.window._publish_shortcut_state()
+        self.window._refresh_playback_routing()
         self.assertFalse(controls.is_enabled)
         self.window._discovery_ready.add('remote_codes')
-        self.window._publish_shortcut_state()
+        self.window._refresh_playback_routing()
         self.assertTrue(controls.is_enabled)
 
     def test_registration_works_without_ever_showing_window(self):
@@ -337,7 +341,6 @@ class RoutingTests(unittest.TestCase):
         cls = window_fixture.REMOTE['SonyRemote']
         with patch.object(cls, '_setup_activation', lambda self: None), \
              patch.object(cls, '_setup_calibration', lambda self: None), \
-             patch.object(cls, '_install_windows_keyboard_hook', lambda self: None), \
              patch.object(window_fixture.REMOTE['AmplifierClient'], 'start', lambda self: None):
             hidden = cls(config)
         def cleanup():
@@ -370,8 +373,8 @@ class RoutingTests(unittest.TestCase):
         self.enable()
         self.window.amplifier_client.state_deadline = window_fixture.time.monotonic() + 5
         with patch.object(self.window, '_amplifier_owns_hotkeys', return_value=True):
-            self.window._publish_shortcut_state()
-        self.assertFalse(self.window._accept_native_shortcut('volume_up', int(self.window.winId())))
+            self.window._refresh_playback_routing()
+            self.assertFalse(self.window._focused_shortcut_allowed('volume_up'))
         self.window.api.ircc.assert_not_called()
         self.assertEqual(self.window._playback_key_mode(), 'smtc')
 

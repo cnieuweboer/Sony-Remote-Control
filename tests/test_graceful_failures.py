@@ -84,8 +84,7 @@ class DiscoveryTests(unittest.TestCase):
         # Tests neither bind production IPC names nor connect to another app.
         with patch.object(REMOTE['AmplifierClient'], 'start', lambda client: None), \
              patch.object(REMOTE['SonyRemote'], '_setup_calibration', lambda window: None), \
-             patch.object(REMOTE['SonyRemote'], '_setup_activation', lambda window: None), \
-             patch.object(REMOTE['SonyRemote'], '_install_windows_keyboard_hook', lambda window: None):
+             patch.object(REMOTE['SonyRemote'], '_setup_activation', lambda window: None):
             self.window = REMOTE['SonyRemote'](config)
         self.window.api = self.device
         self.window.pool.setMaxThreadCount(6)
@@ -247,7 +246,7 @@ class DiscoveryTests(unittest.TestCase):
         self.wait(lambda: 'remote_codes' in self.window._discovery_ready)
         self.assertTrue(self.buttons('Up')[0].isEnabled())
         self.assertTrue(self.buttons('Settings')[0].isEnabled())
-        self.assertIn('Up', self.window._shortcut_state[2])
+        self.assertTrue(self.window._focused_shortcut_allowed('Up'))
 
     def test_input_recovery_restores_dropdown_and_favorites(self):
         self.device.failures['inputs'] = REMOTE['DeviceResponseError']('Unavailable')

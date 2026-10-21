@@ -127,9 +127,11 @@ Only one instance of SonyRemote can run at a time. Launching it again restores t
 
 Regular status polling pauses while the window is hidden or minimized and refreshes immediately when restored. When SMTC playback keys are available and enabled, the same timer continues in the background to detect TV availability. Active requests finish normally; configuration file watching remains enabled.
 
-## Windows shortcut reliability
+## Keyboard shortcuts
 
-Windows shortcuts use native key handling to stay responsive, including when both remotes run. Sony yields volume/mute keys whenever Yamaha Remote owns global volume control. While a dropdown is open, arrows and Enter operate the list instead of the TV.
+Focused shortcuts use a Qt application event filter on all platforms, before buttons and comboboxes handle keys. Sony yields volume/mute keys whenever the amplifier remote owns global volume control; open dropdowns keep arrows and Enter, and text input keeps its editing keys.
+
+Navigation and volume keys repeat when held; Mute and Play/Pause toggle once per press. Optional Windows SMTC playback routing remains separate.
 
 Hold **Volume +** or **Volume −** to repeat after half a second. With TV volume rate limiting enabled, the number shows your requested target until the TV catches up.
 

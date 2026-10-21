@@ -4,6 +4,8 @@ Release identifiers below come from the corresponding commits. Some releases upd
 
 ## 2026-10-21
 
+- Sony Remote 2026.10.21.3 — Use the Qt application event filter for focused shortcuts on Windows as well as other platforms. Remove Sony’s low-level Windows hook, thread/queue, and hook-only tests. Preserve popup/text/modal/calibration guards and amplifier/SMTC ownership; consume handled presses/releases, retain navigation/volume repeats, and suppress Mute/Play-Pause repeats. Add real Qt widget, shortcut-override, media-key, popup, and routing regression coverage. Yamaha is unchanged.
+
 - Sony Remote 2026.10.21.2 — Clear the Apps dropdown selection and keyboard highlight after closing, including cancellation and native dismissal. Preserve app activation and leave device-backed input/speaker selections unchanged.
 
 - 2026.10.21.1 — Expand dropdown popups one Qt logical pixel on each side while leaving combobox buttons unchanged. Use the expanded geometry throughout the live opening animation.
