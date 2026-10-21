@@ -498,7 +498,7 @@ class CalibrationServer(QObject):
 APP_NAME = "Sony Remote"
 
 
-__version__ = "2026.10.20.7"
+__version__ = "2026.10.21.1"
 
 
 CONFIG_PATH = Path(__file__).resolve().with_name("SonyRemote.json")
@@ -1830,9 +1830,17 @@ class CenteredComboBox(QComboBox):
         self._popup_timer.setInterval(8)
         self._popup_timer.timeout.connect(self._animation_tick)
 
+    def _widen_popup(self):
+        popup = self.view().window()
+        if popup.isVisible():
+            popup.setGeometry(popup.geometry().adjusted(-1, 0, 1, 0))
+            if popup.layout() is not None:
+                popup.layout().activate()
+
     def showPopup(self):
         if not self._animate_popup:
             super().showPopup()
+            self._widen_popup()
             return
         if self.view().window().isVisible():
             self.hidePopup()
@@ -1848,6 +1856,7 @@ class CenteredComboBox(QComboBox):
             super().showPopup()
         finally:
             app.setEffectEnabled(effect, animate)
+        self._widen_popup()
         if not animate:
             return  # Respect the user's/system's disabled UI animations.
 
@@ -1857,8 +1866,8 @@ class CenteredComboBox(QComboBox):
         if not popup.isVisible() or final_rect.height() <= 2:
             return
 
-        # Keep Qt's final placement, including screen-edge clipping and
-        # popups that overlap the combo. Never relocate it above/below by hand.
+        # Keep Qt's vertical placement, including popups that overlap the combo,
+        # and the one-pixel expansion on each side. Never relocate it above/below.
         self._opens_downward = final_rect.center().y() >= self.mapToGlobal(self.rect().center()).y()
         self._popup, self._popup_view = popup, view
         self._final_rect = QRect(final_rect)

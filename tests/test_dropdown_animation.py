@@ -58,7 +58,7 @@ class DropdownAnimationTests(unittest.TestCase):
         # implementation, before platform-specific frame adjustments.
         geometry = QRect(self.combo.view().window().geometry())
         self.combo.hidePopup()
-        return geometry
+        return geometry.adjusted(-1, 0, 1, 0)
 
     def assert_clean(self):
         self.assertIsNone(self.combo._popup)

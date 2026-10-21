@@ -2,6 +2,10 @@
 
 Release identifiers below come from the corresponding commits. Some releases updated only the calibration helper; the remote and helper can therefore have different version numbers. Historical behavior may have been superseded by later releases.
 
+## 2026-10-21
+
+- 2026.10.21.1 — Expand dropdown popups one Qt logical pixel on each side while leaving combobox buttons unchanged. Use the expanded geometry throughout the live opening animation.
+
 ## 2026-10-20
 
 - 2026.10.20.7 — Clear state-protocol feedback on fresh valid state and ack-protocol feedback on a valid pending acknowledgement, without replaying commands. Keep unattributed errors until an accepted command. Detect missing Qt theme support before acquiring the instance lock, display an explicit upgrade message, and remove unused imports.
