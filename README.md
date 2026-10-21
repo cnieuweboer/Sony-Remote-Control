@@ -122,12 +122,6 @@ SonyRemote automatically adds newly discovered applications and inputs to `Apps`
 
 Failed discovery disables only its associated controls and retries automatically; power and volume remain usable when TV status is available.
 
-The app automatically restarts when it detects that `SonyRemote.json` has changed.
-
-Only one instance of SonyRemote can run at a time. Launching it again restores the existing window, including from the system tray.
-
-Regular status polling pauses while the window is hidden or minimized and refreshes immediately when restored. When SMTC playback keys are available and enabled, the same timer continues in the background to detect TV availability. Active requests finish normally; configuration file watching remains enabled.
-
 ## Keyboard shortcuts
 
 Edit `Shortcuts` to replace focused keyboard bindings; each action accepts a list such as `["Ctrl+Alt+Up", "F8"]`. Missing actions are added with defaults on startup, while `[]` or `""` disables that action's focused shortcut; button tooltips show the configured bindings.
