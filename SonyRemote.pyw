@@ -533,7 +533,7 @@ class CalibrationServer(QObject):
 APP_NAME = "Sony Remote"
 
 
-__version__ = "2026.10.21.19"
+__version__ = "2026.10.21.20"
 
 
 CONFIG_PATH = Path(__file__).resolve().with_name("SonyRemote.json")
@@ -575,6 +575,7 @@ DEFAULT_SHORTCUTS = {
     "VolumeUp": ["Volume Up"],
     "VolumeDown": ["Volume Down"],
     "Mute": ["Volume Mute"],
+    "FocusTextInput": ["Shift+Return", "Shift+Enter", "Shift+Num+Enter"],
     "Left": ["Left", "Num+Left"],
     "Right": ["Right", "Num+Right"],
     "Up": ["Up", "Num+Up"],
@@ -609,6 +610,7 @@ SHORTCUT_ACTIONS = {
     "VolumeUp": "volume_up",
     "VolumeDown": "volume_down",
     "Mute": "mute",
+    "FocusTextInput": "focus_text_input",
     "Left": "Left",
     "Right": "Right",
     "Up": "Up",
@@ -1998,6 +2000,7 @@ class TvTextEdit(QTextEdit):
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self.submission_key = None
         self.setAcceptRichText(False)
         self.setLineWrapMode(QTextEdit.WidgetWidth)
         self.setPlaceholderText("Type text for the TV")
@@ -2014,10 +2017,14 @@ class TvTextEdit(QTextEdit):
                 super().keyPressEvent(event)
                 return
 
-            if modifiers & Qt.ControlModifier:
-                self.submitAndConfirmRequested.emit()
-            else:
-                self.submitRequested.emit()
+            self.submission_key = event.key()
+            try:
+                if modifiers & Qt.ControlModifier:
+                    self.submitAndConfirmRequested.emit()
+                else:
+                    self.submitRequested.emit()
+            finally:
+                self.submission_key = None
             return
 
         super().keyPressEvent(event)
@@ -2793,6 +2800,7 @@ class SonyRemote(QMainWindow):
         layout = self._section("Text Input")
 
         self.text_input = TvTextEdit()
+        self.text_input.setToolTip(_shortcut_tip(self.config, "focus_text_input"))
         self.text_input.submitRequested.connect(self.send_text_input)
         self.text_input.submitAndConfirmRequested.connect(
             self.send_text_input_and_confirm
@@ -3921,15 +3929,14 @@ class SonyRemote(QMainWindow):
             return
 
         text = self.text_input.toPlainText()
-        if not text:
-            return
-
-        self.run_command(
+        accepted = self.run_command(
             lambda: self.api.set_text_form(text),
             on_error=lambda error: self.handle_request_error(
                 error, hint="Make sure a TV software keyboard or text field is currently active."
             ),
         )
+        if accepted:
+            self._text_submission_queued()
 
     def send_text_input_and_confirm(self):
         if self._calibration_blocked():
@@ -3938,8 +3945,6 @@ class SonyRemote(QMainWindow):
             return
 
         text = self.text_input.toPlainText()
-        if not text:
-            return
 
         def send_and_confirm():
             # When automated submit is disabled, Ctrl+Enter falls back to the
@@ -3972,12 +3977,21 @@ class SonyRemote(QMainWindow):
             for command in submit_sequence:
                 self.api.ircc(command)
 
-        self.run_command(
+        accepted = self.run_command(
             send_and_confirm,
             on_error=lambda error: self.handle_request_error(
                 error, hint="Make sure a TV software keyboard or text field is currently active."
             ),
         )
+        if accepted:
+            self._text_submission_queued()
+
+    def _text_submission_queued(self):
+        # Keep the submitting press through release after moving focus, so
+        # holding Enter cannot activate a button or send a second TV command.
+        if self.text_input.submission_key is not None:
+            self._shortcut_presses[self.text_input.submission_key] = "text_submit"
+        self.power_button.setFocus(Qt.OtherFocusReason)
 
     def _dispatch_shortcut(self, command, *, custom=False):
         if not custom and command in _PLAYBACK_KEY_COMMANDS and self._playback_key_mode() != "focused":
@@ -4023,6 +4037,7 @@ class SonyRemote(QMainWindow):
         bound_actions = {
             command for code, command in self._shortcut_bindings.items()
             if (code & 0x01FFFFFF) in _NATIVE_QT_VOLUME_KEYS.values()
+            and (command != "focus_text_input" or self._focused_shortcut_allowed(command, custom=True))
             and (command in ("volume_up", "volume_down", "mute")
                  or not (hasattr(self, "text_input") and self.text_input.hasFocus()))}
         with self._native_volume_lock:
@@ -4084,6 +4099,9 @@ class SonyRemote(QMainWindow):
                 or QApplication.activeModalWidget() is not None
                 or QApplication.activePopupWidget() is not None):
             return False
+        if command == "focus_text_input":
+            editor = getattr(self, "text_input", None)
+            return bool(editor is not None and editor.isEnabled() and not editor.hasFocus())
         if command in ("volume_up", "volume_down", "mute"):
             return True
         if hasattr(self, "text_input") and self.text_input.hasFocus():
@@ -4093,7 +4111,9 @@ class SonyRemote(QMainWindow):
                 and self.api.resolve_remote_command(command) in self.api.remote_codes)
 
     def _run_focused_shortcut(self, command, *, custom=False):
-        if command == "volume_up":
+        if command == "focus_text_input":
+            self.text_input.setFocus(Qt.ShortcutFocusReason)
+        elif command == "volume_up":
             self.adjust_volume(1)
         elif command == "volume_down":
             self.adjust_volume(-1)
@@ -4454,7 +4474,7 @@ class SonyRemote(QMainWindow):
 
         if key in self._shortcut_presses:
             owned = previous
-            if (owned and command is not None and owned not in ("mute", "PlayPause")
+            if (owned and command is not None and owned not in ("mute", "PlayPause", "text_submit")
                     and self._focused_shortcut_allowed(owned, custom=custom)):
                 self._run_focused_shortcut(owned, custom=custom)
         else:

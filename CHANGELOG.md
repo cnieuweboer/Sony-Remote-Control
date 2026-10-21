@@ -4,6 +4,8 @@ Release identifiers below come from the corresponding commits. Some releases upd
 
 ## 2026-10-21
 
+- Sony Remote 2026.10.21.20 — Add configurable FocusTextInput shortcuts (Shift+Enter by default), preserving Shift+Enter newlines inside the editor. Return focus to the remote immediately after a text command is queued, retain focus when queueing is rejected, and allow empty strings through both submission paths. Preserve text and hold the submitting key's ownership until release.
+
 - Sony Remote 2026.10.21.19 — Track automatically maintained `Removed` flags without deleting app/input preferences or JSON positions. Confirm absence with another successful inventory after five seconds, retain entries on errors/standby, restore rediscovered entries, and rebuild dropdowns/favorites with immediate window resizing. Reuse ordinary status/input polling and add a 30-second visible/awake inventory refresh plus guarded verification; preserve unapplied JSON edits.
 
 - Sony Remote 2026.10.21.18 — Add the focused TV-volume exception to global amplifier shortcuts. Prepare the TV handler before advertising leased readiness; the amplifier yields only matching bindings for the actual TV foreground window while using another known input. Preserve global ownership elsewhere, SMTC priority, calibration guards, expiry and disconnect recovery. Add native-hook and cross-repository IPC regressions.

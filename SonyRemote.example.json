@@ -131,6 +131,11 @@
     ],
     "Num9": [
       "Num+9"
+    ],
+    "FocusTextInput": [
+      "Shift+Return",
+      "Shift+Enter",
+      "Shift+Num+Enter"
     ]
   }
 }
