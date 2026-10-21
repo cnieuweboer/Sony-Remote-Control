@@ -187,3 +187,7 @@ The relevant license text is included in `THIRD_PARTY_LICENSES.txt`.
 
 
 Amplifier global shortcuts take priority over overlapping SMTC playback keys and focused shortcuts. Sony follows the amplifier's published ownership automatically. With Sony focused and the TV on, matching volume shortcuts control the TV when the amplifier uses another known input; global control remains active outside Sony.
+
+### Cached state report
+
+Run `python SonyRemote.pyw --dump-state` while the remote is running to save a timestamped diagnostic JSON beside the script (or in the app-data diagnostics folder if needed). This leaves the window as it is and makes no device queries; the result message gives the file path. Credentials and text-entry contents are omitted, but review reports before sharing.

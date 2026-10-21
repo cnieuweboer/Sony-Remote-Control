@@ -4,6 +4,8 @@ Release identifiers below come from the corresponding commits. Some releases upd
 
 ## 2026-10-21
 
+- Sony Remote 2026.10.21.22 — Add --dump-state cached diagnostic reports through second-launch IPC, without activating the window or querying devices. Record bounded request outcomes, omit credentials/text/payloads, use timestamped files with app-data fallback, and ignore generated reports in Git.
+
 - Sony Remote 2026.10.21.21 — Escape leaves the text editor without sending or clearing text. Share focus-return handling with submission and retain Enter/Escape ownership until key release.
 
 - Sony Remote 2026.10.21.20 — Add configurable FocusTextInput shortcuts (Shift+Enter by default), preserving Shift+Enter newlines inside the editor. Return focus to the remote immediately after a text command is queued, retain focus when queueing is rejected, and allow empty strings through both submission paths. Preserve text and hold the submitting key's ownership until release.

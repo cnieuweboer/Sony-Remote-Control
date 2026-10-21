@@ -11,3 +11,6 @@ VolumeCalibration.session.json.tmp
 SonyRemote.json
 *-crash.log
 *.json.tmp
+
+# Cached diagnostic reports may contain local runtime state.
+*-state-*.json

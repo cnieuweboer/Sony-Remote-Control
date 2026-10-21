@@ -459,7 +459,7 @@ class DiscoveryTests(unittest.TestCase):
 
     def pending_poll_result(self):
         jobs = []
-        with patch.object(self.window, 'run_worker', side_effect=lambda *args: jobs.append(args)):
+        with patch.object(self.window, 'run_worker', side_effect=lambda *args, **kwargs: jobs.append(args)):
             self.window.poll_status()
         query, done, failed, finished = jobs[0]
         data = query()
@@ -548,7 +548,7 @@ class DiscoveryTests(unittest.TestCase):
     def test_routing_change_during_power_read_skips_audio_request(self):
         self.settle_volume_controls()
         jobs = []
-        with patch.object(self.window, 'run_worker', side_effect=lambda *args: jobs.append(args)):
+        with patch.object(self.window, 'run_worker', side_effect=lambda *args, **kwargs: jobs.append(args)):
             self.window.poll_status()
         self.device.get_power = lambda: self.feed_amplifier_state() and 'active'
         self.device.get_volume = Mock()
