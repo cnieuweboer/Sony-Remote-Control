@@ -111,6 +111,35 @@ class ActivationTests(unittest.TestCase):
         self.server.activate.assert_not_called()
         self.assertFalse(self.window.isVisible())
 
+    def test_full_dump_request_returns_path_without_activation(self):
+        self.window.hide()
+        self.window.state_dumper = REMOTE['StateDumper'](self.window, lambda *, full=False: {'mode': 'cached_full' if full else 'cached'})
+        self.server.dump = Mock(wraps=self.window.state_dumper.request)
+        output = patch.dict(GLOBALS, {'CONFIG_PATH': Path(self.folder.name) / 'remote.json'})
+        output.start()
+        self.addCleanup(output.stop)
+        self.server.activate = Mock(side_effect=AssertionError('Dump activated window'))
+        socket = QLocalSocket()
+        self.sockets.append(socket)
+        socket.connectToServer(self.server.name)
+        deadline = time.monotonic() + 2
+        received = bytearray()
+        socket.write(REMOTE['_ipc_encode']({'version': 1, 'type': 'dump_state_full'}))
+        while time.monotonic() < deadline:
+            self.app.processEvents()
+            received.extend(bytes(socket.readAll()))
+            if b'state_dump' in received:
+                break
+            time.sleep(0.002)
+        self.assertIn(b'state_dump', received)
+        reports = list(Path(self.folder.name).glob('*-state-*.json'))
+        self.assertEqual(len(reports), 1)
+        self.assertEqual(reports[0].read_text().strip(), '{\n  \"mode\": \"cached_full\"\n}')
+        self.server.dump.assert_called_once()
+        self.assertTrue(self.server.dump.call_args.kwargs['full'])
+        self.server.activate.assert_not_called()
+        self.assertFalse(self.window.isVisible())
+
     def cleanup(self):
         for child in self.children:
             if child.poll() is None:

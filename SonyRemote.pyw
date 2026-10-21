@@ -327,13 +327,17 @@ class ActivationServer(QObject):
                 ok = bool(self.activate())
                 socket.write(_ipc_encode({"version": 1, "type": "activated", "ok": ok}))
                 socket.disconnectFromServer()
-            elif messages[0] == {"version": 1, "type": "dump_state"} and self.dump is not None:
+            elif (messages[0] in ({"version": 1, "type": "dump_state"},
+                                  {"version": 1, "type": "dump_state_full"}) and self.dump is not None):
                 socket.findChild(QTimer, "request_deadline").start(5000)
                 def completed(result):
                     if socket in self.clients:
                         socket.write(_ipc_encode(dict(result, version=1, type="state_dump")))
                         socket.disconnectFromServer()
-                self.dump(completed)
+                if messages[0]["type"] == "dump_state_full":
+                    self.dump(completed, full=True)
+                else:
+                    self.dump(completed)
             else:
                 raise ValueError("Unsupported instance request")
         except (ValueError, UnicodeError, KeyError):
@@ -418,8 +422,8 @@ def activate_existing_instance(role, timeout_seconds=1.5):
     return bool(reply and reply.get("ok") is True)
 
 
-def dump_existing_state(role):
-    reply = _request_existing_instance(role, "dump_state", 5.0)
+def dump_existing_state(role, *, full=False):
+    reply = _request_existing_instance(role, "dump_state_full" if full else "dump_state", 5.0)
     if reply and reply.get("ok") is True and isinstance(reply.get("path"), str):
         message = "Cached state saved to:\n" + reply["path"]
         if reply.get("fallback"):
@@ -573,7 +577,7 @@ class CalibrationServer(QObject):
 APP_NAME = "Sony Remote"
 
 
-__version__ = "2026.10.21.22"
+__version__ = "2026.10.21.23"
 
 
 CONFIG_PATH = Path(__file__).resolve().with_name("SonyRemote.json")
@@ -1690,6 +1694,7 @@ class SonyConnectionError(DeviceConnectionError):
 class SonyApi:
     def __init__(self, host, psk, timeout=2.0):
         self.psk = psk
+        self.polling_responses = PollingResponses(('system/getPowerStatus', 'audio/getVolumeInformation', 'appControl/getApplicationList', 'avContent/getCurrentExternalInputsStatus', 'system/getRemoteControllerInfo', 'appControl/getApplicationStatusList'))
         self.timeout = timeout
         # IPv6 literals need brackets when used in a URL.
         try:
@@ -1745,6 +1750,7 @@ class SonyApi:
             raise DeviceResponseError(f"Sony rejected {method} (error code {code}).")
         if not isinstance(result.get("result"), list):
             raise DeviceResponseError("Sony response is missing a result list.")
+        self.polling_responses.record(f"{service}/{method}", result)
         return result
 
     def get_power(self):
@@ -1889,6 +1895,30 @@ def _state_age(observed_at, now):
     return round(max(0.0, now - observed_at), 3) if observed_at else None
 
 
+class PollingResponses:
+    """Latest successful decoded response per allowlisted read; worker-thread safe."""
+
+    def __init__(self, request_types):
+        self._responses = dict.fromkeys(request_types)
+        self._lock = threading.Lock()
+
+    def record(self, request_type, response):
+        if request_type not in self._responses:
+            return  # Never retain command responses, parameters, or headers.
+        entry = {"at_utc": datetime.now(timezone.utc).isoformat(),
+                 "observed_at": time.monotonic(), "response": copy.deepcopy(response)}
+        with self._lock:
+            self._responses[request_type] = entry
+
+    def snapshot(self, now):
+        with self._lock:
+            result = copy.deepcopy(self._responses)
+        for entry in result.values():
+            if entry is not None:
+                entry["age_seconds"] = _state_age(entry.pop("observed_at"), now)
+        return result
+
+
 class RequestHistory:
     """Bounded GUI-thread outcome summaries; never retain exceptions or payloads."""
 
@@ -1949,12 +1979,12 @@ class StateDumper(QObject):
         self.snapshot = snapshot
         self.worker = None
 
-    def request(self, done):
+    def request(self, done, *, full=False):
         if self.worker is not None:
             done({"ok": False, "error": "busy"})
             return
         try:
-            snapshot = copy.deepcopy(self.snapshot())
+            snapshot = copy.deepcopy(self.snapshot(full=True) if full else self.snapshot())
             directories = [CONFIG_PATH.parent]
             fallback = QStandardPaths.writableLocation(QStandardPaths.AppLocalDataLocation)
             if fallback:
@@ -4429,9 +4459,14 @@ class SonyRemote(QMainWindow):
     # Tray and shutdown lifecycle
     # ----------------------------
 
-    def _cached_state(self):
+    def _cached_state(self, *, full=False):
         now = time.monotonic()
         report = _cached_common(self, "tv", now)
+        if full:
+            report["mode"] = "cached_full"
+            report["polling_responses"] = self.api.polling_responses.snapshot(now)
+            report["privacy"]["warning"] = "Full device responses may contain device/network identifiers and app inventories. Review before sharing."
+            report["privacy"]["omitted"] = ["credentials", "request_headers", "submitted_text", "request_parameters", "exception_messages", "configuration_file"]
         state = self.amplifier_state or {}
         routed = self._use_amplifier()
         tv_input = self._amplifier_tv_input()
@@ -4796,6 +4831,8 @@ def configure_app_theme(config):
 
 def _run_application():
     app = QApplication(sys.argv)
+    if "--dump-state-full" in sys.argv[1:]:
+        return dump_existing_state("tv", full=True)
     if "--dump-state" in sys.argv[1:]:
         return dump_existing_state("tv")
     if not check_qt_theme_support():

@@ -5,7 +5,7 @@ import runpy
 import tempfile
 import time
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 ROOT = Path(__file__).resolve().parents[1]
 BRAND = 'Sony' if (ROOT / 'SonyRemote.pyw').exists() else 'Yamaha'
@@ -77,7 +77,14 @@ class DumpTests(unittest.TestCase):
         window.config['PreSharedKey'] = 'SECRET_PSK'
         window.run_worker = Mock(side_effect=AssertionError('Unexpected device work'))
         visible = window.isVisible()
+        window.api.polling_responses = R['PollingResponses'](('status',))
+        window.api.polling_responses.record('status', {'power': 'on', 'extra': 42})
         report = window._cached_state()
+        full = window._cached_state(full=True)
+        self.assertNotIn('polling_responses', report)
+        self.assertEqual(full['mode'], 'cached_full')
+        self.assertEqual(full['polling_responses']['status']['response']['extra'], 42)
+        self.assertFalse(full['fresh_queries_performed'])
         payload = json.dumps(report, allow_nan=False)
         self.assertEqual(report['mode'], 'cached')
         self.assertFalse(report['fresh_queries_performed'])
@@ -85,3 +92,45 @@ class DumpTests(unittest.TestCase):
         self.assertNotIn('SECRET_PSK', payload)
         window.run_worker.assert_not_called()
         self.assertEqual(window.isVisible(), visible)
+
+    def test_polling_cache_is_detached_bounded_and_timestamped(self):
+        cache = R['PollingResponses'](('status', 'inventory'))
+        response = {'result': [{'extra_device_field': 12}]}
+        cache.record('status', response)
+        response['result'][0]['extra_device_field'] = 99
+        cache.record('setTextForm', {'text': 'SECRET'})
+        snapshot = cache.snapshot(time.monotonic())
+        self.assertIsNone(snapshot['inventory'])
+        self.assertEqual(snapshot['status']['response']['result'][0]['extra_device_field'], 12)
+        self.assertIn('at_utc', snapshot['status'])
+        self.assertGreaterEqual(snapshot['status']['age_seconds'], 0)
+        self.assertNotIn('SECRET', json.dumps(snapshot))
+        snapshot['status']['response'].clear()
+        self.assertTrue(cache.snapshot(time.monotonic())['status']['response'])
+
+    def test_actual_api_caches_reads_but_not_commands_or_failed_responses(self):
+        api = R[BRAND + 'Api']('device.local', 'SECRET_PSK') if BRAND == 'Sony' else R['YamahaApi']('device.local')
+        success = {'result': [{'status': 'active'}], 'extra': 'preserved'} if BRAND == 'Sony' else {'response_code': 0, 'power': 'on', 'extra': 'preserved'}
+        globals_ = R[BRAND + 'Api'].__init__.__globals__
+        reply = Mock()
+        reply.read.return_value = json.dumps(success).encode()
+        opener = MagicMock()
+        opener.open.return_value.__enter__.return_value = reply
+        read_key = 'system/getPowerStatus' if BRAND == 'Sony' else 'main/getStatus'
+        with patch.dict(globals_, {'DEVICE_HTTP_OPENER': opener}):
+            api.get_power() if BRAND == 'Sony' else api.get_status()
+            api.rpc('appControl', 'setTextForm', ['SECRET_TEXT']) if BRAND == 'Sony' else api._get_json('main/setVolume?volume=20')
+            reply.read.return_value = json.dumps({'error': [1, 'failed']} if BRAND == 'Sony' else {'response_code': 1}).encode()
+            with self.assertRaises(R['DeviceResponseError']):
+                api.get_power() if BRAND == 'Sony' else api.get_status()
+        report = api.polling_responses.snapshot(time.monotonic())
+        self.assertEqual(report[read_key]['response'], success)
+        self.assertEqual(sum(value is not None for value in report.values()), 1)
+        self.assertNotIn('SECRET', json.dumps(report))
+
+    def test_full_cli_dispatch(self):
+        function = R['_run_application']
+        with patch.dict(function.__globals__, {'QApplication': Mock(), 'dump_existing_state': Mock(return_value=0)}), \
+             patch('sys.argv', ['remote.pyw', '--dump-state-full']):
+            self.assertEqual(function(), 0)
+            function.__globals__['dump_existing_state'].assert_called_once_with('tv' if BRAND == 'Sony' else 'amplifier', full=True)
