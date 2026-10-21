@@ -498,7 +498,7 @@ class CalibrationServer(QObject):
 APP_NAME = "Sony Remote"
 
 
-__version__ = "2026.10.21.10"
+__version__ = "2026.10.21.11"
 
 
 CONFIG_PATH = Path(__file__).resolve().with_name("SonyRemote.json")
@@ -1989,6 +1989,108 @@ class CenteredComboDelegate(QStyledItemDelegate):
 # ----------------------------
 
 
+class PollingCoordinator(QObject):
+    """Own ordinary polling policy and coalesced refresh scheduling.
+
+    Device queries and their results stay in the window. Volume-rate steps are
+    command feedback, not ordinary polling, and retain their independent timer.
+    """
+
+    def __init__(self, window):
+        super().__init__(window)
+        self.window = window
+        self.paused = False
+        self.pending = False
+        self.deadline = None
+        self.condition = None
+        self.periodic = QTimer(self)
+        self.periodic.timeout.connect(self._periodic_due)
+        self.refresh = QTimer(self)
+        self.refresh.setSingleShot(True)
+        self.refresh.timeout.connect(self._dispatch)
+
+    def allowed(self):
+        w = self.window
+        return (not self.paused and not w._shutting_down
+                and not w._calibration_operation
+                and not missing_config_settings(w.config)
+                and (w.calibration_active or w._smtc_background_polling()
+                     or (w.isVisible() and not w.isMinimized())))
+
+    def reads_volume(self):
+        w = self.window
+        return (not (w._volume_rate_loop_running or w._volume_rate_step_running)
+                and (w.calibration_active or not w._amplifier_routed)
+                and (w.config["VolumeControls"] or w.calibration_active))
+
+    def reads_inputs(self):
+        w = self.window
+        return (self.allowed() and not w.calibration_active and not w._input_status_running
+                and "inputs" in w._discovery_ready and "inputs" not in w._discovery_pending)
+
+    def update(self, refresh=False):
+        self.periodic.setInterval(250 if self.window.calibration_active else POLL_INTERVAL_MS)
+        if not self.allowed():
+            self.periodic.stop()
+            self.refresh.stop()
+            return
+        if not self.periodic.isActive():
+            self.periodic.start()
+        if refresh:
+            self.request()
+        elif self.pending:
+            self._arm()
+
+    def request(self, delay_ms=0, condition=None):
+        deadline = time.monotonic() + max(0, delay_ms) / 1000
+        # Keep the earliest unconditional refresh. Replace conditional volume
+        # work with the latest completion so a newer target gets its own delay.
+        # Unconditional requests cannot be cancelled by stale keypress state.
+        if not self.pending or self.condition is not None:
+            self.deadline, self.condition = deadline, condition
+        elif condition is None:
+            self.deadline = min(self.deadline, deadline)
+        self.pending = True
+        if delay_ms <= 0:
+            self._dispatch()
+        else:
+            self._arm()
+
+    def _arm(self):
+        if self.allowed() and not self.window.poll_running:
+            self.refresh.start(max(0, math.ceil((self.deadline - time.monotonic()) * 1000)))
+
+    def _dispatch(self):
+        if not self.pending or not self.allowed() or self.window.poll_running:
+            return
+        condition = self.condition
+        self.pending = False
+        self.deadline = self.condition = None
+        if condition is None or condition():
+            self.window.poll_status()
+
+    def _periodic_due(self):
+        # A cycle already running satisfies the periodic tick. A delayed
+        # command refresh keeps its settling delay instead of being preempted.
+        if not self.window.poll_running and not self.pending:
+            self.request()
+
+    def finished(self):
+        if self.pending:
+            self._arm()
+
+    def pause(self):
+        self.paused = True
+        self.pending = False
+        self.deadline = self.condition = None
+        self.periodic.stop()
+        self.refresh.stop()
+
+    def resume(self):
+        self.paused = False
+        self.update(refresh=True)
+
+
 class SonyRemote(QMainWindow):
     _native_volume_ready = Signal()
 
@@ -2016,7 +2118,6 @@ class SonyRemote(QMainWindow):
         self._workers = set()
         self._command_workers = set()
         self.poll_running = False
-        self._tv_volume_refresh_pending = False
         self._input_status_running = False
         self.initialized = False
         self._discovery_ready = set()
@@ -2093,7 +2194,6 @@ class SonyRemote(QMainWindow):
     def _calibration_changed(self, active):
         self.calibration_active = active
         self.setEnabled(not active)
-        self.poll_timer.setInterval(250 if active else POLL_INTERVAL_MS)
         self._desired_volume = None
         self._volume_rate_loop_running = False
         self.volume_rate_timer.stop()
@@ -2141,9 +2241,8 @@ class SonyRemote(QMainWindow):
         ready()
 
     def _setup_timers(self):
-        self.poll_timer = QTimer(self)
-        self.poll_timer.setInterval(POLL_INTERVAL_MS)
-        self.poll_timer.timeout.connect(self.poll_status)
+        self.polling = PollingCoordinator(self)
+        self.poll_timer = self.polling.periodic
 
         self.volume_rate_timer = QTimer(self)
         self.volume_rate_timer.setSingleShot(True)
@@ -2773,18 +2872,14 @@ class SonyRemote(QMainWindow):
         return True
 
     def poll_status(self):
-        if (self._shutting_down or self._calibration_operation or missing_config_settings(self.config)
-                or (not self.calibration_active and not self._smtc_background_polling()
-                     and (not self.isVisible() or self.isMinimized()))):
+        if not self.polling.allowed():
             return
         if self.poll_running:
             return
         self.poll_running = True
         volume_request = (self._volume_generation, self._desired_volume)
         volume_busy = bool(self._volume_rate_loop_running or self._pending_volume_commands)
-        read_volume = (not (self._volume_rate_loop_running or self._volume_rate_step_running)
-                       and (self.calibration_active or not self._amplifier_routed))
-        self._tv_volume_refresh_pending = False
+        read_volume = self.polling.reads_volume()
 
         def query():
             power = self.api.get_power()
@@ -2792,9 +2887,7 @@ class SonyRemote(QMainWindow):
             # Recheck after the power request: a limiter may have started
             # while it was in flight. Never delay the limiter behind this poll.
             if (power == "active" and read_volume
-                    and not (self._volume_rate_loop_running or self._volume_rate_step_running)
-                    and (self.calibration_active or not self._amplifier_routed)
-                    and (self.config["VolumeControls"] or self.calibration_active)):
+                    and self.polling.reads_volume()):
                 data["volume"] = self.api.get_volume()
                 data["volume_observed_at"] = time.monotonic()
             return data
@@ -2841,14 +2934,10 @@ class SonyRemote(QMainWindow):
 
     def _status_poll_finished(self):
         self.poll_running = False
-        if self._tv_volume_refresh_pending and not self._shutting_down:
-            # A routing fallback during an in-flight poll must get its own
-            # fresh audio read as soon as that poll finishes, not two seconds later.
-            QTimer.singleShot(0, lambda: self.poll_status() if self._tv_volume_refresh_pending else None)
+        self.polling.finished()
 
     def _poll_input_status(self):
-        if (self._shutting_down or self.calibration_active or self._input_status_running
-                or "inputs" not in self._discovery_ready or "inputs" in self._discovery_pending):
+        if not self.polling.reads_inputs():
             return
         self._input_status_running = True
         accepted = self.run_worker(
@@ -2860,22 +2949,11 @@ class SonyRemote(QMainWindow):
             self._input_status_running = False
 
     def _update_polling_state(self, refresh=False):
-        if self._shutting_down or not hasattr(self, "poll_timer"):
-            return
+        if hasattr(self, "polling"):
+            self.polling.update(refresh=refresh)
 
-        should_poll = (
-            (self.calibration_active or self._smtc_background_polling()
-             or (self.isVisible() and not self.isMinimized()))
-            and not missing_config_settings(self.config)
-        )
-
-        if should_poll:
-            if refresh:
-                self.poll_status()
-            if not self.poll_timer.isActive():
-                self.poll_timer.start()
-        else:
-            self.poll_timer.stop()
+    def _request_poll(self, delay_ms=0, condition=None):
+        self.polling.request(delay_ms, condition)
 
     # ----------------------------
     # State and request errors
@@ -3042,7 +3120,7 @@ class SonyRemote(QMainWindow):
             lambda: self.api.set_power(turn_on),
             on_finished=lambda: (
                 self.power_button.setEnabled(self.last_power is not None),
-                QTimer.singleShot(300, self.poll_status),
+                self._request_poll(300),
             ),
         )
         if not accepted:
@@ -3110,21 +3188,20 @@ class SonyRemote(QMainWindow):
             self._desired_volume = None
             self._volume_rate_loop_running = False
             self.volume_rate_timer.stop()
-            self._tv_volume_refresh_pending = False
         self._amplifier_routed = routed
         if falling_back and not self.calibration_active:
             # The physical TV may have changed while we displayed amplifier
             # values. Do not act on its old cached volume before the refresh.
             self.last_volume = None
             self._volume_observed_at = 0
-            self._tv_volume_refresh_pending = bool(
-                not self._shutting_down and self.config["VolumeControls"] and self.last_power == "active")
+
         self._refresh_playback_routing()
         self._update_volume_controls()
         if self.config["VolumeControls"]:
             self.update_volume_ui(self.last_volume or {})
-        if self._tv_volume_refresh_pending:
-            self.poll_status()
+        if (falling_back and not self.calibration_active and self.config["VolumeControls"]
+                and self.last_power == "active"):
+            self._request_poll()
 
     def _update_volume_controls(self):
         if self.config["VolumeControls"]:
@@ -3165,7 +3242,7 @@ class SonyRemote(QMainWindow):
         if not self.last_volume:
             return
         target = not bool(self.last_volume.get("mute"))
-        self.run_command(lambda: self.api.set_mute(target), on_finished=lambda: QTimer.singleShot(200, self.poll_status))
+        self.run_command(lambda: self.api.set_mute(target), on_finished=lambda: self._request_poll(200))
 
     def adjust_volume(self, amount):
         if self._calibration_blocked():
@@ -3198,13 +3275,14 @@ class SonyRemote(QMainWindow):
                 if self._pending_volume_commands:
                     return
                 generation = self._volume_generation
-                def refresh_if_idle():
+                def volume_is_idle():
                     # A new press may arrive during the device-settling delay.
                     if (generation == self._volume_generation
                             and not self._pending_volume_commands
                             and not self._volume_rate_loop_running):
-                        self.poll_status()
-                QTimer.singleShot(200, refresh_if_idle)
+                        return True
+                    return False
+                self._request_poll(200, volume_is_idle)
             accepted = self.run_command(
                 lambda: None if self._amplifier_routed else self.api.adjust_volume(1 if amount > 0 else -1),
                 on_finished=finished,
@@ -3272,7 +3350,7 @@ class SonyRemote(QMainWindow):
             if self.calibration_server is not None:
                 self.calibration_server.publish()
             if finished:
-                QTimer.singleShot(200, self.poll_status)
+                self._request_poll(200)
             else:
                 self._schedule_volume_rate_step()
 
@@ -3281,7 +3359,7 @@ class SonyRemote(QMainWindow):
             self._volume_rate_loop_running = False
             self._desired_volume = None
             self.handle_request_error(error)
-            QTimer.singleShot(200, self.poll_status)
+            self._request_poll(200)
 
         if not self.run_command(step, on_result=done, on_error=failed):
             self._volume_rate_step_running = False
@@ -3296,7 +3374,7 @@ class SonyRemote(QMainWindow):
     def launch_app(self, uri):
         if self._calibration_blocked():
             return
-        self.run_command(lambda: self.api.launch_app(uri), on_finished=lambda: QTimer.singleShot(300, self.poll_status))
+        self.run_command(lambda: self.api.launch_app(uri), on_finished=lambda: self._request_poll(300))
 
     def select_input(self, index):
         uri = self.input_combo.itemData(index)
@@ -3306,7 +3384,7 @@ class SonyRemote(QMainWindow):
     def set_input(self, uri):
         if self._calibration_blocked():
             return
-        self.run_command(lambda: self.api.set_input(uri), on_finished=lambda: QTimer.singleShot(300, self.poll_status))
+        self.run_command(lambda: self.api.set_input(uri), on_finished=lambda: self._request_poll(300))
 
     def send_ircc(self, command, *, background=False):
         if self._calibration_blocked():
@@ -3676,7 +3754,7 @@ class SonyRemote(QMainWindow):
 
     def _pause_background_work(self):
         self._shutting_down = True
-        self._tv_volume_refresh_pending = False
+        self.polling.pause()
         self._shortcut_presses.clear()
         self._popup_shortcut_keys.clear()
         if self._smtc is not None:
@@ -3727,7 +3805,7 @@ class SonyRemote(QMainWindow):
             self._schedule_volume_rate_step(0)
         if not self.initialized:
             self.initialize()
-        self._update_polling_state(refresh=True)
+        self.polling.resume()
 
     def _shutdown(self):
         if self._shutdown_complete:

@@ -33,6 +33,9 @@ class VolumeLimiterTests(unittest.TestCase):
             run_command=self.enqueue,
         )
         self.window._accept_volume_status = lambda info, at: CLS._accept_volume_status(self.window, info, at)
+        self.window._request_poll = lambda delay, condition=None: REMOTE['QTimer'].singleShot(
+            delay, self.window.poll_status if condition is None else
+            lambda: self.window.poll_status() if condition() else None)
         self.timer = patch.object(REMOTE['QTimer'], 'singleShot')
         self.refresh = self.timer.start()
         self.addCleanup(self.timer.stop)
@@ -188,6 +191,9 @@ class UnrestrictedVolumePollingTests(unittest.TestCase):
             poll_status=Mock(), api=SimpleNamespace(adjust_volume=Mock()),
             run_command=self.enqueue,
         )
+        self.window._request_poll = lambda delay, condition=None: REMOTE['QTimer'].singleShot(
+            delay, self.window.poll_status if condition is None else
+            lambda: self.window.poll_status() if condition() else None)
         timer = patch.object(REMOTE['QTimer'], 'singleShot')
         self.refresh = timer.start()
         self.addCleanup(timer.stop)

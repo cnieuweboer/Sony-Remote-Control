@@ -4,6 +4,8 @@ Release identifiers below come from the corresponding commits. Some releases upd
 
 ## 2026-10-21
 
+- Sony Remote 2026.10.21.11 — Centralize ordinary polling in a local coordinator: periodic cadence, visibility/calibration eligibility, volume/input read policy, delayed/coalesced refreshes, deferral behind active polls, and pause/resume. Cancel delayed callbacks during restart/shutdown and preserve independent volume rate-limit feedback.
+
 - Sony Remote 2026.10.21.10 — Skip physical TV volume/mute reads during amplifier routing while keeping power/input polling. Immediately refresh TV audio on fallback, queue that refresh behind an existing status cycle, and discard superseded routing results. Briefly disable TV volume controls until a fresh response arrives. Calibration still reads physical TV audio.
 
 - Sony Remote 2026.10.21.9 — Let the active volume rate limiter own volume/mute reads while ordinary polling continues power/input updates. Reuse limiter feedback without replacing the pending target, discard superseded audio results, and resume ordinary audio polling after completion/cancellation/failure. Track power and volume observation times separately for truthful calibration freshness.

@@ -504,7 +504,7 @@ class DiscoveryTests(unittest.TestCase):
         self.assertEqual(self.window.volume_value.text(), '35')
         self.assertEqual(self.window.mute_button.text(), 'Unmute')
         self.assertTrue(self.window.volume_up.isEnabled())
-        self.assertFalse(self.window._tv_volume_refresh_pending)
+        self.assertFalse(self.window.polling.pending)
 
     def test_fallback_during_an_existing_poll_refreshes_as_soon_as_it_finishes(self):
         self.settle_volume_controls()
@@ -512,7 +512,7 @@ class DiscoveryTests(unittest.TestCase):
         deliver = self.pending_poll_result()  # Captures power only while routed.
         self.device.get_volume = Mock(return_value={'volume': 36, 'mute': False})
         self.feed_amplifier_state(input='hdmi2')
-        self.assertTrue(self.window._tv_volume_refresh_pending)
+        self.assertTrue(self.window.polling.pending)
         self.device.get_volume.assert_not_called()
         deliver()
         self.wait(lambda: self.device.get_volume.called and not self.window.poll_running)
@@ -564,7 +564,7 @@ class DiscoveryTests(unittest.TestCase):
         self.window.hide()
         self.device.get_volume = Mock(return_value={'volume': 38, 'mute': False})
         self.window.amplifier_client._expire()
-        self.assertTrue(self.window._tv_volume_refresh_pending)
+        self.assertTrue(self.window.polling.pending)
         self.assertFalse(self.window.poll_running)
         self.device.get_volume.assert_not_called()
         self.window.show()
