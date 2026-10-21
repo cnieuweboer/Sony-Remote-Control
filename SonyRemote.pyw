@@ -1,4 +1,5 @@
 import ctypes
+import copy
 from collections import deque
 from datetime import datetime
 import faulthandler
@@ -20,7 +21,7 @@ from pathlib import Path
 from xml.sax.saxutils import escape
 from PySide6.QtCore import QByteArray, QEasingCurve, QElapsedTimer, QRect, QEvent, QFileSystemWatcher, QLockFile, QObject, QProcess, QRunnable, Qt, QThreadPool, QTimer, Signal
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
-from PySide6.QtGui import QAction, QPalette, QStyleHints
+from PySide6.QtGui import QAction, QKeySequence, QPalette, QStyleHints
 from PySide6.QtWidgets import (
     QApplication, QComboBox, QDialogButtonBox, QFrame, QGridLayout, QHBoxLayout, QLabel,
     QMainWindow, QMenu, QMessageBox, QPushButton, QProxyStyle, QStyle, QTextEdit,
@@ -499,7 +500,7 @@ class CalibrationServer(QObject):
 APP_NAME = "Sony Remote"
 
 
-__version__ = "2026.10.21.15"
+__version__ = "2026.10.21.16"
 
 
 CONFIG_PATH = Path(__file__).resolve().with_name("SonyRemote.json")
@@ -537,7 +538,76 @@ TEXT_INPUT_STATE_POLL_SECONDS = 0.05
 # ----------------------------
 
 
+DEFAULT_SHORTCUTS = {
+    "VolumeUp": ["Volume Up"],
+    "VolumeDown": ["Volume Down"],
+    "Mute": ["Volume Mute"],
+    "Left": ["Left", "Num+Left"],
+    "Right": ["Right", "Num+Right"],
+    "Up": ["Up", "Num+Up"],
+    "Down": ["Down", "Num+Down"],
+    "Confirm": ["Return", "Enter", "Num+Enter"],
+    "Return": ["Backspace"],
+    "Home": ["Home", "Num+Home"],
+    "TvInput": ["Ins", "Num+Ins"],
+    "Settings": ["Del", "Num+Del"],
+    "ChannelUp": ["Num++"],
+    "ChannelDown": ["Num+-"],
+    "PlayPause": ["Toggle Media Play/Pause"],
+    "Play": ["Media Play"],
+    "Pause": ["Media Pause"],
+    "Stop": ["Media Stop"],
+    "Next": ["Media Next"],
+    "Previous": ["Media Previous"],
+    "Num0": ["Num+0"],
+    "Num1": ["Num+1"],
+    "Num2": ["Num+2"],
+    "Num3": ["Num+3"],
+    "Num4": ["Num+4"],
+    "Num5": ["Num+5"],
+    "Num6": ["Num+6"],
+    "Num7": ["Num+7"],
+    "Num8": ["Num+8"],
+    "Num9": ["Num+9"],
+}
+
+
+SHORTCUT_ACTIONS = {
+    "VolumeUp": "volume_up",
+    "VolumeDown": "volume_down",
+    "Mute": "mute",
+    "Left": "Left",
+    "Right": "Right",
+    "Up": "Up",
+    "Down": "Down",
+    "Confirm": "Confirm",
+    "Return": "Return",
+    "Home": "Home",
+    "TvInput": "TvInput",
+    "Settings": "Settings",
+    "ChannelUp": "ChannelUp",
+    "ChannelDown": "ChannelDown",
+    "PlayPause": "PlayPause",
+    "Play": "Play",
+    "Pause": "Pause",
+    "Stop": "Stop",
+    "Next": "Next",
+    "Previous": "Prev",
+    "Num0": "Num0",
+    "Num1": "Num1",
+    "Num2": "Num2",
+    "Num3": "Num3",
+    "Num4": "Num4",
+    "Num5": "Num5",
+    "Num6": "Num6",
+    "Num7": "Num7",
+    "Num8": "Num8",
+    "Num9": "Num9",
+}
+
+
 DEFAULT_CONFIG = {
+    "Shortcuts": DEFAULT_SHORTCUTS,
     "Host": "",
     "PreSharedKey": "",
     "DarkMode": True,
@@ -797,11 +867,67 @@ def _ordered_entries(entries, sort_by_name):
     return items
 
 
+def _validate_shortcuts(raw):
+    if not isinstance(raw, dict):
+        raise ConfigError('"Shortcuts" must be an object.')
+    unknown = set(raw) - set(DEFAULT_SHORTCUTS)
+    if unknown:
+        raise ConfigError('Unknown shortcut action(s): ' + ', '.join(sorted(unknown)) + '.')
+    normalized, owners = {}, {}
+    for action, defaults in DEFAULT_SHORTCUTS.items():
+        bindings = raw.get(action, defaults)
+        if bindings == "":
+            bindings = []
+        if not isinstance(bindings, list):
+            raise ConfigError(f'Shortcuts.{action} must be a list of key strings, or empty to disable.')
+        normalized[action] = []
+        for text in bindings:
+            if not isinstance(text, str) or not text.strip():
+                raise ConfigError(f'Shortcuts.{action} contains an empty or invalid key.')
+            sequence = QKeySequence.fromString(text.strip(), QKeySequence.PortableText)
+            if (sequence.count() != 1 or sequence[0].key() in (Qt.Key_unknown, 0)
+                    or not sequence.toString(QKeySequence.PortableText)):
+                raise ConfigError(f'Shortcuts.{action}: invalid single-key combination {text!r}.')
+            code = sequence[0].toCombined()
+            canonical = sequence.toString(QKeySequence.PortableText)
+            if code in owners:
+                raise ConfigError(f'Shortcut {canonical!r} is assigned more than once '
+                                  f'({owners[code]} and {action}).')
+            owners[code] = action
+            normalized[action].append(canonical)
+    return normalized
+
+
+def _compile_shortcuts(config):
+    return {QKeySequence.fromString(text, QKeySequence.PortableText)[0].toCombined():
+            SHORTCUT_ACTIONS[action]
+            for action, bindings in config["Shortcuts"].items() for text in bindings}
+
+
+def _shortcut_code(event):
+    return event.key() | event.modifiers().value
+
+
+def _focused_shortcut_command(bindings, event):
+    code = _shortcut_code(event)
+    command = bindings.get(code)
+    # Printable punctuation already encodes Shift on many layouts (e.g. '+').
+    # Prefer an explicitly modified binding, then accept the literal symbol.
+    if (command is None and event.modifiers() & Qt.ShiftModifier
+            and 0x21 <= event.key() <= 0x7E and not chr(event.key()).isalnum()):
+        command = bindings.get(code & ~Qt.ShiftModifier.value)
+    return command
+
+
+def _shortcut_tip(config, command):
+    action = next((name for name, value in SHORTCUT_ACTIONS.items() if value == command), None)
+    labels = [QKeySequence.fromString(text, QKeySequence.PortableText).toString(QKeySequence.NativeText)
+              for text in config["Shortcuts"].get(action, [])]
+    return "Shortcut: " + " / ".join(labels) if labels else ""
+
+
 def _default_config_copy():
-    return {
-        key: value.copy() if isinstance(value, (dict, list)) else value
-        for key, value in DEFAULT_CONFIG.items()
-    }
+    return copy.deepcopy(DEFAULT_CONFIG)
 
 
 def missing_config_settings(config):
@@ -828,6 +954,7 @@ def validate_config(raw_config, *, allow_incomplete=False):
 
     config = _default_config_copy()
     config.update(raw_config)
+    config["Shortcuts"] = _validate_shortcuts(config["Shortcuts"])
     config["Host"] = _validate_host(config["Host"])
     if not isinstance(config["PreSharedKey"], str):
         raise ConfigError('"PreSharedKey" must be a string.')
@@ -874,8 +1001,8 @@ def load_config():
         save_config(config)
         return validate_config(config, allow_incomplete=True)
     try:
-        with CONFIG_PATH.open("r", encoding="utf-8") as f:
-            raw_config = json.load(f)
+        content = CONFIG_PATH.read_bytes()
+        raw_config = json.loads(content.decode("utf-8"))
     except json.JSONDecodeError as ex:
         raise ConfigError(
             f"Invalid JSON syntax in {CONFIG_PATH.name}: line {ex.lineno}, "
@@ -885,7 +1012,12 @@ def load_config():
         raise ConfigError(f"{CONFIG_PATH.name} must use UTF-8 encoding.") from ex
     except OSError as ex:
         raise ConfigError(f"Unable to read {CONFIG_PATH.name}: {ex}") from ex
-    return validate_config(raw_config, allow_incomplete=True)
+    config = validate_config(raw_config, allow_incomplete=True)
+    if "Shortcuts" not in raw_config or set(DEFAULT_SHORTCUTS) - set(raw_config["Shortcuts"]):
+        updated = dict(raw_config)
+        updated["Shortcuts"] = config["Shortcuts"]
+        save_config(updated, expected_digest=hashlib.sha256(content).digest())
+    return config
 
 
 def save_config(config, *, expected_digest=None):
@@ -948,17 +1080,20 @@ _instance_lock_file = None
 _NATIVE_VOLUME_KEYS = {0xAF: "volume_up", 0xAE: "volume_down", 0xAD: "mute"}
 
 
-_SHORTCUT_LABELS = {
-    "Left": "Left Arrow", "Right": "Right Arrow",
-    "Up": "Up Arrow", "Down": "Down Arrow",
-    "Confirm": "Enter", "Return": "Backspace", "Home": "Home",
-    "TvInput": "Insert", "Settings": "Delete",
-    "ChannelUp": "Numpad +", "ChannelDown": "Numpad −",
-    "PlayPause": "Media Play/Pause", "Next": "Media Next",
-    "Prev": "Media Previous",
-    **{f"Num{number}": f"Numpad {number}" for number in range(10)},
-}
+_QT_PLAYBACK_KEYS = frozenset((Qt.Key_MediaTogglePlayPause, Qt.Key_MediaPlay,
+                               Qt.Key_MediaPause, Qt.Key_MediaStop,
+                               Qt.Key_MediaNext, Qt.Key_MediaPrevious))
 _RETAINED_VOLUME_HOOKS = []
+
+
+_NATIVE_QT_VOLUME_KEYS = {0xAF: Qt.Key_VolumeUp.value, 0xAE: Qt.Key_VolumeDown.value,
+                          0xAD: Qt.Key_VolumeMute.value}
+
+
+def _native_shortcut_modifiers(user32):
+    return sum(mask for keys, mask in (((0x10,), 0x02000000), ((0x11,), 0x04000000),
+                                      ((0x12,), 0x08000000), ((0x5B, 0x5C), 0x10000000))
+               if any(user32.GetAsyncKeyState(key) & 0x8000 for key in keys))
 
 
 class _VolumeKeyState:
@@ -966,18 +1101,27 @@ class _VolumeKeyState:
 
     def __init__(self):
         self.pressed = {}
+        self.commands = {}
+
+    def clear(self):
+        self.pressed.clear()
+        self.commands.clear()
 
     def press(self, key, command, accept):
         if key in self.pressed:
             owned = self.pressed[key]
-            if owned and command != "mute":
-                accept(command)
+            original = self.commands.get(key, command)
+            if owned and original not in ("mute", "PlayPause"):
+                accept(original)
             return owned
         owned = bool(accept(command))
         self.pressed[key] = owned
+        if owned:
+            self.commands[key] = command
         return owned
 
     def release(self, key):
+        self.commands.pop(key, None)
         return self.pressed.pop(key, False)
 
 
@@ -1031,9 +1175,10 @@ def _load_volume_hook_api():
 class _WindowsVolumeHook(QObject):
     changed = Signal(bool, object)
 
-    def __init__(self, accept, parent=None):
+    def __init__(self, accept, parent=None, *, resolve=None):
         super().__init__(parent)
         self._accept = accept
+        self._resolve = resolve
         self._keys = _VolumeKeyState()
         self._hook = None
         self._callback = None
@@ -1073,6 +1218,7 @@ class _WindowsVolumeHook(QObject):
             if self._stopping.is_set():
                 return
             # Do not seize keys that were already held when the app started.
+            self._keys.clear()
             self._keys.pressed = {
                 key: False for key in _NATIVE_VOLUME_KEYS
                 if self._user32.GetAsyncKeyState(key) & 0x8000
@@ -1118,9 +1264,12 @@ class _WindowsVolumeHook(QObject):
                 data = ctypes.cast(address, ctypes.POINTER(_LowLevelKey)).contents
                 key = data.vkCode
                 command = _NATIVE_VOLUME_KEYS.get(key)
+                if command is not None and self._resolve is not None:
+                    command = self._keys.commands.get(key) or self._resolve(
+                        key, _native_shortcut_modifiers(self._user32))
                 # Remappers can generate injected volume-key events. They are
                 # safe to handle too: this remote never synthesizes key events.
-                if command:
+                if command or key in self._keys.pressed:
                     if message in (0x101, 0x105):
                         owned = self._keys.release(data.vkCode)
                     else:
@@ -2189,6 +2338,7 @@ class SonyRemote(QMainWindow):
     def __init__(self, config):
         super().__init__()
         self.config = config
+        self._shortcut_bindings = _compile_shortcuts(config)
         self.calibration_active = False
         self.volume_mapping = None
         self._mapping_digest = None
@@ -2507,7 +2657,7 @@ class SonyRemote(QMainWindow):
             button.clicked.connect(
                 lambda checked=False, c=command: self.send_ircc(c)
             )
-            button.setToolTip("Shortcut: " + _SHORTCUT_LABELS[command])
+            button.setToolTip(_shortcut_tip(self.config, command))
             button.setProperty("remoteCommand", command)
             self.channel_buttons[command] = button
             grid.addWidget(button, row, column)
@@ -2536,7 +2686,7 @@ class SonyRemote(QMainWindow):
             button = QPushButton(text)
             button.setMinimumHeight(36)
             button.clicked.connect(lambda checked=False: self.send_ircc(command))
-            button.setToolTip("Shortcut: " + _SHORTCUT_LABELS[command])
+            button.setToolTip(_shortcut_tip(self.config, command))
             button.setProperty("remoteCommand", command)
             return button
 
@@ -2583,8 +2733,8 @@ class SonyRemote(QMainWindow):
         self.volume_value.setObjectName("volumeValue")
         self.volume_value.setAlignment(Qt.AlignCenter)
         self.volume_up = QPushButton("+")
-        self.volume_down.setToolTip("Shortcut: Volume Down")
-        self.volume_up.setToolTip("Shortcut: Volume Up")
+        self.volume_down.setToolTip(_shortcut_tip(self.config, "volume_down"))
+        self.volume_up.setToolTip(_shortcut_tip(self.config, "volume_up"))
         for button, amount in ((self.volume_down, -1), (self.volume_up, 1)):
             button.setAutoRepeat(True)
             button.setAutoRepeatDelay(500)
@@ -2598,7 +2748,7 @@ class SonyRemote(QMainWindow):
         layout.addLayout(row)
 
         self.mute_button = QPushButton("Mute")
-        self.mute_button.setToolTip("Shortcut: Volume Mute")
+        self.mute_button.setToolTip(_shortcut_tip(self.config, "mute"))
         self.mute_button.clicked.connect(self.toggle_mute)
         layout.addWidget(self.mute_button)
 
@@ -2614,8 +2764,7 @@ class SonyRemote(QMainWindow):
             button = QPushButton(text)
             button.clicked.connect(lambda checked=False, c=command: self.send_ircc(c))
             button.setProperty("remoteCommand", command)
-            if command in _SHORTCUT_LABELS:
-                button.setToolTip("Shortcut: " + _SHORTCUT_LABELS[command])
+            button.setToolTip(_shortcut_tip(self.config, command))
             row.addWidget(button)
         layout.addLayout(row)
 
@@ -3595,8 +3744,8 @@ class SonyRemote(QMainWindow):
             ),
         )
 
-    def _dispatch_shortcut(self, command):
-        if command in _PLAYBACK_KEY_COMMANDS and self._playback_key_mode() != "focused":
+    def _dispatch_shortcut(self, command, *, custom=False):
+        if not custom and command in _PLAYBACK_KEY_COMMANDS and self._playback_key_mode() != "focused":
             return False
         if "remote_codes" not in self._discovery_ready:
             return False
@@ -3610,7 +3759,7 @@ class SonyRemote(QMainWindow):
     def _install_windows_volume_hook(self):
         if self._native_volume_hook is not None:
             return
-        self._native_volume_hook = _WindowsVolumeHook(self._accept_native_volume, self)
+        self._native_volume_hook = _WindowsVolumeHook(self._accept_native_volume, self, resolve=self._resolve_native_volume)
         self._native_volume_hook.changed.connect(self._volume_hook_changed)
         try:
             self._native_volume_hook.start()
@@ -3630,16 +3779,24 @@ class SonyRemote(QMainWindow):
                    or QApplication.activeModalWidget() is not None
                    or QApplication.activePopupWidget() is not None)
         owner_deadline = self.amplifier_client.state_deadline if self._amplifier_owns_hotkeys() else 0
+        self._native_bound_actions = {
+            command for code, command in self._shortcut_bindings.items()
+            if (code & 0x01FFFFFF) in _NATIVE_QT_VOLUME_KEYS.values()
+            and (command in ("volume_up", "volume_down", "mute")
+                 or not (hasattr(self, "text_input") and self.text_input.hasFocus()))}
         with self._native_volume_lock:
             self._native_volume_state = (window, blocked, owner_deadline)
             if blocked or not window:
                 self._native_volume_queue.clear()
 
+    def _resolve_native_volume(self, key, modifiers):
+        return self._shortcut_bindings.get(_NATIVE_QT_VOLUME_KEYS[key] | modifiers)
+
     def _accept_native_volume(self, command, foreground):
         # Native-thread callback: plain state and queued signal only; no widget/device/IPC calls.
         with self._native_volume_lock:
             window, blocked, owner_deadline = self._native_volume_state
-            if (command not in ("volume_up", "volume_down", "mute") or blocked
+            if (command not in self._native_bound_actions or blocked
                     or not window or foreground != window or time.monotonic() < owner_deadline):
                 return False
             if len(self._native_volume_queue) >= 32:
@@ -3661,13 +3818,13 @@ class SonyRemote(QMainWindow):
             return
         for command in commands:
             # Ownership was decided when this physical event was intercepted.
-            self._run_focused_shortcut(command)
+            self._run_focused_shortcut(command, custom=True)
 
     def _refresh_shortcut_context(self):
         self._shortcut_refresh_pending = False
         self._refresh_playback_routing()
 
-    def _focused_shortcut_allowed(self, command):
+    def _focused_shortcut_allowed(self, command, *, custom=False):
         if (self._shutting_down or self._calibration_blocked()
                 or not self.isActiveWindow() or self.isMinimized()
                 or QApplication.activeModalWidget() is not None
@@ -3677,11 +3834,11 @@ class SonyRemote(QMainWindow):
             return not self._amplifier_owns_hotkeys()
         if hasattr(self, "text_input") and self.text_input.hasFocus():
             return False
-        return (not (command in _PLAYBACK_KEY_COMMANDS and self._playback_key_mode() != "focused")
+        return (not (not custom and command in _PLAYBACK_KEY_COMMANDS and self._playback_key_mode() != "focused")
                 and "remote_codes" in self._discovery_ready
                 and self.api.resolve_remote_command(command) in self.api.remote_codes)
 
-    def _run_focused_shortcut(self, command):
+    def _run_focused_shortcut(self, command, *, custom=False):
         if command == "volume_up":
             self.adjust_volume(1)
         elif command == "volume_down":
@@ -3689,31 +3846,16 @@ class SonyRemote(QMainWindow):
         elif command == "mute":
             self.toggle_mute()
         else:
-            self._dispatch_shortcut(command)
+            self._dispatch_shortcut(command, custom=custom)
 
-    @staticmethod
-    def _qt_shortcut_command(event):
-        modifiers = event.modifiers()
-        if modifiers & (Qt.ControlModifier | Qt.AltModifier | Qt.MetaModifier):
-            return None
+    def _qt_shortcut_command(self, event):
         key = event.key()
-        if modifiers & Qt.KeypadModifier:
-            command = {Qt.Key_0: "Num0", Qt.Key_1: "Num1", Qt.Key_2: "Num2",
-                       Qt.Key_3: "Num3", Qt.Key_4: "Num4", Qt.Key_5: "Num5",
-                       Qt.Key_6: "Num6", Qt.Key_7: "Num7", Qt.Key_8: "Num8",
-                       Qt.Key_9: "Num9", Qt.Key_Plus: "ChannelUp",
-                       Qt.Key_Minus: "ChannelDown"}.get(key)
-            if command is not None:
-                return command
-        return {
-            Qt.Key_Left: "Left", Qt.Key_Right: "Right", Qt.Key_Up: "Up", Qt.Key_Down: "Down",
-            Qt.Key_Return: "Confirm", Qt.Key_Enter: "Confirm", Qt.Key_Backspace: "Return",
-            Qt.Key_Home: "Home", Qt.Key_Insert: "TvInput", Qt.Key_Delete: "Settings",
-            Qt.Key_VolumeUp: "volume_up", Qt.Key_VolumeDown: "volume_down", Qt.Key_VolumeMute: "mute",
-            Qt.Key_MediaTogglePlayPause: "PlayPause", Qt.Key_MediaPlay: "Play",
-            Qt.Key_MediaPause: "Pause", Qt.Key_MediaStop: "Stop",
-            Qt.Key_MediaNext: "Next", Qt.Key_MediaPrevious: "Prev",
-        }.get(key)
+        if (key in _QT_PLAYBACK_KEYS and self._playback_key_mode() != "focused"):
+            return None  # SMTC owns physical transport keys, independent of bindings.
+        if (hasattr(self, "text_input") and self.text_input.hasFocus()
+                and key not in _NATIVE_QT_VOLUME_KEYS.values()):
+            return None
+        return _focused_shortcut_command(self._shortcut_bindings, event)
 
     # ----------------------------
     # Configuration watching and restart
@@ -4041,11 +4183,12 @@ class SonyRemote(QMainWindow):
             return super().eventFilter(watched, event)
 
         command = self._qt_shortcut_command(event)
+        custom = key not in _QT_PLAYBACK_KEYS
         previous = self._shortcut_presses.get(key)
         if event_type == QEvent.ShortcutOverride:
             owned = (previous if key in self._shortcut_presses else
                      command if not event.isAutoRepeat() and command is not None
-                     and self._focused_shortcut_allowed(command) else None)
+                     and self._focused_shortcut_allowed(command, custom=custom) else None)
             if owned:
                 event.accept()
                 return True
@@ -4054,17 +4197,17 @@ class SonyRemote(QMainWindow):
         if key in self._shortcut_presses:
             owned = previous
             if (owned and command is not None and owned not in ("mute", "PlayPause")
-                    and self._focused_shortcut_allowed(owned)):
-                self._run_focused_shortcut(owned)
+                    and self._focused_shortcut_allowed(owned, custom=custom)):
+                self._run_focused_shortcut(owned, custom=custom)
         else:
             # Never acquire a held key halfway through its press, after focus
             # or amplifier/SMTC ownership changed.
             owned = command if (not event.isAutoRepeat() and command is not None
-                                and self._focused_shortcut_allowed(command)) else None
+                                and self._focused_shortcut_allowed(command, custom=custom)) else None
             if command is not None:
                 self._shortcut_presses[key] = owned
             if owned:
-                self._run_focused_shortcut(owned)
+                self._run_focused_shortcut(owned, custom=custom)
         if owned:
             event.accept()
             return True

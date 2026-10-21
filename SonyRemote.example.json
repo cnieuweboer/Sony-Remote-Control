@@ -31,5 +31,106 @@
   "SystemTray": false,
   "CloseToTray": false,
   "DropdownAnimationWorkaround": true,
-  "AmplifierTVInput": ""
+  "AmplifierTVInput": "",
+  "Shortcuts": {
+    "VolumeUp": [
+      "Volume Up"
+    ],
+    "VolumeDown": [
+      "Volume Down"
+    ],
+    "Mute": [
+      "Volume Mute"
+    ],
+    "Left": [
+      "Left",
+      "Num+Left"
+    ],
+    "Right": [
+      "Right",
+      "Num+Right"
+    ],
+    "Up": [
+      "Up",
+      "Num+Up"
+    ],
+    "Down": [
+      "Down",
+      "Num+Down"
+    ],
+    "Confirm": [
+      "Return",
+      "Enter",
+      "Num+Enter"
+    ],
+    "Return": [
+      "Backspace"
+    ],
+    "Home": [
+      "Home",
+      "Num+Home"
+    ],
+    "TvInput": [
+      "Ins",
+      "Num+Ins"
+    ],
+    "Settings": [
+      "Del",
+      "Num+Del"
+    ],
+    "ChannelUp": [
+      "Num++"
+    ],
+    "ChannelDown": [
+      "Num+-"
+    ],
+    "PlayPause": [
+      "Toggle Media Play/Pause"
+    ],
+    "Play": [
+      "Media Play"
+    ],
+    "Pause": [
+      "Media Pause"
+    ],
+    "Stop": [
+      "Media Stop"
+    ],
+    "Next": [
+      "Media Next"
+    ],
+    "Previous": [
+      "Media Previous"
+    ],
+    "Num0": [
+      "Num+0"
+    ],
+    "Num1": [
+      "Num+1"
+    ],
+    "Num2": [
+      "Num+2"
+    ],
+    "Num3": [
+      "Num+3"
+    ],
+    "Num4": [
+      "Num+4"
+    ],
+    "Num5": [
+      "Num+5"
+    ],
+    "Num6": [
+      "Num+6"
+    ],
+    "Num7": [
+      "Num+7"
+    ],
+    "Num8": [
+      "Num+8"
+    ],
+    "Num9": [
+      "Num+9"
+    ]
+  }
 }

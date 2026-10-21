@@ -99,8 +99,9 @@ Set:
 - `InputControls` — show the input selector and favorite input buttons.
 - `VolumeControls` — show volume and mute controls.
 - `PlaybackControls` — show media playback controls.
-- `SMTCPlaybackKeys` — `false` by default. On Windows, use SMTC for global playback keys and disable their focused interception; requires the optional packages above. Participation pauses when the TV is unavailable or during calibration. Volume/mute routing is unchanged.
+- `SMTCPlaybackKeys` — `false` by default. On Windows, use SMTC for global playback keys and disable focused interception of physical playback keys; requires the optional packages above. Participation pauses when the TV is unavailable or during calibration. Volume/mute routing is unchanged.
 - `AmplifierTVInput` — fallback amplifier input ID for the TV (for example `hdmi1`, `optical1`, or `tv`), rather than its display name. Leave empty to use TV controls unless a matching calibration supplies the input.
+- `Shortcuts` — focused action-to-key lists; see the keyboard shortcut section below.
 - `DiagnosticsEnabled` — `false` by default. Set to `true` to append unexpected errors and crash diagnostics to `SonyRemote-crash.log` beside the script. Logs contain the app version, exception types, and stack locations; exception messages, source lines, request data, and local variable values are omitted. If the log cannot be opened or written, the app continues without logging.
 - `SortByName` — `false` (default) keeps favorites and dropdown entries in JSON insertion order; `true` sorts them alphabetically by `NameOverride`, falling back to `Name`, ignoring case. Apps and inputs are ordered separately.
 - `Apps` — settings for applications discovered from the Sony TV.
@@ -129,9 +130,13 @@ Regular status polling pauses while the window is hidden or minimized and refres
 
 ## Keyboard shortcuts
 
-Navigation and focused playback shortcuts use a Qt application event filter on all platforms; Windows volume/mute use focused low-level interception to suppress Windows volume changes. Sony yields volume/mute to amplifier global ownership; open dropdowns keep arrows and Enter, and text input keeps its editing keys.
+Edit `Shortcuts` to replace focused keyboard bindings; each action accepts a list such as `["Ctrl+Alt+Up", "F8"]`. Missing actions are added with defaults on startup, while `[]` or `""` disables that action's focused shortcut; button tooltips show the configured bindings.
 
-Navigation and volume keys repeat when held; Mute and Play/Pause toggle once per press. Optional Windows SMTC playback routing remains separate.
+Names use [Qt portable shortcut notation](https://doc.qt.io/qt-6/qkeysequence.html#detailed-description). See the example JSON for all actions and [key-name examples and behavior](IMPLEMENTATION.md#configurable-focused-shortcuts) for media/numpad keys.
+
+Focused shortcuts use a Qt application event filter on all platforms; physical Windows volume keys use native interception to suppress Windows volume changes. Sony yields volume/mute to amplifier global ownership; open dropdowns keep arrows and Enter, and text input keeps its editing keys.
+
+Navigation and volume keys repeat when held; Mute and Play/Pause toggle once per press. Optional Windows SMTC playback routing remains separate; custom focused playback combinations still work alongside it.
 
 Hold **Volume +** or **Volume −** to repeat after half a second. With TV volume rate limiting enabled, the number shows your requested target until the TV catches up.
 

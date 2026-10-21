@@ -4,6 +4,8 @@ Release identifiers below come from the corresponding commits. Some releases upd
 
 ## 2026-10-21
 
+- Sony Remote 2026.10.21.16 — Add configurable focused `Shortcuts` with readable Qt key strings, multiple bindings, explicit disabling, conflict validation, missing-default insertion, and generated button tooltips. Preserve native Windows volume suppression, press ownership/repeat rules, popup/text safeguards, and independent SMTC playback. Global volume keys/IPC ownership remain unchanged for phase two.
+
 - Sony Remote 2026.10.21.15 — Elide long closed-combobox and favorite labels at the right edge, keeping the leading text. Keep favorite columns equal and prevent names from widening the layout. Truncation follows available pixel width; full names and action targets remain intact. Popup-list rendering is unchanged.
 
 - Sony Remote 2026.10.21.14 — Clarify the half-interval freshness conversion, keep activation deadlines/retry sleeps in seconds with millisecond conversion only at Qt waits, and use a local validity helper plus a named status-age limit distinct from the protocol wire limit. Add boundary checks and a real-window periodic-timer/event-refresh regression. Timing defaults and wire format are unchanged.
