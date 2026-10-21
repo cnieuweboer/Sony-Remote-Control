@@ -134,3 +134,21 @@ class DumpTests(unittest.TestCase):
              patch('sys.argv', ['remote.pyw', '--dump-state-full']):
             self.assertEqual(function(), 0)
             function.__globals__['dump_existing_state'].assert_called_once_with('tv' if BRAND == 'Sony' else 'amplifier', full=True)
+
+    def test_full_save_confirmation_warns_before_sharing(self):
+        function = R['dump_existing_state']
+        for full in (False, True):
+            for console in (False, True):
+                with self.subTest(full=full, console=console):
+                    dialogs = Mock()
+                    printer = Mock()
+                    with patch.dict(function.__globals__, {
+                            '_request_existing_instance': Mock(return_value={'ok': True, 'path': '/tmp/report.json'}),
+                            'QMessageBox': dialogs, 'print': printer}), \
+                         patch('sys.stdout', Mock() if console else None):
+                        self.assertEqual(function('tv', full=full), 0)
+                    message = printer.call_args.args[0] if console else dialogs.information.call_args.args[2]
+                    self.assertIn('/tmp/report.json', message)
+                    self.assertEqual('Privacy warning:' in message, full)
+                    if full:
+                        self.assertIn('Review it before sharing', message)

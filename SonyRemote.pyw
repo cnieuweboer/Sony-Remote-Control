@@ -428,6 +428,9 @@ def dump_existing_state(role, *, full=False):
         message = "Cached state saved to:\n" + reply["path"]
         if reply.get("fallback"):
             message += "\n(The script folder was unavailable; the app data folder was used.)"
+        if full:
+            message += ("\n\nPrivacy warning: This full report may contain device/network identifiers "
+                        "and app inventories. Review it before sharing.")
         ok = True
     else:
         error = reply.get("error", "unavailable") if reply else "unavailable"
@@ -577,7 +580,7 @@ class CalibrationServer(QObject):
 APP_NAME = "Sony Remote"
 
 
-__version__ = "2026.10.21.23"
+__version__ = "2026.10.21.24"
 
 
 CONFIG_PATH = Path(__file__).resolve().with_name("SonyRemote.json")

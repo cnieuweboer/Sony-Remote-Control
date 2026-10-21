@@ -4,6 +4,8 @@ Release identifiers below come from the corresponding commits. Some releases upd
 
 ## 2026-10-21
 
+- Sony Remote 2026.10.21.24 — Show the full-report privacy warning in the save confirmation popup and console output, as well as in the JSON.
+
 - Sony Remote 2026.10.21.23 — Add --dump-state-full with timestamped cached decoded responses for allowlisted polling/discovery reads. Keep ordinary dumps compact and command payloads, headers and submitted text uncached. No fresh queries; document identifiers and inventory privacy.
 
 - Sony Remote 2026.10.21.22 — Add --dump-state cached diagnostic reports through second-launch IPC, without activating the window or querying devices. Record bounded request outcomes, omit credentials/text/payloads, use timestamped files with app-data fallback, and ignore generated reports in Git.
