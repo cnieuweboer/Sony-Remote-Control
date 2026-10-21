@@ -44,8 +44,8 @@ class DiscoveryTests(unittest.TestCase):
                 self.assertTrue(sync(remote, collection, entries))
                 values = remote.config[collection]
                 self.assertEqual(list(values), ["existing", "unseen", "new"])
-                self.assertEqual(existing, {"Name": "Updated", "NameOverride": "Custom", "Hidden": True, "Favorite": True})
-                self.assertEqual(values["new"], {"Name": "New & useful", "NameOverride": "", "Hidden": False, "Favorite": False})
+                self.assertEqual(existing, {"Name": "Updated", "NameOverride": "Custom", "Hidden": True, "Favorite": True, "Removed": False})
+                self.assertEqual(values["new"], {"Name": "New & useful", "NameOverride": "", "Hidden": False, "Favorite": False, "Removed": False})
                 self.assertFalse(sync(remote, collection, entries))
 
 

@@ -109,16 +109,18 @@ Set:
   - `NameOverride` — optional replacement name shown in the dropdown and on favorite buttons. Long closed labels end with an ellipsis; favorite buttons keep equal widths.
   - `Hidden` — hide the application from the dropdown menu. Hidden applications can still be favorites.
   - `Favorite` — show a button for the application directly in the remote.
+  - `Removed` — maintained automatically; confirmed missing entries disappear from dropdowns and favorites, then return with their preferences when rediscovered.
 - `Inputs` — settings for inputs discovered from the Sony TV.
   - `Name` — name reported by the TV. This is updated automatically.
   - `NameOverride` — optional replacement name shown in the dropdown and on favorite buttons.
   - `Hidden` — hide the input from the dropdown menu. Hidden inputs can still be favorites.
   - `Favorite` — show a button for the input directly in the remote.
+  - `Removed` — maintained automatically; confirmed missing entries disappear from dropdowns and favorites, then return with their preferences when rediscovered.
 - `SystemTray` — show a system tray icon when the desktop supports it. If unavailable, the app runs as an ordinary window.
 - `CloseToTray` — clicking the window close button hides the app to the tray instead of exiting. If no tray is available, closing the window exits normally.
 - `DropdownAnimationWorkaround` — use a custom 200 ms dropdown animation to avoid dropdown flicker on Windows. Set to `false` for the standard Qt dropdown; disabled system animations remain disabled.
 
-SonyRemote automatically adds newly discovered applications and inputs to `Apps` and `Inputs` with default settings. Existing `NameOverride`, `Hidden`, and `Favorite` values are preserved. Existing entries keep their JSON positions; newly discovered entries append in device discovery order. Dropdowns only include currently discovered, non-hidden entries. Favorite buttons remain independent of `Hidden`. Name sorting affects display only and does not reorder the JSON file.
+SonyRemote automatically adds newly discovered applications and inputs to `Apps` and `Inputs` with default settings. Existing `NameOverride`, `Hidden`, and `Favorite` values are preserved. Existing entries keep their JSON positions; newly discovered entries append in device discovery order. Dropdowns exclude `Hidden` and `Removed` entries; favorites exclude `Removed` entries. Name sorting affects display only and does not reorder the JSON file. Availability is refreshed while the device is on and the window visible; missing entries need a second successful check after five seconds, and the UI resizes without restarting.
 
 Failed discovery disables only its associated controls and retries automatically; power and volume remain usable when TV status is available.
 

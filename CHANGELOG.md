@@ -4,6 +4,8 @@ Release identifiers below come from the corresponding commits. Some releases upd
 
 ## 2026-10-21
 
+- Sony Remote 2026.10.21.19 — Track automatically maintained `Removed` flags without deleting app/input preferences or JSON positions. Confirm absence with another successful inventory after five seconds, retain entries on errors/standby, restore rediscovered entries, and rebuild dropdowns/favorites with immediate window resizing. Reuse ordinary status/input polling and add a 30-second visible/awake inventory refresh plus guarded verification; preserve unapplied JSON edits.
+
 - Sony Remote 2026.10.21.18 — Add the focused TV-volume exception to global amplifier shortcuts. Prepare the TV handler before advertising leased readiness; the amplifier yields only matching bindings for the actual TV foreground window while using another known input. Preserve global ownership elsewhere, SMTC priority, calibration guards, expiry and disconnect recovery. Add native-hook and cross-repository IPC regressions.
 
 - Sony Remote 2026.10.21.17 — React to per-binding amplifier IPC ownership instead of disabling every focused volume shortcut. Let amplifier global bindings take priority over overlapping SMTC actions and focused keys, restore non-conflicting controls dynamically, and retain compatibility with older amplifier state messages.

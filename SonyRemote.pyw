@@ -24,7 +24,7 @@ from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtGui import QAction, QKeySequence, QPalette, QStyleHints
 from PySide6.QtWidgets import (
     QApplication, QComboBox, QDialogButtonBox, QFrame, QGridLayout, QHBoxLayout, QLabel,
-    QMainWindow, QMenu, QMessageBox, QPushButton, QProxyStyle, QStyle, QTextEdit,
+    QLayout, QMainWindow, QMenu, QMessageBox, QPushButton, QProxyStyle, QStyle, QTextEdit,
     QStyleOptionButton, QSizePolicy, QStyleOptionComboBox, QStylePainter, QStyledItemDelegate,
     QSystemTrayIcon, QVBoxLayout, QWidget,
 )
@@ -533,7 +533,7 @@ class CalibrationServer(QObject):
 APP_NAME = "Sony Remote"
 
 
-__version__ = "2026.10.21.18"
+__version__ = "2026.10.21.19"
 
 
 CONFIG_PATH = Path(__file__).resolve().with_name("SonyRemote.json")
@@ -841,6 +841,7 @@ def _validate_entries(value, collection):
             "NameOverride",
             "Hidden",
             "Favorite",
+            "Removed",
         }
 
         if unknown_keys:
@@ -854,6 +855,7 @@ def _validate_entries(value, collection):
         name_override = settings.get("NameOverride", "")
         hidden = settings.get("Hidden", False)
         favorite = settings.get("Favorite", False)
+        removed = settings.get("Removed", False)
 
         if not isinstance(name, str) or not name.strip():
             raise ConfigError(
@@ -879,11 +881,15 @@ def _validate_entries(value, collection):
                 'must be true or false.'
             )
 
+        if not isinstance(removed, bool):
+            raise ConfigError(f'"{collection}" entry {input_id!r} "Removed" must be true or false.')
+
         normalized[input_id] = {
             "Name": name.strip(),
             "NameOverride": name_override.strip(),
             "Hidden": hidden,
             "Favorite": favorite,
+            "Removed": removed,
         }
 
     return normalized
@@ -1059,9 +1065,16 @@ def load_config():
     except OSError as ex:
         raise ConfigError(f"Unable to read {CONFIG_PATH.name}: {ex}") from ex
     config = validate_config(raw_config, allow_incomplete=True)
-    if "Shortcuts" not in raw_config or set(DEFAULT_SHORTCUTS) - set(raw_config["Shortcuts"]):
+    collections = ("Apps", "Inputs") if "Apps" in config else ("Inputs",)
+    missing_removed = any("Removed" not in item for collection in collections
+                          for item in raw_config.get(collection, {}).values())
+    if ("Shortcuts" not in raw_config or set(DEFAULT_SHORTCUTS) - set(raw_config["Shortcuts"])
+            or missing_removed):
         updated = dict(raw_config)
         updated["Shortcuts"] = config["Shortcuts"]
+        if missing_removed:
+            for collection in collections:
+                updated[collection] = config[collection]
         save_config(updated, expected_digest=hashlib.sha256(content).digest())
     return config
 
@@ -2223,6 +2236,106 @@ def remaining_validity_ms(age_seconds, max_age_seconds):
     return int(max(0.0, min(max_age_seconds, max_age_seconds - age_seconds)) * 1000)
 
 
+# Discovery inventories retain preferences while absent entries are confirmed.
+DISCOVERY_INTERVAL_SECONDS = 30.0
+REMOVAL_CONFIRM_SECONDS = 5.0
+
+
+def _inventory_ids(entries, id_key, name_key):
+    if not isinstance(entries, list):
+        raise DeviceResponseError("Discovery did not return a complete inventory list.")
+    ids = []
+    for entry in entries:
+        if (not isinstance(entry, dict) or not isinstance(entry.get(id_key), str)
+                or not entry[id_key].strip() or not isinstance(entry.get(name_key), str)
+                or not entry[name_key].strip()):
+            raise DeviceResponseError("Discovery returned an invalid inventory entry.")
+        ids.append(entry[id_key].strip())
+    if len(set(ids)) != len(ids):
+        raise DeviceResponseError("Discovery returned duplicate inventory IDs.")
+    return set(ids)
+
+
+class DiscoveryTracker(QObject):
+    """Confirm absences with fresh inventories; reuse the ordinary status cadence."""
+
+    def __init__(self, parent, collections, refresh, allowed):
+        super().__init__(parent)
+        self.collections, self.refresh, self.allowed = collections, refresh, allowed
+        self.pending = {}
+        self.checked = {}
+        self.retry_after = {}
+        self.paused = False
+        self.verification = QTimer(self)
+        self.verification.setSingleShot(True)
+        self.verification.timeout.connect(self.tick)
+
+    def observe(self, collection, present, settings, *, allow_missing, observed_at=None):
+        now = time.monotonic() if observed_at is None else observed_at
+        missing = self.pending.setdefault(collection, {})
+        changed = False
+        for key, item in settings.items():
+            if "Removed" not in item:
+                item["Removed"] = False
+                changed = True
+            if key in present:
+                missing.pop(key, None)
+                if item["Removed"]:
+                    item["Removed"] = False
+                    changed = True
+            elif allow_missing and not item["Removed"]:
+                first = missing.setdefault(key, now)
+                if now - first >= REMOVAL_CONFIRM_SECONDS:
+                    item["Removed"] = True
+                    missing.pop(key, None)
+                    changed = True
+        if allow_missing or not any(key not in present and not item["Removed"]
+                                    for key, item in settings.items()):
+            self.checked[collection] = now
+        else:
+            missing.clear()  # Standby/unknown power cannot establish an absence.
+        self._arm()
+        return changed
+
+    def tick(self):
+        if self.paused:
+            return
+        now = time.monotonic()
+        for collection in self.collections:
+            if not self.allowed(collection):
+                continue
+            pending = self.pending.get(collection, {})
+            due = min(pending.values()) + REMOVAL_CONFIRM_SECONDS if pending else float("inf")
+            if (now >= self.retry_after.get(collection, 0)
+                    and (now >= due or now - self.checked.get(collection, 0) >= DISCOVERY_INTERVAL_SECONDS)):
+                self.retry_after[collection] = now + REMOVAL_CONFIRM_SECONDS
+                self.refresh(collection)
+        self._arm()
+
+    def _arm(self):
+        self.verification.stop()
+        if self.paused:
+            return
+        now = time.monotonic()
+        deadlines = [max(min(missing.values()) + REMOVAL_CONFIRM_SECONDS,
+                         self.retry_after.get(collection, 0))
+                     for collection, missing in self.pending.items()
+                     if missing and self.allowed(collection)]
+        if deadlines:
+            self.verification.start(max(1, int(max(0, min(deadlines) - now) * 1000) + 1))
+
+    def pause(self):
+        self.paused = True
+        self.verification.stop()
+        self.pending.clear()
+        self.checked.clear()
+        self.retry_after.clear()
+
+    def resume(self):
+        self.paused = False
+        self._arm()
+
+
 class PollingCoordinator(QObject):
     """Own ordinary polling policy and coalesced refresh scheduling.
 
@@ -2417,6 +2530,7 @@ class SonyRemote(QMainWindow):
         self._discovery_ready = set()
         self._discovery_pending = set()
         self._discovery_errors = {}
+        self.discovery = DiscoveryTracker(self, ("Apps", "Inputs"), self._refresh_discovery, self._can_discover)
         self.tray = None
         self._really_close = False
         self._shutting_down = False
@@ -2844,7 +2958,7 @@ class SonyRemote(QMainWindow):
                 for uri, settings in _ordered_entries(
                     self.config[collection], self.config["SortByName"]
                 )
-                if settings["Favorite"]
+                if settings["Favorite"] and not settings.get("Removed", False)
             ]
             for index, (uri, settings) in enumerate(favorites):
                 button = buttons.pop(uri, None)
@@ -2857,6 +2971,7 @@ class SonyRemote(QMainWindow):
                 button.setText(_entry_display_name(settings))
                 row, column = divmod(index, 2)
                 layout.addWidget(button, row, column)
+                button.show()
             for button in buttons.values():
                 button.hide()
                 button.deleteLater()
@@ -2878,6 +2993,10 @@ class SonyRemote(QMainWindow):
     def _fit_and_lock_window(self):
         self.setMinimumSize(0, 0)
         self.setMaximumSize(16777215, 16777215)
+        # Recalculate nested section layouts before locking the new size.
+        for layout in reversed(self.findChildren(QLayout)):
+            layout.invalidate()
+            layout.activate()
         self.adjustSize()
         self.setFixedSize(self.sizeHint())
 
@@ -3010,31 +3129,49 @@ class SonyRemote(QMainWindow):
             self.power_button.setText("Configure device")
             return
 
-        tasks = {}
+        tasks = []
         if ((self.config["TextInputControls"] and self.config["TextInputSubmit"])
                 or self.config["ChannelControls"] or self.config["NavigationControls"]
                 or self.config["PlaybackControls"]):
-            tasks["remote_codes"] = self.api.load_remote_codes
+            tasks.append("remote_codes")
         if self.config["AppControls"]:
-            tasks["apps"] = self.api.get_apps
+            tasks.append("apps")
         if self.config["InputControls"]:
-            tasks["inputs"] = self.api.get_inputs
+            tasks.append("inputs")
 
-        for feature, function in tasks.items():
-            if feature in self._discovery_ready or feature in self._discovery_pending:
-                continue
-            self._discovery_pending.add(feature)
-            def discover(function=function):
-                return function(), time.monotonic()
-            accepted = self.run_worker(
-                discover,
-                on_result=lambda result, feature=feature: self._discovery_succeeded(feature, *result),
-                on_error=lambda error, feature=feature: self._discovery_failed(feature, error),
-                on_finished=lambda feature=feature: self._discovery_finished(feature),
-            )
-            if not accepted:
-                self._discovery_pending.discard(feature)
+        for feature in tasks:
+            if feature not in self._discovery_ready:
+                self._start_discovery(feature)
         self._update_polling_state()
+
+    def _can_discover(self, collection):
+        return bool(not self._shutting_down and not self.calibration_active
+                    and not self._calibration_operation and self.last_power == "active"
+                    and time.monotonic() - self._status_observed_at < STATUS_MAX_AGE_SECONDS
+                    and self.config["AppControls" if collection == "Apps" else "InputControls"]
+                    and self.isVisible() and not self.isMinimized() and self.polling.allowed())
+
+    def _refresh_discovery(self, collection):
+        if self._can_discover(collection):
+            self._start_discovery("apps" if collection == "Apps" else "inputs")
+
+    def _start_discovery(self, feature):
+        if (feature in self._discovery_pending or self._shutting_down or self.calibration_active
+                or feature == "inputs" and self._input_status_running):
+            return
+        function = getattr(self.api, {"apps": "get_apps", "inputs": "get_inputs",
+                                     "remote_codes": "load_remote_codes"}[feature])
+        self._discovery_pending.add(feature)
+        def discover():
+            return function(), time.monotonic()
+        accepted = self.run_worker(
+            discover,
+            on_result=lambda result: self._discovery_succeeded(feature, *result),
+            on_error=lambda error: self._discovery_failed(feature, error),
+            on_finished=lambda: self._discovery_finished(feature),
+        )
+        if not accepted:
+            self._discovery_pending.discard(feature)
 
     def _discovery_finished(self, feature):
         self._discovery_pending.discard(feature)
@@ -3045,11 +3182,22 @@ class SonyRemote(QMainWindow):
         if feature in ("apps", "inputs"):
             collection = "Apps" if feature == "apps" else "Inputs"
             try:
+                present = _inventory_ids(result, "uri", "title")
                 changed = self._sync_discovered_config(collection, result)
-                if feature == "apps":
-                    self.populate_apps(result)
-                else:
-                    self.populate_inputs(result)
+                changed = self.discovery.observe(
+                    collection, present, self.config[collection],
+                    allow_missing=self._can_discover(collection), observed_at=observed_at) or changed
+                if changed or feature not in self._discovery_ready:
+                    combo = self.app_combo if feature == "apps" else self.input_combo
+                    combo.hidePopup()
+                    if feature == "apps":
+                        self.populate_apps()
+                    else:
+                        self.populate_inputs(result)
+                    self._build_favorites_from_config()
+                    self._fit_and_lock_window()
+                elif feature == "inputs":
+                    self.update_active_input(result)
             except Exception as error:
                 self._discovery_failed(feature, error)
                 return
@@ -3059,8 +3207,6 @@ class SonyRemote(QMainWindow):
                 except Exception as error:
                     record_exception(error, "Configuration save")
                     self.show_error(f"Could not update SonyRemote.json:\n\n{error}")
-            self._build_favorites_from_config()
-            self._fit_and_lock_window()
         if feature == "inputs" and observed_at is not None:
             self.polling.observed("inputs", observed_at)
         self._discovery_ready.add(feature)
@@ -3072,7 +3218,8 @@ class SonyRemote(QMainWindow):
 
     def _discovery_failed(self, feature, error):
         record_unexpected_exception(error, f"Optional {feature} discovery", background=True)
-        self._discovery_ready.discard(feature)
+        if feature not in ("apps", "inputs"):
+            self._discovery_ready.discard(feature)
         self._discovery_errors[feature] = (str(error) if isinstance(error, (DeviceConnectionError, DeviceResponseError))
                                            else f"Unexpected discovery error ({type(error).__name__}).")
         self.set_controls_enabled(self.last_power == "active",
@@ -3121,21 +3268,18 @@ class SonyRemote(QMainWindow):
             if "Favorite" not in item:
                 item["Favorite"] = False
                 changed = True
+            if "Removed" not in item:
+                item["Removed"] = False
+                changed = True
 
         return changed
 
-    def populate_apps(self, entries):
+    def populate_apps(self):
         apps_config = self.config.get("Apps", {})
         apps = []
 
-        available = {
-            str(entry.get("uri", "")).strip()
-            for entry in entries
-            if str(entry.get("uri", "")).strip()
-            and html.unescape(str(entry.get("title", ""))).strip()
-        }
         for uri, settings in _ordered_entries(apps_config, self.config["SortByName"]):
-            if uri in available and not settings["Hidden"]:
+            if not settings["Hidden"] and not settings.get("Removed", False):
                 apps.append((_entry_display_name(settings), uri))
 
         self.app_combo.blockSignals(True)
@@ -3161,10 +3305,10 @@ class SonyRemote(QMainWindow):
             and html.unescape(str(entry.get("title", ""))).strip()
         }
         for uri, settings in _ordered_entries(inputs_config, self.config["SortByName"]):
-            if uri not in available or settings["Hidden"]:
+            if settings["Hidden"] or settings.get("Removed", False):
                 continue
             inputs.append((_entry_display_name(settings), uri))
-            if str(available[uri].get("status", "")).lower() == "true":
+            if str(available.get(uri, {}).get("status", "")).lower() == "true":
                 active_uri = uri
 
         self.input_combo.blockSignals(True)
@@ -3263,6 +3407,7 @@ class SonyRemote(QMainWindow):
 
     def _status_poll_finished(self):
         self.poll_running = False
+        self.discovery.tick()
         self.polling.finished()
 
     def _poll_input_status(self):
@@ -3274,8 +3419,7 @@ class SonyRemote(QMainWindow):
             return entries, time.monotonic()
         def done(result):
             entries, observed_at = result
-            self.update_active_input(entries)
-            self.polling.observed("inputs", observed_at)
+            self._discovery_succeeded("inputs", entries, observed_at)
         def finished():
             self._input_status_running = False
             self.polling.finished()
@@ -4141,6 +4285,7 @@ class SonyRemote(QMainWindow):
 
     def _pause_background_work(self):
         self._shutting_down = True
+        self.discovery.pause()
         self.polling.pause()
         self._shortcut_presses.clear()
         self._popup_shortcut_keys.clear()
@@ -4173,6 +4318,7 @@ class SonyRemote(QMainWindow):
 
     def _resume_background_work(self, active_timers):
         self._shutting_down = False
+        self.discovery.resume()
         self._setup_activation()
         self._setup_calibration()
         self._setup_smtc()
