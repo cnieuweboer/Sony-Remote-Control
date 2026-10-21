@@ -99,6 +99,8 @@ class AmplifierClient(QObject):
         self.sequence = 0
         self.pending = {}
         self.stopped = True
+        self.focused_volume = None
+        self._sent_focused_volume = None
         self.retry = QTimer(self)
         self.retry.setSingleShot(True)
         self.retry.setInterval(2000)
@@ -109,6 +111,28 @@ class AmplifierClient(QObject):
         self.socket.readyRead.connect(self._read)
         self.socket.disconnected.connect(self._lost)
         self.socket.errorOccurred.connect(lambda _error: self._lost())
+
+    def set_focused_volume(self, window, bindings, input_id, observed_at):
+        self.focused_volume = (window, tuple(bindings), input_id, observed_at)
+        self._send_focused_volume()
+
+    def _send_focused_volume(self):
+        context = self.focused_volume
+        if (context is None or context == self._sent_focused_volume
+                or not self.state_is_fresh or not self.state.get("focused_volume_override_supported", False)
+                or self.socket.state() != QLocalSocket.ConnectedState):
+            return
+        window, bindings, input_id, observed_at = context
+        valid_for = remaining_validity_ms(time.monotonic() - observed_at, STATUS_MAX_AGE_SECONDS)
+        payload = _ipc_encode({"version": 1, "type": "focused_volume", "window": window,
+                               "shortcuts": bindings, "input": input_id, "valid_for_ms": valid_for})
+        if self.socket.bytesToWrite() > IPC_MAX_FRAME * 4:
+            self.socket.abort()  # Do not keep a permission with an undeliverable withdrawal.
+            return
+        if self.socket.write(payload) == len(payload):
+            self._sent_focused_volume = context
+        else:
+            self.socket.abort()
 
     def start(self):
         self.stopped = False
@@ -123,6 +147,7 @@ class AmplifierClient(QObject):
         return self.state is not None and time.monotonic() < self.state_deadline
 
     def _expire(self):
+        self._sent_focused_volume = None
         self.state_deadline = 0
         self.state = None
         self.state_changed.emit(None)
@@ -152,6 +177,7 @@ class AmplifierClient(QObject):
                     self.state_deadline = time.monotonic() + message["valid_for_ms"] / 1000
                     self.lease.start(max(1, message["valid_for_ms"]))
                     self.state_changed.emit(message)
+                    self._send_focused_volume()
                 elif message_type == "ack":
                     if type(message.get("id")) is not int or type(message.get("accepted")) is not bool:
                         raise ValueError("Invalid command acknowledgement")
@@ -200,6 +226,8 @@ class AmplifierClient(QObject):
                 or any(type(code) is not int or not 0 < code <= 0x7FFFFFFF for code in bindings)
                 or len(set(bindings)) != len(bindings)):
             raise ValueError("Invalid global shortcut ownership")
+        if type(message.get("focused_volume_override_supported", False)) is not bool:
+            raise ValueError("Invalid focused volume capability")
         for key in ("raw_volume", "raw_max_volume"):
             value = message.get(key)
             if value is not None and (type(value) not in (int, float) or not math.isfinite(value)):
@@ -505,7 +533,7 @@ class CalibrationServer(QObject):
 APP_NAME = "Sony Remote"
 
 
-__version__ = "2026.10.21.17"
+__version__ = "2026.10.21.18"
 
 
 CONFIG_PATH = Path(__file__).resolve().with_name("SonyRemote.json")
@@ -909,12 +937,17 @@ def _compile_shortcuts(config):
             for action, bindings in config["Shortcuts"].items() for text in bindings}
 
 
-def _binding_owned(bindings, code):
-    if code in bindings:
-        return True
+def _ownership_code(code):
     key = code & 0x01FFFFFF
-    return bool(code & Qt.ShiftModifier.value and 0x21 <= key <= 0x7E
-                and not chr(key).isalnum() and code & ~Qt.ShiftModifier.value in bindings)
+    if key == Qt.Key_Enter.value:
+        code &= ~Qt.KeypadModifier.value
+    if 0x21 <= key <= 0x7E and not chr(key).isalnum():
+        code &= ~Qt.ShiftModifier.value
+    return code
+
+
+def _binding_owned(bindings, code):
+    return any(_ownership_code(binding) == _ownership_code(code) for binding in bindings)
 
 
 def _shortcut_code(event):
@@ -3156,6 +3189,7 @@ class SonyRemote(QMainWindow):
         self.last_volume = info
         self._volume_observed_at = observed_at
         self.polling.observed("volume", observed_at)
+        self._publish_native_volume_state()
         return True
 
     def poll_status(self, groups=None):
@@ -3471,9 +3505,34 @@ class SonyRemote(QMainWindow):
                     and state["input"] == self._amplifier_tv_input()
                     and state["raw_volume"] is not None and type(state["mute"]) is bool)
 
-    def _amplifier_owns_hotkeys(self, code=None):
-        # Ownership is independent of the TV input: a functioning global hook
-        # must receive the key even while the amplifier uses a PC input.
+    def _focused_tv_volume_bindings(self):
+        if (self._shutting_down or self._calibration_blocked() or not self.initialized
+                or self.last_power != "active" or not self.last_volume or self._use_amplifier()
+                or not self.isActiveWindow() or self.isMinimized() or not self.isVisible()
+                or QApplication.activeModalWidget() is not None
+                or QApplication.activePopupWidget() is not None or not self._amplifier_tv_input()):
+            return []
+        native_ready = (sys.platform != "win32" or self._native_volume_hook is not None
+                        and self._native_volume_hook.installed)
+        editing = hasattr(self, "text_input") and self.text_input.hasFocus()
+        return [code for code, action in self._shortcut_bindings.items()
+                if action in ("volume_up", "volume_down", "mute")
+                and not (code & 0x01FFFFFF in _QT_PLAYBACK_KEYS and self._playback_key_mode() != "focused")
+                and (code & 0x01FFFFFF not in _NATIVE_QT_VOLUME_KEYS.values() or native_ready)
+                and (not editing or code & 0x01FFFFFF in _NATIVE_QT_VOLUME_KEYS.values())][:128]
+
+    def _focused_tv_override_bindings(self):
+        state = self.amplifier_state or {}
+        if (not self.amplifier_client.state_is_fresh
+                or not state.get("focused_volume_override_supported", False)
+                or not state.get("input") or state["input"] == self._amplifier_tv_input()
+                or time.monotonic() - self._status_observed_at >= STATUS_MAX_AGE_SECONDS):
+            return []
+        return self._focused_tv_volume_bindings()
+
+    def _amplifier_owns_hotkeys(self, code=None, *, focused=False):
+        # Global ownership is authoritative. A capable amplifier may yield matching
+        # keys to the prepared foreground TV-volume handler.
         active = bool(not self._shutting_down and self.amplifier_state
                     and self.amplifier_client.state_is_fresh
                     and self.amplifier_state["online"] and self.amplifier_state["power"] == "on"
@@ -3481,6 +3540,8 @@ class SonyRemote(QMainWindow):
                     and self.amplifier_state["global_hotkeys_active"])
         if not active or code is None:
             return active
+        if focused and _binding_owned(self._focused_tv_override_bindings(), code):
+            return False
         if "global_shortcuts" not in self.amplifier_state:
             # Older producers own the three physical volume keys.
             return code & 0x01FFFFFF in _NATIVE_QT_VOLUME_KEYS.values()
@@ -3797,6 +3858,8 @@ class SonyRemote(QMainWindow):
             QTimer.singleShot(0, lambda error=error: self._volume_hook_changed(False, error))
 
     def _volume_hook_changed(self, installed, error):
+        if not self._shutting_down:
+            self._publish_native_volume_state()
         if error is not None and not self._shutting_down:
             record_exception(error, "Windows volume hook")
             self.show_error("Windows volume-key interception is unavailable. Use the remote's volume buttons.")
@@ -3811,24 +3874,32 @@ class SonyRemote(QMainWindow):
         owner_deadline = self.amplifier_client.state_deadline if self._amplifier_owns_hotkeys() else 0
         owned_codes = (self.amplifier_state.get("global_shortcuts")
                                     if self.amplifier_state else [])
+        override_codes = self._focused_tv_override_bindings()
+        override_deadline = self._status_observed_at + STATUS_MAX_AGE_SECONDS
         bound_actions = {
             command for code, command in self._shortcut_bindings.items()
             if (code & 0x01FFFFFF) in _NATIVE_QT_VOLUME_KEYS.values()
             and (command in ("volume_up", "volume_down", "mute")
                  or not (hasattr(self, "text_input") and self.text_input.hasFocus()))}
         with self._native_volume_lock:
+            self._native_tv_override = (override_deadline, override_codes)
             self._native_owned_codes = owned_codes
             self._native_bound_actions = bound_actions
             self._native_volume_state = (window, blocked, owner_deadline)
             if blocked or not window:
                 self._native_volume_queue.clear()
+        candidates = self._focused_tv_volume_bindings()
+        self.amplifier_client.set_focused_volume(
+            window if candidates else 0, candidates, self._amplifier_tv_input(), self._status_observed_at)
 
     def _resolve_native_volume(self, key, modifiers):
         code = _NATIVE_QT_VOLUME_KEYS[key] | modifiers
         with self._native_volume_lock:
             if time.monotonic() < self._native_volume_state[2]:
                 if self._native_owned_codes is None or _binding_owned(self._native_owned_codes, code):
-                    return None
+                    deadline, granted = self._native_tv_override
+                    if time.monotonic() >= deadline or not _binding_owned(granted, code):
+                        return None
         return self._shortcut_bindings.get(code)
 
     def _accept_native_volume(self, command, foreground):
@@ -3889,7 +3960,7 @@ class SonyRemote(QMainWindow):
 
     def _qt_shortcut_command(self, event):
         key = event.key()
-        if self._amplifier_owns_hotkeys(_shortcut_code(event)):
+        if self._amplifier_owns_hotkeys(_shortcut_code(event), focused=True):
             return None
         if (key in _QT_PLAYBACK_KEYS and self._playback_key_mode() != "focused"):
             return None  # SMTC owns physical transport keys, independent of bindings.

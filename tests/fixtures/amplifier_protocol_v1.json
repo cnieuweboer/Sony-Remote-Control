@@ -20,7 +20,8 @@
         16777330,
         16777328,
         16777329
-      ]
+      ],
+      "focused_volume_override_supported": true
     },
     {
       "version": 1,
@@ -42,7 +43,8 @@
         16777330,
         16777328,
         16777329
-      ]
+      ],
+      "focused_volume_override_supported": true
     }
   ],
   "commands": [
@@ -101,6 +103,26 @@
       "type": "ack",
       "id": 1,
       "accepted": false
+    }
+  ],
+  "focused_volume_contexts": [
+    {
+      "version": 1,
+      "type": "focused_volume",
+      "window": 123,
+      "shortcuts": [
+        16777330
+      ],
+      "input": "tv",
+      "valid_for_ms": 6000
+    },
+    {
+      "version": 1,
+      "type": "focused_volume",
+      "window": 0,
+      "shortcuts": [],
+      "input": "tv",
+      "valid_for_ms": 0
     }
   ]
 }

@@ -33,6 +33,7 @@ class VolumeLimiterTests(unittest.TestCase):
             run_command=self.enqueue,
         )
         self.window.polling = SimpleNamespace(observed=Mock())
+        self.window._publish_native_volume_state = Mock()
         self.window._accept_volume_status = lambda info, at: CLS._accept_volume_status(self.window, info, at)
         self.window._request_poll = lambda delay, condition=None, groups=None: REMOTE['QTimer'].singleShot(
             delay, self.window.poll_status if condition is None else

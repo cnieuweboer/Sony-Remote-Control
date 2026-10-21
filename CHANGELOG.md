@@ -4,6 +4,8 @@ Release identifiers below come from the corresponding commits. Some releases upd
 
 ## 2026-10-21
 
+- Sony Remote 2026.10.21.18 — Add the focused TV-volume exception to global amplifier shortcuts. Prepare the TV handler before advertising leased readiness; the amplifier yields only matching bindings for the actual TV foreground window while using another known input. Preserve global ownership elsewhere, SMTC priority, calibration guards, expiry and disconnect recovery. Add native-hook and cross-repository IPC regressions.
+
 - Sony Remote 2026.10.21.17 — React to per-binding amplifier IPC ownership instead of disabling every focused volume shortcut. Let amplifier global bindings take priority over overlapping SMTC actions and focused keys, restore non-conflicting controls dynamically, and retain compatibility with older amplifier state messages.
 
 - Sony Remote 2026.10.21.16 — Add configurable focused `Shortcuts` with readable Qt key strings, multiple bindings, explicit disabling, conflict validation, missing-default insertion, and generated button tooltips. Preserve native Windows volume suppression, press ownership/repeat rules, popup/text safeguards, and independent SMTC playback. Global volume keys/IPC ownership remain unchanged for phase two.

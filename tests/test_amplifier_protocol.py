@@ -71,7 +71,7 @@ class WireContractTests(unittest.TestCase):
 class ClientContractTests(unittest.TestCase):
     def client(self, message, *, pending=True):
         return SimpleNamespace(socket=MemorySocket(message), buffer=bytearray(),
-            state=None, state_deadline=0, lease=Mock(), state_changed=Mock(),
+            state=None, _send_focused_volume=Mock(), state_deadline=0, lease=Mock(), state_changed=Mock(),
             pending={1:Mock()} if pending else {}, _lost=Mock(),
             _validate_state=REMOTE['AmplifierClient']._validate_state,
             command_failed=Mock(), command_succeeded=Mock(), command_acknowledged=Mock())
