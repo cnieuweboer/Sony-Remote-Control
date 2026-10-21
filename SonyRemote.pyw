@@ -48,6 +48,7 @@ def ipc_server_name(role, *, channel=None):
 
 IPC_SERVER_NAME = ipc_server_name("amplifier")
 IPC_MAX_FRAME = 4096
+IPC_MAX_STATE_VALIDITY_MS = 6000  # Protocol v1 wire limit.
 
 
 def _ipc_encode(message):
@@ -182,7 +183,7 @@ class AmplifierClient(QObject):
                     "volume_display", "volume_unit",
                     "global_hotkeys_enabled", "global_hotkeys_active", "valid_for_ms"}
         if (not required <= message.keys() or type(message.get("valid_for_ms")) is not int
-                or not 0 <= message["valid_for_ms"] <= 6000
+                or not 0 <= message["valid_for_ms"] <= IPC_MAX_STATE_VALIDITY_MS
                 or any(type(message.get(key)) is not bool for key in
                        ("online", "global_hotkeys_enabled", "global_hotkeys_active"))
                 or message.get("power") not in (None, "on", "standby")
@@ -314,15 +315,15 @@ def _allow_foreground_activation(process_id):
             pass  # Window restoration still works if foreground permission is denied.
 
 
-def activate_existing_instance(role, timeout_ms=1500):
+def activate_existing_instance(role, timeout_seconds=1.5):
     """Bound startup retries and the complete handshake to one deadline."""
     socket = QLocalSocket()
     socket.setReadBufferSize(IPC_MAX_FRAME + 1)
     buffer = bytearray()
-    deadline = time.monotonic() + timeout_ms / 1000
+    deadline = time.monotonic() + timeout_seconds
 
     def remaining():
-        return max(0, int((deadline - time.monotonic()) * 1000))
+        return max(0.0, deadline - time.monotonic())
 
     def receive(expected):
         while remaining():
@@ -331,17 +332,17 @@ def activate_existing_instance(role, timeout_ms=1500):
                 if len(messages) != 1 or messages[0].get("type") != expected:
                     return None
                 return messages[0]
-            if not socket.waitForReadyRead(remaining()) and not socket.bytesAvailable():
+            if not socket.waitForReadyRead(int(remaining() * 1000)) and not socket.bytesAvailable():
                 return None
         return None
 
     try:
         while remaining():
             socket.connectToServer(ipc_server_name(role, channel="activation"))
-            if socket.waitForConnected(min(150, remaining())):
+            if socket.waitForConnected(int(min(0.15, remaining()) * 1000)):
                 break
             socket.abort()
-            time.sleep(min(0.05, remaining() / 1000))
+            time.sleep(min(0.05, remaining()))
         else:
             return False
         hello = receive("instance")
@@ -352,7 +353,7 @@ def activate_existing_instance(role, timeout_ms=1500):
         payload = _ipc_encode({"version": 1, "type": "activate"})
         if socket.write(payload) != len(payload):
             return False
-        if socket.bytesToWrite() and not socket.waitForBytesWritten(remaining()):
+        if socket.bytesToWrite() and not socket.waitForBytesWritten(int(remaining() * 1000)):
             return False
         reply = receive("activated")
         return bool(reply and reply.get("ok") is True)
@@ -498,7 +499,7 @@ class CalibrationServer(QObject):
 APP_NAME = "Sony Remote"
 
 
-__version__ = "2026.10.21.13"
+__version__ = "2026.10.21.14"
 
 
 CONFIG_PATH = Path(__file__).resolve().with_name("SonyRemote.json")
@@ -511,6 +512,9 @@ NETWORK_TIMEOUT_SECONDS = 2.0
 
 
 POLL_INTERVAL_MS = 2000
+
+
+STATUS_MAX_AGE_SECONDS = 6.0
 
 
 MAX_PENDING_COMMANDS = 16
@@ -1989,6 +1993,11 @@ class CenteredComboDelegate(QStyledItemDelegate):
 # ----------------------------
 
 
+def remaining_validity_ms(age_seconds, max_age_seconds):
+    """Convert a bounded remaining status lifetime to the IPC wire unit."""
+    return int(max(0.0, min(max_age_seconds, max_age_seconds - age_seconds)) * 1000)
+
+
 class PollingCoordinator(QObject):
     """Own ordinary polling policy and coalesced refresh scheduling.
 
@@ -2045,7 +2054,7 @@ class PollingCoordinator(QObject):
             self._arm()
 
     GROUPS = frozenset(("power", "volume", "inputs"))
-    FRESHNESS_SECONDS = POLL_INTERVAL_MS / 2000  # Half the normal interval.
+    FRESHNESS_SECONDS = POLL_INTERVAL_MS / 1000 / 2  # Half the normal interval.
 
     @property
     def pending(self):
@@ -2245,7 +2254,7 @@ class SonyRemote(QMainWindow):
                  "volume": volume.get("volume"), "mute": volume.get("mute"),
                  "minimum": volume.get("minVolume"), "maximum": volume.get("maxVolume"),
                  "sample_id": self._status_sequence, "relative_volume": True,
-                 "valid_for_ms": max(0, min(6000, int((6 - age) * 1000)))}
+                 "valid_for_ms": remaining_validity_ms(age, STATUS_MAX_AGE_SECONDS)}
         state.update(calibration_active=self.calibration_active,
                      device_id=hashlib.sha256(self.config["Host"].casefold().encode()).hexdigest())
         return state

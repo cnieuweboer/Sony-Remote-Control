@@ -866,5 +866,38 @@ class DiscoveryTests(unittest.TestCase):
                   and not self.window.poll_running)
         self.assertFalse(self.window.polling._commands['volume'])
 
+
+    def test_real_periodic_timer_skips_pending_then_fresh_volume_and_resumes(self):
+        self.settle_volume_controls()
+        coordinator = self.window.polling
+        before = self.device.calls.copy()
+        ticks = []
+        def tick():
+            ticks.append(self.device.calls['volume'])
+        # Observe counts before dispatch starts a worker on this tick.
+        coordinator.periodic.timeout.disconnect(coordinator._periodic_due)
+        coordinator.periodic.timeout.connect(tick)
+        coordinator.periodic.timeout.connect(coordinator._periodic_due)
+        try:
+            with patch.dict(GLOBALS, POLL_INTERVAL_MS=300), \
+                 patch.object(type(coordinator), 'FRESHNESS_SECONDS', 0.15):
+                coordinator.invalidate()
+                coordinator.update()
+                coordinator.request(525, groups={'volume'})
+                # These are real Qt timeouts and real window/worker dispatches;
+                # no manual _periodic_due() calls or mocked poll_status().
+                self.wait(lambda: len(ticks) >= 3
+                          and self.device.calls['volume'] >= before['volume'] + 2
+                          and not self.window._workers)
+                self.assertEqual(ticks[:3], [before['volume'], before['volume'] + 1,
+                                             before['volume'] + 1])
+                self.assertEqual(self.device.calls['volume'], before['volume'] + 2)
+                self.assertGreaterEqual(self.device.calls['power'], before['power'] + 3)
+                self.assertGreaterEqual(self.device.calls['inputs'], before['inputs'] + 3)
+                self.assertEqual(self.window.volume_value.text(), '20')
+        finally:
+            coordinator.pause()
+            coordinator.periodic.timeout.disconnect(tick)
+
 if __name__ == '__main__':
     unittest.main()
