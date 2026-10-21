@@ -1,4 +1,5 @@
 import ctypes
+from collections import deque
 from datetime import datetime
 import faulthandler
 import hashlib
@@ -19,7 +20,7 @@ from pathlib import Path
 from xml.sax.saxutils import escape
 from PySide6.QtCore import QByteArray, QEasingCurve, QElapsedTimer, QRect, QEvent, QFileSystemWatcher, QLockFile, QObject, QProcess, QRunnable, Qt, QThreadPool, QTimer, Signal
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
-from PySide6.QtGui import QAction, QKeyEvent, QPalette, QStyleHints
+from PySide6.QtGui import QAction, QPalette, QStyleHints
 from PySide6.QtWidgets import (
     QApplication, QComboBox, QDialogButtonBox, QFrame, QGridLayout, QHBoxLayout, QLabel,
     QMainWindow, QMenu, QMessageBox, QPushButton, QProxyStyle, QStyle, QTextEdit,
@@ -497,7 +498,7 @@ class CalibrationServer(QObject):
 APP_NAME = "Sony Remote"
 
 
-__version__ = "2026.10.21.5"
+__version__ = "2026.10.21.6"
 
 
 CONFIG_PATH = Path(__file__).resolve().with_name("SonyRemote.json")
@@ -924,9 +925,7 @@ _instance_mutex_api = None
 _instance_lock_file = None
 
 
-class _WindowsMessageHeader(ctypes.Structure):
-    _fields_ = [("hwnd", ctypes.c_void_p), ("message", ctypes.c_uint32),
-                ("wParam", ctypes.c_size_t), ("lParam", ctypes.c_ssize_t)]
+_NATIVE_VOLUME_KEYS = {0xAF: "volume_up", 0xAE: "volume_down", 0xAD: "mute"}
 
 
 _SHORTCUT_LABELS = {
@@ -939,6 +938,221 @@ _SHORTCUT_LABELS = {
     "Prev": "Media Previous",
     **{f"Num{number}": f"Numpad {number}" for number in range(10)},
 }
+_RETAINED_VOLUME_HOOKS = []
+
+
+class _VolumeKeyState:
+    """Keep a physical press with its original owner until release."""
+
+    def __init__(self):
+        self.pressed = {}
+
+    def press(self, key, command, accept):
+        if key in self.pressed:
+            owned = self.pressed[key]
+            if owned and command != "mute":
+                accept(command)
+            return owned
+        owned = bool(accept(command))
+        self.pressed[key] = owned
+        return owned
+
+    def release(self, key):
+        return self.pressed.pop(key, False)
+
+
+class _LowLevelKey(ctypes.Structure):
+    _fields_ = [
+        ("vkCode", ctypes.c_uint32), ("scanCode", ctypes.c_uint32),
+        ("flags", ctypes.c_uint32), ("time", ctypes.c_uint32),
+        ("dwExtraInfo", ctypes.c_size_t),
+    ]
+
+
+class _NativePoint(ctypes.Structure):
+    _fields_ = [("x", ctypes.c_int32), ("y", ctypes.c_int32)]
+
+
+class _NativeMessage(ctypes.Structure):
+    _fields_ = [
+        ("hwnd", ctypes.c_void_p), ("message", ctypes.c_uint32),
+        ("wParam", ctypes.c_size_t), ("lParam", ctypes.c_ssize_t),
+        ("time", ctypes.c_uint32), ("pt", _NativePoint),
+        ("lPrivate", ctypes.c_uint32),
+    ]
+
+
+_HookProc = getattr(ctypes, "WINFUNCTYPE", ctypes.CFUNCTYPE)(
+    ctypes.c_ssize_t, ctypes.c_int, ctypes.c_size_t, ctypes.c_ssize_t
+)
+
+
+def _load_volume_hook_api():
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    signatures = (
+        (user32.SetWindowsHookExW, [ctypes.c_int, _HookProc, ctypes.c_void_p, ctypes.c_uint32], ctypes.c_void_p),
+        (user32.UnhookWindowsHookEx, [ctypes.c_void_p], ctypes.c_int),
+        (user32.CallNextHookEx, [ctypes.c_void_p, ctypes.c_int, ctypes.c_size_t, ctypes.c_ssize_t], ctypes.c_ssize_t),
+        (user32.GetForegroundWindow, [], ctypes.c_void_p),
+        (user32.GetAsyncKeyState, [ctypes.c_int], ctypes.c_int16),
+        (user32.PeekMessageW, [ctypes.POINTER(_NativeMessage), ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32], ctypes.c_int),
+        (user32.GetMessageW, [ctypes.POINTER(_NativeMessage), ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32], ctypes.c_int),
+        (user32.PostThreadMessageW, [ctypes.c_uint32, ctypes.c_uint32, ctypes.c_size_t, ctypes.c_ssize_t], ctypes.c_int),
+        (kernel32.GetModuleHandleW, [ctypes.c_wchar_p], ctypes.c_void_p),
+        (kernel32.GetCurrentThreadId, [], ctypes.c_uint32),
+    )
+    for function, arguments, result in signatures:
+        function.argtypes = arguments
+        function.restype = result
+    return user32, kernel32
+
+
+class _WindowsVolumeHook(QObject):
+    changed = Signal(bool, object)
+
+    def __init__(self, accept, parent=None):
+        super().__init__(parent)
+        self._accept = accept
+        self._keys = _VolumeKeyState()
+        self._hook = None
+        self._callback = None
+        self._user32 = None
+        self._thread_id = None
+        self._thread = None
+        self._stopping = threading.Event()
+        self._faulted = False
+
+    @property
+    def installed(self):
+        return bool(self._hook and not self._faulted and not self._stopping.is_set())
+
+    def start(self):
+        # A separate native message loop keeps the hook responsive even while
+        # the GUI waits for workers during restart/shutdown. No Qt UI calls or
+        # network/file operations run inside the native callback.
+        if self._thread is not None:
+            return
+        self._thread = threading.Thread(target=self._run, name="RemoteVolumeKeys", daemon=True)
+        self._thread.start()
+
+    def _notify(self, installed, error=None):
+        try:
+            self.changed.emit(installed, error)
+        except RuntimeError:
+            pass  # The Qt parent may already be closing.
+
+    def _run(self):
+        error = None
+        try:
+            self._user32, kernel32 = _load_volume_hook_api()
+            message = _NativeMessage()
+            self._user32.PeekMessageW(ctypes.byref(message), None, 0, 0, 0)
+            self._thread_id = kernel32.GetCurrentThreadId()
+            # stop() can arrive before the native thread has finished startup.
+            if self._stopping.is_set():
+                return
+            # Do not seize keys that were already held when the app started.
+            self._keys.pressed = {
+                key: False for key in _NATIVE_VOLUME_KEYS
+                if self._user32.GetAsyncKeyState(key) & 0x8000
+            }
+            self._callback = _HookProc(self._handle_key)
+            self._hook = self._user32.SetWindowsHookExW(
+                13, self._callback, kernel32.GetModuleHandleW(None), 0
+            )
+            if not self._hook:
+                raise ctypes.WinError()
+            if not self._stopping.is_set():
+                self._notify(True)
+            while not self._stopping.is_set():
+                result = self._user32.GetMessageW(ctypes.byref(message), None, 0, 0)
+                if result == 0:
+                    break
+                if result == -1:
+                    raise ctypes.WinError()
+        except Exception as exc:
+            error = exc
+            self._faulted = True
+        finally:
+            if self._hook:
+                try:
+                    if not self._user32.UnhookWindowsHookEx(self._hook):
+                        raise ctypes.WinError()
+                    self._hook = None
+                except Exception as exc:
+                    error = error or exc
+                    self._faulted = True
+            # Keep the C callback alive if native unregistration failed.
+            if self._hook is None:
+                self._callback = None
+            elif self not in _RETAINED_VOLUME_HOOKS:
+                _RETAINED_VOLUME_HOOKS.append(self)
+            self._thread_id = None
+            self._notify(False, error)
+
+    def _handle_key(self, code, message, address):
+        key = None
+        if code == 0 and message in (0x100, 0x101, 0x104, 0x105):
+            try:
+                data = ctypes.cast(address, ctypes.POINTER(_LowLevelKey)).contents
+                key = data.vkCode
+                command = _NATIVE_VOLUME_KEYS.get(key)
+                # Remappers can generate injected volume-key events. They are
+                # safe to handle too: this remote never synthesizes key events.
+                if command:
+                    if message in (0x101, 0x105):
+                        owned = self._keys.release(data.vkCode)
+                    else:
+                        foreground = self._user32.GetForegroundWindow()
+                        owned = self._keys.press(
+                            data.vkCode, command,
+                            lambda value: (
+                                not self._faulted and not self._stopping.is_set()
+                                and self._accept(value, foreground)
+                            ),
+                        )
+                    if owned:
+                        return 1
+            except Exception as error:
+                if not self._faulted:
+                    self._faulted = True
+                    self._notify(False, error)
+                if self._keys.pressed.get(key, False):
+                    return 1
+        try:
+            return self._user32.CallNextHookEx(self._hook, code, message, address)
+        except Exception as error:
+            if not self._faulted:
+                self._faulted = True
+                self._notify(False, error)
+            return 0  # Never let a Python exception escape a native callback.
+
+    def stop(self):
+        self._stopping.set()
+        if self._thread is not None and self._thread.is_alive() and self._thread_id and self._user32:
+            try:
+                if not self._user32.PostThreadMessageW(self._thread_id, 0x12, 0, 0):  # WM_QUIT
+                    raise ctypes.WinError()
+            except Exception as error:
+                record_exception(error, "Hotkey shutdown")
+        if self._thread is not None and self._thread.ident is not None:
+            self._thread.join(timeout=2)
+        if self._thread is not None and self._thread.is_alive():
+            # Never free a live C callback. Disable interception even if the
+            # native message thread cannot be stopped normally.
+            try:
+                if self._hook and self._user32.UnhookWindowsHookEx(self._hook):
+                    self._hook = None
+            except Exception as error:
+                record_exception(error, "Hotkey shutdown")
+            if self._hook and self not in _RETAINED_VOLUME_HOOKS:
+                _RETAINED_VOLUME_HOOKS.append(self)
+            record_exception(RuntimeError("Volume hook thread did not stop."), "Hotkey shutdown")
+
+
+
+
 def acquire_single_instance():
     global _instance_mutex_handle, _instance_mutex_api, _instance_lock_file
 
@@ -1760,6 +1974,8 @@ class CenteredComboDelegate(QStyledItemDelegate):
 
 
 class SonyRemote(QMainWindow):
+    _native_volume_ready = Signal()
+
     # ----------------------------
     # Initialization
     # ----------------------------
@@ -1971,6 +2187,7 @@ class SonyRemote(QMainWindow):
     def _refresh_playback_routing(self):
         if self._smtc is not None:
             self._smtc.update(self._smtc_commands())
+        self._publish_native_volume_state()
 
     def _smtc_background_polling(self):
         return self._playback_key_mode() == "smtc" and self._smtc is not None
@@ -1984,7 +2201,16 @@ class SonyRemote(QMainWindow):
         self._popup_shortcut_keys = set()
         self._shortcut_presses = {}
         self._shortcut_refresh_pending = False
+        self._native_volume_hook = None
+        self._native_volume_lock = threading.Lock()
+        self._native_volume_state = (0, True, 0)
+        self._native_volume_queue = deque()
+        self._native_volume_drain_pending = False
+        self._native_volume_ready.connect(self._drain_native_volume, Qt.QueuedConnection)
         QApplication.instance().installEventFilter(self)
+        self._publish_native_volume_state()
+        if sys.platform == "win32":
+            self._install_windows_volume_hook()
 
     # ----------------------------
     # UI construction and styling
@@ -3100,6 +3326,62 @@ class SonyRemote(QMainWindow):
         self.send_ircc(command)
         return True
 
+    def _install_windows_volume_hook(self):
+        if self._native_volume_hook is not None:
+            return
+        self._native_volume_hook = _WindowsVolumeHook(self._accept_native_volume, self)
+        self._native_volume_hook.changed.connect(self._volume_hook_changed)
+        try:
+            self._native_volume_hook.start()
+        except Exception as error:
+            QTimer.singleShot(0, lambda error=error: self._volume_hook_changed(False, error))
+
+    def _volume_hook_changed(self, installed, error):
+        if error is not None and not self._shutting_down:
+            record_exception(error, "Windows volume hook")
+            self.show_error("Windows volume-key interception is unavailable. Use the remote's volume buttons.")
+
+    def _publish_native_volume_state(self):
+        if not hasattr(self, "_native_volume_lock"):
+            return
+        window = int(self.winId()) if self.isVisible() and not self.isMinimized() else 0
+        blocked = (self._shutting_down or self._calibration_blocked()
+                   or QApplication.activeModalWidget() is not None
+                   or QApplication.activePopupWidget() is not None)
+        owner_deadline = self.amplifier_client.state_deadline if self._amplifier_owns_hotkeys() else 0
+        with self._native_volume_lock:
+            self._native_volume_state = (window, blocked, owner_deadline)
+            if blocked or not window:
+                self._native_volume_queue.clear()
+
+    def _accept_native_volume(self, command, foreground):
+        # Native-thread callback: plain state and queued signal only; no widget/device/IPC calls.
+        with self._native_volume_lock:
+            window, blocked, owner_deadline = self._native_volume_state
+            if (command not in ("volume_up", "volume_down", "mute") or blocked
+                    or not window or foreground != window or time.monotonic() < owner_deadline):
+                return False
+            if len(self._native_volume_queue) >= 32:
+                return True  # Drop an excess step, never leak an owned key to Windows.
+            self._native_volume_queue.append(command)
+            if not self._native_volume_drain_pending:
+                self._native_volume_drain_pending = True
+                self._native_volume_ready.emit()
+            return True
+
+    def _drain_native_volume(self):
+        with self._native_volume_lock:
+            commands = list(self._native_volume_queue)
+            self._native_volume_queue.clear()
+            self._native_volume_drain_pending = False
+        if (self._shutting_down or self._calibration_blocked() or not self.isActiveWindow()
+                or QApplication.activeModalWidget() is not None
+                or QApplication.activePopupWidget() is not None):
+            return
+        for command in commands:
+            # Ownership was decided when this physical event was intercepted.
+            self._run_focused_shortcut(command)
+
     def _refresh_shortcut_context(self):
         self._shortcut_refresh_pending = False
         self._refresh_playback_routing()
@@ -3386,6 +3668,8 @@ class SonyRemote(QMainWindow):
         app = QApplication.instance()
         if app is not None:
             app.removeEventFilter(self)
+        if self._native_volume_hook is not None:
+            self._native_volume_hook.stop()
         if self.tray:
             self.tray.hide()
         release_single_instance()
@@ -3434,43 +3718,6 @@ class SonyRemote(QMainWindow):
             self.text_input.clearFocus()
         super().mousePressEvent(event)
 
-    def _handle_windows_media_command(self, lparam):
-        # WM_APPCOMMAND can otherwise reach DefWindowProc and change Windows
-        # volume even after Qt's associated key event was accepted.
-        device = (lparam >> 16) & 0xF000
-        if device == 0x8000:  # Mouse commands are not keyboard media keys.
-            return False
-        key = {
-            8: Qt.Key_VolumeMute, 9: Qt.Key_VolumeDown, 10: Qt.Key_VolumeUp,
-            11: Qt.Key_MediaNext, 12: Qt.Key_MediaPrevious, 13: Qt.Key_MediaStop,
-            14: Qt.Key_MediaTogglePlayPause, 46: Qt.Key_MediaPlay, 47: Qt.Key_MediaPause,
-        }.get((lparam >> 16) & 0x0FFF)
-        modifiers = QApplication.keyboardModifiers()
-        if lparam & 0x0008:
-            modifiers |= Qt.ControlModifier
-        if (key is None or modifiers & (Qt.ControlModifier | Qt.AltModifier | Qt.MetaModifier)
-                or not hasattr(self, "_shortcut_presses")):
-            return False
-        command = self._qt_shortcut_command(QKeyEvent(QEvent.KeyPress, key, modifiers))
-        owner = self._shortcut_presses.get(key, command)
-        if owner != command or not self._focused_shortcut_allowed(command):
-            return False
-        if device != 0:
-            # OEM/device-only app commands have no VK key pair. Feed one pair
-            # through the existing Qt filter, just as Qt's Windows backend does.
-            QApplication.sendEvent(self, QKeyEvent(QEvent.KeyPress, key, modifiers))
-            QApplication.sendEvent(self, QKeyEvent(QEvent.KeyRelease, key, modifiers))
-        # Keyboard-origin commands already have their own VK press/release;
-        # suppress only the accompanying Windows action, without dispatching twice.
-        return True
-
-    def nativeEvent(self, event_type, message):
-        if sys.platform == "win32" and bytes(event_type) == b"windows_generic_MSG":
-            msg = ctypes.cast(int(message), ctypes.POINTER(_WindowsMessageHeader)).contents
-            if msg.message == 0x0319 and self._handle_windows_media_command(msg.lParam):
-                return True, 1  # TRUE is WM_APPCOMMAND's handled result.
-        return super().nativeEvent(event_type, message)
-
     def eventFilter(self, watched, event):
         event_type = event.type()
         if hasattr(self, "_shortcut_presses") and event_type in (
@@ -3488,6 +3735,10 @@ class SonyRemote(QMainWindow):
             return super().eventFilter(watched, event)
 
         key = event.key()
+        if sys.platform == "win32" and key in (Qt.Key_VolumeUp, Qt.Key_VolumeDown, Qt.Key_VolumeMute):
+            # Only the native hook handles focused Windows volume keys. Do not
+            # dispatch again through Qt, even if the hook could not be installed.
+            return super().eventFilter(watched, event)
         if event_type == QEvent.KeyRelease:
             if event.isAutoRepeat():
                 owned = self._shortcut_presses.get(key)

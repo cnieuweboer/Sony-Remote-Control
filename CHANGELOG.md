@@ -4,6 +4,8 @@ Release identifiers below come from the corresponding commits. Some releases upd
 
 ## 2026-10-21
 
+- Sony Remote 2026.10.21.6 — Restore the proven Windows low-level path for focused Volume Up/Down/Mute only; keep Qt navigation/playback and non-Windows volume handling. Remove the ineffective media-command bridge and exclude Windows volume from Qt dispatch. Preserve amplifier ownership, press/release suppression, mute repeat protection, lifecycle recovery, and silent overflow drops; restore native lifecycle coverage and add focused volume regression tests.
+
 - Sony Remote 2026.10.21.5 — Replace the ineffective media-key registrations with a focused Qt nativeEvent handler for WM_APPCOMMAND. Consume Windows media commands Sony owns without redispatching their keyboard events; normalize device-only commands into the existing Qt key filter. Preserve amplifier/SMTC ownership and popup/modal/calibration/focus guards, without a global hook.
 
 - Sony Remote 2026.10.21.4 — Register currently owned Windows media keys with Qt so its WM_APPCOMMAND handling does not also forward them to Windows. Registrations are window-scoped and have no activation handlers; the application event filter remains the only command dispatcher. Release registrations for amplifier global ownership, SMTC playback, popups, calibration, modal dialogs, and inactive windows.

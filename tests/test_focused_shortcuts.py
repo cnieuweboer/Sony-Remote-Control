@@ -1,6 +1,5 @@
 """Application-filter shortcuts with real Qt widget, popup and repeat delivery."""
 import os
-import ctypes
 os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
 from types import SimpleNamespace
 import unittest
@@ -42,79 +41,6 @@ class FocusedShortcutTests(unittest.TestCase):
     def release(self, key):
         return self.event(key, kind=QEvent.KeyRelease)
 
-    def native_media_message(self, number, device=0, flags=0):
-        message = fixture.REMOTE['_WindowsMessageHeader'](
-            int(self.window.winId()), 0x0319, 0, ((device | number) << 16) | flags)
-        with patch.dict(fixture.GLOBALS, sys=SimpleNamespace(platform='win32')):
-            return self.window.nativeEvent(b'windows_generic_MSG', ctypes.addressof(message))
-
-    def test_windows_appcommands_are_handled_without_duplicate_key_dispatch(self):
-        for _ in range(100):
-            self.assertTrue(self.event(Qt.Key_VolumeUp))
-            self.assertEqual(self.native_media_message(10), (True, 1))
-            self.assertTrue(self.release(Qt.Key_VolumeUp))
-        self.assertEqual(self.window.adjust_volume.call_count, 100)
-        self.assertTrue(self.event(Qt.Key_VolumeMute))
-        self.assertEqual(self.native_media_message(8), (True, 1))
-        self.release(Qt.Key_VolumeMute)
-        self.window.toggle_mute.assert_called_once()
-        # A keyboard-origin appcommand alone is suppression, never dispatch.
-        self.assertEqual(self.native_media_message(9), (True, 1))
-        self.assertEqual(self.window.adjust_volume.call_count, 100)
-
-    def test_device_only_appcommands_feed_the_single_qt_dispatch_path(self):
-        for number, command in ((11, 'Next'), (12, 'Prev'), (13, 'Stop'),
-                                (14, 'PlayPause'), (46, 'Play'), (47, 'Pause')):
-            self.assertEqual(self.native_media_message(number, 0x1000), (True, 1))
-            self.window.send_ircc.assert_called_with(command)
-        self.assertEqual(self.window.send_ircc.call_count, 6)
-        self.assertEqual(self.native_media_message(10, 0x1000), (True, 1))
-        self.window.adjust_volume.assert_called_once_with(1)
-        self.assertEqual(self.native_media_message(8, 0x1000), (True, 1))
-        self.window.toggle_mute.assert_called_once()
-        self.assertEqual(self.window._shortcut_presses, {})
-
-    def test_native_media_bridge_yields_amplifier_smtc_and_modified_or_mouse_commands(self):
-        with patch.object(self.window, '_amplifier_owns_hotkeys', return_value=True):
-            for number in (8, 9, 10):
-                self.assertFalse(self.window._handle_windows_media_command(number << 16))
-            self.assertFalse(self.event(Qt.Key_VolumeUp))
-        # A held key initially owned elsewhere must remain unclaimed.
-        self.assertFalse(self.window._handle_windows_media_command(10 << 16))
-        self.release(Qt.Key_VolumeUp)
-        self.assertTrue(self.window._handle_windows_media_command(10 << 16))
-        self.window.config['SMTCPlaybackKeys'] = True
-        for number in (11, 12, 13, 14, 46, 47):
-            self.assertFalse(self.window._handle_windows_media_command(number << 16))
-        self.assertFalse(self.window._handle_windows_media_command((10 | 0x8000) << 16))
-        self.assertFalse(self.window._handle_windows_media_command((10 << 16) | 0x0008))
-        self.assertFalse(self.window._handle_windows_media_command(99 << 16))
-        self.window.adjust_volume.assert_not_called()
-        self.window.send_ircc.assert_not_called()
-
-    def test_native_media_bridge_respects_popup_modal_calibration_and_focus(self):
-        for amplifier in (False, True):
-            self.window.calibration_active = not amplifier
-            self.window.amplifier_state = {'calibration_active': amplifier}
-            self.assertFalse(self.window._handle_windows_media_command(10 << 16))
-        self.window.calibration_active = False
-        self.window.amplifier_state = None
-        self.window.input_combo.showPopup()
-        self.assertFalse(self.window._handle_windows_media_command(10 << 16))
-        self.window.input_combo.hidePopup()
-        self.window.activateWindow()
-        self.app.processEvents()
-        dialog = QDialog(self.window)
-        dialog.setModal(True)
-        dialog.show()
-        self.app.processEvents()
-        self.assertFalse(self.window._handle_windows_media_command(10 << 16))
-        dialog.close()
-        dialog.deleteLater()
-        self.window.hide()
-        self.app.processEvents()
-        self.assertFalse(self.window._handle_windows_media_command(10 << 16))
-
     def test_windows_and_other_platforms_share_the_qt_path(self):
         for platform in ('win32', 'linux', 'darwin'):
             with self.subTest(platform=platform), patch.dict(
@@ -122,7 +48,8 @@ class FocusedShortcutTests(unittest.TestCase):
                 QTest.keyClick(self.window.power_button, Qt.Key_Up)
         self.assertEqual(self.window.send_ircc.call_count, 3)
         self.window.send_ircc.assert_called_with('Up')
-        self.assertNotIn('_WindowsShortcutHook', fixture.REMOTE)
+        self.assertEqual(set(fixture.REMOTE['_NATIVE_VOLUME_KEYS'].values()),
+                         {'volume_up', 'volume_down', 'mute'})
 
     def test_buttons_do_not_consume_remote_arrows_or_enter(self):
         clicked = Mock()

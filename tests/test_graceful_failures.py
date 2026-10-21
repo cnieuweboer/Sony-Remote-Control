@@ -84,7 +84,8 @@ class DiscoveryTests(unittest.TestCase):
         # Tests neither bind production IPC names nor connect to another app.
         with patch.object(REMOTE['AmplifierClient'], 'start', lambda client: None), \
              patch.object(REMOTE['SonyRemote'], '_setup_calibration', lambda window: None), \
-             patch.object(REMOTE['SonyRemote'], '_setup_activation', lambda window: None):
+             patch.object(REMOTE['SonyRemote'], '_setup_activation', lambda window: None), \
+             patch.object(REMOTE['SonyRemote'], '_install_windows_volume_hook', lambda window: None):
             self.window = REMOTE['SonyRemote'](config)
         self.window.api = self.device
         self.window.pool.setMaxThreadCount(6)

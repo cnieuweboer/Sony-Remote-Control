@@ -129,7 +129,7 @@ Regular status polling pauses while the window is hidden or minimized and refres
 
 ## Keyboard shortcuts
 
-Focused shortcuts use a Qt application event filter on all platforms, before buttons and comboboxes handle keys. Sony yields volume/mute keys whenever the amplifier remote owns global volume control; open dropdowns keep arrows and Enter, and text input keeps its editing keys.
+Navigation and focused playback shortcuts use a Qt application event filter on all platforms; Windows volume/mute use focused low-level interception to suppress Windows volume changes. Sony yields volume/mute to amplifier global ownership; open dropdowns keep arrows and Enter, and text input keeps its editing keys.
 
 Navigation and volume keys repeat when held; Mute and Play/Pause toggle once per press. Optional Windows SMTC playback routing remains separate.
 

@@ -341,6 +341,7 @@ class RoutingTests(unittest.TestCase):
         cls = window_fixture.REMOTE['SonyRemote']
         with patch.object(cls, '_setup_activation', lambda self: None), \
              patch.object(cls, '_setup_calibration', lambda self: None), \
+             patch.object(cls, '_install_windows_volume_hook', lambda self: None), \
              patch.object(window_fixture.REMOTE['AmplifierClient'], 'start', lambda self: None):
             hidden = cls(config)
         def cleanup():
