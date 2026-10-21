@@ -468,6 +468,109 @@ class DiscoveryTests(unittest.TestCase):
             finished()
         return deliver
 
+    def feed_amplifier_state(self, **changes):
+        self.window.config['AmplifierTVInput'] = 'tv'
+        state = json.loads((ROOT / 'tests/fixtures/amplifier_protocol_v1.json').read_text())['states'][0]
+        state.update(changes)
+        with patch.dict(REMOTE['AmplifierClient']._read.__globals__,
+                        _ipc_frames=lambda socket, buffer: [state]):
+            self.window.amplifier_client._read()
+        return state
+
+    def test_amplifier_routing_skips_tv_audio_but_keeps_power_and_input_reads(self):
+        self.settle_volume_controls()
+        self.feed_amplifier_state()
+        self.assertTrue(self.window._amplifier_routed)
+        power_before, inputs_before = self.device.calls['power'], self.device.calls['inputs']
+        self.device.get_volume = Mock()
+        self.window.poll_status()
+        self.wait(lambda: not self.window.poll_running and not self.window._input_status_running)
+        self.device.get_volume.assert_not_called()
+        self.assertGreater(self.device.calls['power'], power_before)
+        self.assertGreater(self.device.calls['inputs'], inputs_before)
+        self.assertEqual(self.window.volume_value.text(), '100')
+
+    def test_amplifier_disconnect_immediately_refreshes_tv_audio_before_enabling_controls(self):
+        self.settle_volume_controls()
+        self.feed_amplifier_state()
+        self.device.get_volume = Mock(return_value={'volume': 35, 'mute': True})
+        self.window.amplifier_client._expire()
+        self.assertTrue(self.window.poll_running)
+        self.assertIsNone(self.window.last_volume)
+        self.assertEqual(self.window.volume_value.text(), '—')
+        self.assertFalse(self.window.volume_up.isEnabled())
+        self.wait(lambda: not self.window.poll_running and self.device.get_volume.called)
+        self.device.get_volume.assert_called_once()
+        self.assertEqual(self.window.volume_value.text(), '35')
+        self.assertEqual(self.window.mute_button.text(), 'Unmute')
+        self.assertTrue(self.window.volume_up.isEnabled())
+        self.assertFalse(self.window._tv_volume_refresh_pending)
+
+    def test_fallback_during_an_existing_poll_refreshes_as_soon_as_it_finishes(self):
+        self.settle_volume_controls()
+        self.feed_amplifier_state()
+        deliver = self.pending_poll_result()  # Captures power only while routed.
+        self.device.get_volume = Mock(return_value={'volume': 36, 'mute': False})
+        self.feed_amplifier_state(input='hdmi2')
+        self.assertTrue(self.window._tv_volume_refresh_pending)
+        self.device.get_volume.assert_not_called()
+        deliver()
+        self.wait(lambda: self.device.get_volume.called and not self.window.poll_running)
+        self.device.get_volume.assert_called_once()
+        self.assertEqual(self.window.volume_value.text(), '36')
+
+    def test_inflight_audio_from_before_amplifier_routing_cannot_replace_routed_display(self):
+        self.settle_volume_controls()
+        observed_at = self.window._volume_observed_at
+        deliver = self.pending_poll_result()
+        self.feed_amplifier_state()
+        deliver()
+        self.assertEqual(self.window._volume_observed_at, observed_at)
+        self.assertEqual(self.window.volume_value.text(), '100')
+        self.device.get_volume = Mock(return_value={'volume': 37, 'mute': False})
+        self.window.amplifier_client._expire()
+        self.wait(lambda: self.device.get_volume.called and not self.window.poll_running)
+        self.assertEqual(self.window.volume_value.text(), '37')
+
+    def test_calibration_keeps_physical_tv_audio_polling_when_amplifier_routed(self):
+        self.settle_volume_controls()
+        self.feed_amplifier_state()
+        self.window.calibration_active = True
+        self.device.get_volume = Mock(return_value={
+            'volume': 28, 'mute': False, 'minVolume': 0, 'maxVolume': 100})
+        self.window.poll_status()
+        self.wait(lambda: not self.window.poll_running)
+        self.device.get_volume.assert_called_once()
+        self.assertEqual(self.window.last_volume['volume'], 28)
+        self.assertGreater(self.window._calibration_snapshot()['valid_for_ms'], 0)
+        self.window.calibration_active = False
+
+    def test_routing_change_during_power_read_skips_audio_request(self):
+        self.settle_volume_controls()
+        jobs = []
+        with patch.object(self.window, 'run_worker', side_effect=lambda *args: jobs.append(args)):
+            self.window.poll_status()
+        self.device.get_power = lambda: self.feed_amplifier_state() and 'active'
+        self.device.get_volume = Mock()
+        query, done, _, finished = jobs[0]
+        done(query())
+        finished()
+        self.device.get_volume.assert_not_called()
+        self.assertEqual(self.window.volume_value.text(), '100')
+
+    def test_hidden_fallback_defers_refresh_until_window_is_shown(self):
+        self.settle_volume_controls()
+        self.feed_amplifier_state()
+        self.window.hide()
+        self.device.get_volume = Mock(return_value={'volume': 38, 'mute': False})
+        self.window.amplifier_client._expire()
+        self.assertTrue(self.window._tv_volume_refresh_pending)
+        self.assertFalse(self.window.poll_running)
+        self.device.get_volume.assert_not_called()
+        self.window.show()
+        self.wait(lambda: self.device.get_volume.called and not self.window.poll_running)
+        self.assertEqual(self.window.volume_value.text(), '38')
+
     def test_unrelated_amplifier_updates_keep_pending_tv_target(self):
         self.settle_volume_controls()
         self.window._desired_volume = 40

@@ -4,6 +4,8 @@ Release identifiers below come from the corresponding commits. Some releases upd
 
 ## 2026-10-21
 
+- Sony Remote 2026.10.21.10 — Skip physical TV volume/mute reads during amplifier routing while keeping power/input polling. Immediately refresh TV audio on fallback, queue that refresh behind an existing status cycle, and discard superseded routing results. Briefly disable TV volume controls until a fresh response arrives. Calibration still reads physical TV audio.
+
 - Sony Remote 2026.10.21.9 — Let the active volume rate limiter own volume/mute reads while ordinary polling continues power/input updates. Reuse limiter feedback without replacing the pending target, discard superseded audio results, and resume ordinary audio polling after completion/cancellation/failure. Track power and volume observation times separately for truthful calibration freshness.
 
 - Sony Remote 2026.10.21.8 — Keep volume/mute buttons disabled unless the TV is active, even when amplifier routing is available. Show the volume placeholder and “Mute” while the TV is in standby/offline, including after amplifier IPC updates; restore the routed display when the TV wakes.

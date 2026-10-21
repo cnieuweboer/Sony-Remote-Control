@@ -498,7 +498,7 @@ class CalibrationServer(QObject):
 APP_NAME = "Sony Remote"
 
 
-__version__ = "2026.10.21.9"
+__version__ = "2026.10.21.10"
 
 
 CONFIG_PATH = Path(__file__).resolve().with_name("SonyRemote.json")
@@ -2016,6 +2016,7 @@ class SonyRemote(QMainWindow):
         self._workers = set()
         self._command_workers = set()
         self.poll_running = False
+        self._tv_volume_refresh_pending = False
         self._input_status_running = False
         self.initialized = False
         self._discovery_ready = set()
@@ -2781,7 +2782,9 @@ class SonyRemote(QMainWindow):
         self.poll_running = True
         volume_request = (self._volume_generation, self._desired_volume)
         volume_busy = bool(self._volume_rate_loop_running or self._pending_volume_commands)
-        read_volume = not (self._volume_rate_loop_running or self._volume_rate_step_running)
+        read_volume = (not (self._volume_rate_loop_running or self._volume_rate_step_running)
+                       and (self.calibration_active or not self._amplifier_routed))
+        self._tv_volume_refresh_pending = False
 
         def query():
             power = self.api.get_power()
@@ -2790,6 +2793,7 @@ class SonyRemote(QMainWindow):
             # while it was in flight. Never delay the limiter behind this poll.
             if (power == "active" and read_volume
                     and not (self._volume_rate_loop_running or self._volume_rate_step_running)
+                    and (self.calibration_active or not self._amplifier_routed)
                     and (self.config["VolumeControls"] or self.calibration_active)):
                 data["volume"] = self.api.get_volume()
                 data["volume_observed_at"] = time.monotonic()
@@ -2818,11 +2822,13 @@ class SonyRemote(QMainWindow):
                 self.volume_rate_timer.stop()
             elif (volume_request == (self._volume_generation, self._desired_volume)
                     and not (self._volume_rate_loop_running or self._volume_rate_step_running)
+                    and (self.calibration_active or not self._amplifier_routed)
                     and self._accept_volume_status(data.get("volume"), data.get("volume_observed_at", 0))):
                 if not (volume_busy or self._pending_volume_commands):
                     self._desired_volume = None
-                if self.config["VolumeControls"]:
-                    self.update_volume_ui(self.last_volume)
+                self._update_volume_controls()
+            if self.config["VolumeControls"]:
+                self.update_volume_ui(self.last_volume or {})
             if self.calibration_server is not None:
                 self.calibration_server.publish()
             if is_active and self.config["InputControls"]:
@@ -2831,7 +2837,14 @@ class SonyRemote(QMainWindow):
         def failed(error):
             self.handle_request_error(error, background=True)
 
-        self.run_worker(query, done, failed, lambda: setattr(self, "poll_running", False))
+        self.run_worker(query, done, failed, self._status_poll_finished)
+
+    def _status_poll_finished(self):
+        self.poll_running = False
+        if self._tv_volume_refresh_pending and not self._shutting_down:
+            # A routing fallback during an in-flight poll must get its own
+            # fresh audio read as soon as that poll finishes, not two seconds later.
+            QTimer.singleShot(0, lambda: self.poll_status() if self._tv_volume_refresh_pending else None)
 
     def _poll_input_status(self):
         if (self._shutting_down or self.calibration_active or self._input_status_running
@@ -3091,19 +3104,32 @@ class SonyRemote(QMainWindow):
                 and state["valid_for_ms"] > 0 and self.amplifier_client.state_is_fresh):
             self._clear_amplifier_error()
         routed = self._use_amplifier()
+        falling_back = self._amplifier_routed and not routed
         if routed != self._amplifier_routed:
+            self._volume_generation += 1
             self._desired_volume = None
             self._volume_rate_loop_running = False
             self.volume_rate_timer.stop()
+            self._tv_volume_refresh_pending = False
         self._amplifier_routed = routed
+        if falling_back and not self.calibration_active:
+            # The physical TV may have changed while we displayed amplifier
+            # values. Do not act on its old cached volume before the refresh.
+            self.last_volume = None
+            self._volume_observed_at = 0
+            self._tv_volume_refresh_pending = bool(
+                not self._shutting_down and self.config["VolumeControls"] and self.last_power == "active")
         self._refresh_playback_routing()
         self._update_volume_controls()
         if self.config["VolumeControls"]:
             self.update_volume_ui(self.last_volume or {})
+        if self._tv_volume_refresh_pending:
+            self.poll_status()
 
     def _update_volume_controls(self):
         if self.config["VolumeControls"]:
-            enabled = not self._shutting_down and self.initialized and self.last_power == "active"
+            enabled = (not self._shutting_down and self.initialized and self.last_power == "active"
+                       and (self._use_amplifier() or bool(self.last_volume)))
             for widget in (self.volume_up, self.volume_down, self.mute_button):
                 widget.setEnabled(enabled)
             if self.last_power != "active":
@@ -3650,6 +3676,7 @@ class SonyRemote(QMainWindow):
 
     def _pause_background_work(self):
         self._shutting_down = True
+        self._tv_volume_refresh_pending = False
         self._shortcut_presses.clear()
         self._popup_shortcut_keys.clear()
         if self._smtc is not None:

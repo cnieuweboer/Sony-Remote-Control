@@ -333,3 +333,12 @@ Normal poll callbacks always process their power result. Audio is accepted only 
 `_status_observed_at` records the actual power-response time and `_volume_observed_at` the actual audio-response time, captured before any subsequent command. An active-TV calibration snapshot uses the older observation for its combined freshness. Limiter reads cannot refresh old power facts, nor can power-only polls refresh old audio facts. The mapping, IPC schema, limiter interval and relative-command behavior remain unchanged.
 
 Tests cover audio-read counts during ownership, continued power/input polling, limiter startup during a power read, no waiting behind an existing poll, target/mute presentation, stale callback delivery, cancellation/failure/resumption, and combined freshness.
+
+
+## TV audio reads during amplifier routing
+
+Ordinary status cycles omit `getVolumeInformation` while amplifier routing is active. Power/input polling continues, and calibration explicitly bypasses this optimization to capture and verify physical TV volume/mute. Routing is rechecked after the power request; generation changes prevent a response from before a routing transition from overwriting current presentation. Power-only cycles still repaint the amplifier display when the TV wakes.
+
+On amplifier disconnect, expired state, standby, input change, or a mapping change that ends routing, the remote invalidates cached physical TV audio and requests an immediate normal status refresh for an active TV. If a status poll is already running, a pending flag schedules the refresh at its completion without waiting for the periodic timer. Hidden windows retain the flag until normal visibility/SMTC polling permits a refresh. No new polling timer is added.
+
+The volume placeholder and disabled controls remain until a fresh TV audio response is accepted, preventing commands based on stale cached volume; mute also returns to its ordinary TV value. Routing back to the amplifier or lifecycle pause clears the pending request. A failed refresh follows existing offline/error handling and normal retries. Tests cover read counts, disconnect/input-change fallback, an existing in-flight poll, routing changes during power/audio reads, hidden fallback, calibration, and TV wake display.
