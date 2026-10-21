@@ -238,6 +238,49 @@ class DiscoveryTests(unittest.TestCase):
         self.assertFalse(self.window.app_combo.isEnabled())
         self.window.show_error.assert_not_called()
 
+    def test_tv_standby_hides_amplifier_volume_and_mute_until_tv_wakes(self):
+        self.start_and_settle()
+        state = json.loads((ROOT / 'tests/fixtures/amplifier_protocol_v1.json').read_text())['states'][0]
+        state.update(online=True, power='on', input='tv', raw_volume=52, mute=True,
+                     volume_display=52, volume_unit='raw')
+        with patch.object(self.window, '_use_amplifier', return_value=True), \
+                patch.object(self.window, '_matched_volume_mapping', return_value=None):
+            self.window._amplifier_state_changed(state)
+            self.assertEqual(self.window.volume_value.text(), '52')
+            self.assertEqual(self.window.mute_button.text(), 'Unmute')
+            self.assertTrue(self.window.volume_up.isEnabled())
+            self.device.power = 'standby'
+            self.window.poll_status()
+            self.wait(lambda: self.window.last_power == 'standby' and not self.window.poll_running)
+            for widget in (self.window.volume_up, self.window.volume_down, self.window.mute_button):
+                self.assertFalse(widget.isEnabled())
+            self.assertEqual(self.window.volume_value.text(), '—')
+            self.assertEqual(self.window.mute_button.text(), 'Mute')
+            # Repeated amp IPC updates must not reveal the cached active volume/mute.
+            self.window._amplifier_state_changed(dict(state, raw_volume=53, volume_display=53))
+            self.assertEqual(self.window.volume_value.text(), '—')
+            self.assertEqual(self.window.mute_button.text(), 'Mute')
+            self.assertFalse(self.window.mute_button.isEnabled())
+            self.device.power = 'active'
+            self.window.poll_status()
+            self.wait(lambda: self.window.last_power == 'active' and not self.window.poll_running)
+            self.assertTrue(self.window.volume_up.isEnabled())
+            self.assertTrue(self.window.mute_button.isEnabled())
+            self.assertEqual(self.window.volume_value.text(), '53')
+            self.assertEqual(self.window.mute_button.text(), 'Unmute')
+
+    def test_offline_tv_keeps_amplifier_controls_disabled_and_display_empty(self):
+        self.start_and_settle()
+        self.window.last_volume = {'volume': 20, 'mute': True}
+        with patch.object(self.window, '_use_amplifier', return_value=True):
+            self.window.set_offline()
+            self.window.update_volume_ui({'volume': 60, 'mute': True})
+            self.assertEqual(self.window.volume_value.text(), '—')
+            self.assertEqual(self.window.mute_button.text(), 'Mute')
+            self.assertFalse(self.window.volume_up.isEnabled())
+            self.assertFalse(self.window.volume_down.isEnabled())
+            self.assertFalse(self.window.mute_button.isEnabled())
+
     def test_calibrated_volume_shows_bucket_decimals_and_integer_first_step(self):
         self.start_and_settle()
         document = {"format_version": 2, "tv_device_id": "tv-id", "amplifier_device_id": "amp-id",

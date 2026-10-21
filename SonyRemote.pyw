@@ -498,7 +498,7 @@ class CalibrationServer(QObject):
 APP_NAME = "Sony Remote"
 
 
-__version__ = "2026.10.21.7"
+__version__ = "2026.10.21.8"
 
 
 CONFIG_PATH = Path(__file__).resolve().with_name("SonyRemote.json")
@@ -2954,6 +2954,11 @@ class SonyRemote(QMainWindow):
             self.power_button.setText("Power On")
 
     def update_volume_ui(self, volume):
+        if self.last_power != "active":
+            self.volume_value.setText("—")
+            self.volume_value.setToolTip("TV volume")
+            self.mute_button.setText("Mute")
+            return
         prefix = ""
         if self._use_amplifier():
             raw = self.amplifier_state["raw_volume"]
@@ -3079,9 +3084,11 @@ class SonyRemote(QMainWindow):
 
     def _update_volume_controls(self):
         if self.config["VolumeControls"]:
-            enabled = not self._shutting_down and (self._use_amplifier() or (self.initialized and self.last_power == "active"))
+            enabled = not self._shutting_down and self.initialized and self.last_power == "active"
             for widget in (self.volume_up, self.volume_down, self.mute_button):
                 widget.setEnabled(enabled)
+            if self.last_power != "active":
+                self.update_volume_ui({})
 
     def _amplifier_acknowledged(self):
         if self._amplifier_error_category == "protocol_ack":
