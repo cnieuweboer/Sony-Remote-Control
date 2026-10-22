@@ -580,7 +580,7 @@ class CalibrationServer(QObject):
 APP_NAME = "Sony Remote"
 
 
-__version__ = "2026.10.22.1"
+__version__ = "2026.10.22.2"
 
 
 CONFIG_PATH = Path(__file__).resolve().with_name("SonyRemote.json")
@@ -958,12 +958,11 @@ def _ordered_entries(entries, sort_by_name):
 def _validate_shortcuts(raw):
     if not isinstance(raw, dict):
         raise ConfigError('"Shortcuts" must be an object.')
-    unknown = set(raw) - set(DEFAULT_SHORTCUTS)
-    if unknown:
-        raise ConfigError('Unknown shortcut action(s): ' + ', '.join(sorted(unknown)) + '.')
+    if any(not isinstance(action, str) or not action or action != action.strip() for action in raw):
+        raise ConfigError("Shortcut action names must be non-empty strings without surrounding whitespace.")
     normalized, owners = {}, {}
-    for action, defaults in DEFAULT_SHORTCUTS.items():
-        bindings = raw.get(action, defaults)
+    for action in dict.fromkeys((*DEFAULT_SHORTCUTS, *raw)):
+        bindings = raw.get(action, DEFAULT_SHORTCUTS.get(action, []))
         if bindings == "":
             bindings = []
         if not isinstance(bindings, list):
@@ -988,7 +987,7 @@ def _validate_shortcuts(raw):
 
 def _compile_shortcuts(config):
     return {QKeySequence.fromString(text, QKeySequence.PortableText)[0].toCombined():
-            SHORTCUT_ACTIONS[action]
+            SHORTCUT_ACTIONS.get(action, "ircc:" + action)
             for action, bindings in config["Shortcuts"].items() for text in bindings}
 
 
@@ -4263,6 +4262,7 @@ class SonyRemote(QMainWindow):
         self.power_button.setFocus(Qt.OtherFocusReason)
 
     def _dispatch_shortcut(self, command, *, custom=False):
+        command = command.removeprefix("ircc:")
         if not custom and command in _PLAYBACK_KEY_COMMANDS and self._playback_key_mode() != "focused":
             return False
         if "remote_codes" not in self._discovery_ready:
@@ -4306,6 +4306,8 @@ class SonyRemote(QMainWindow):
         bound_actions = {
             command for code, command in self._shortcut_bindings.items()
             if (code & 0x01FFFFFF) in _NATIVE_QT_VOLUME_KEYS.values()
+            and (not command.startswith("ircc:") or ("remote_codes" in self._discovery_ready
+                 and command[5:] in self.api.remote_codes))
             and (command != "focus_text_input" or self._focused_shortcut_allowed(command, custom=True))
             and (command in ("volume_up", "volume_down", "mute")
                  or not (hasattr(self, "text_input") and self.text_input.hasFocus()))}
@@ -4377,7 +4379,7 @@ class SonyRemote(QMainWindow):
             return False
         return (not (not custom and command in _PLAYBACK_KEY_COMMANDS and self._playback_key_mode() != "focused")
                 and "remote_codes" in self._discovery_ready
-                and self.api.resolve_remote_command(command) in self.api.remote_codes)
+                and self.api.resolve_remote_command(command.removeprefix("ircc:")) in self.api.remote_codes)
 
     def _run_focused_shortcut(self, command, *, custom=False):
         if command == "focus_text_input":
@@ -4557,7 +4559,12 @@ class SonyRemote(QMainWindow):
             "calibration_matches": self._matched_volume_mapping() is not None}
         with self._native_volume_lock:
             native_queued = len(self._native_volume_queue)
-        report["hotkeys"] = {"focused_configured": copy.deepcopy(self.config["Shortcuts"]),
+        extra_commands = [action for action, keys in self.config["Shortcuts"].items()
+                          if action not in DEFAULT_SHORTCUTS and keys]
+        report["hotkeys"] = {"tv_commands_discovered": "remote_codes" in self._discovery_ready,
+            "unavailable_tv_commands": ([action for action in extra_commands if action not in self.api.remote_codes]
+                                        if "remote_codes" in self._discovery_ready else None),
+            "focused_configured": copy.deepcopy(self.config["Shortcuts"]),
             "native_hook_installed": bool(self._native_volume_hook and self._native_volume_hook.installed),
             "native_queued": native_queued, "amplifier_global_owner": self._amplifier_owns_hotkeys(),
             "focused_tv_override_bindings": list(self._focused_tv_override_bindings()),

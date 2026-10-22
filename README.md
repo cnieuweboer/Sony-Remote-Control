@@ -128,6 +128,8 @@ Failed discovery disables only its associated controls and retries automatically
 
 Edit `Shortcuts` to replace focused keyboard bindings; each action accepts a list such as `["Ctrl+Alt+Up", "F8"]`. Missing actions are added with defaults on startup, while `[]` or `""` disables that action's focused shortcut; button tooltips show the configured bindings.
 
+Additional TV commands can be added by their exact advertised name, for example `"Guide": ["F1"]`. Find available names in `--dump-state-full` under `polling_responses` → `system/getRemoteControllerInfo`; commands not advertised by the TV stay inactive and are listed in dump diagnostics.
+
 Names use [Qt portable shortcut notation](https://doc.qt.io/qt-6/qkeysequence.html#detailed-description). See the example JSON for all actions and [key-name examples and behavior](IMPLEMENTATION.md#configurable-focused-shortcuts) for media/numpad keys.
 
 ## Direct amplifier volume

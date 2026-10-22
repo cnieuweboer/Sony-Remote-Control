@@ -46,8 +46,10 @@ class ShortcutConfigurationTests(unittest.TestCase):
         for value in (None, False, 12, 'A', [''], ['NoSuchKey'], ['Ctrl+'], ['Ctrl+K, Ctrl+C']):
             with self.subTest(value=value), self.assertRaises(REMOTE['ConfigError']):
                 self.validate({'Mute': value})
-        with self.assertRaisesRegex(REMOTE['ConfigError'], 'Unknown shortcut'):
-            self.validate({'MadeUp': []})
+        self.assertEqual(self.validate({'MadeUp': []})['Shortcuts']['MadeUp'], [])
+        for name in ('', ' Guide', 'Guide '):
+            with self.assertRaises(REMOTE['ConfigError']):
+                self.validate({name: ['F1']})
 
     def test_conflicts_include_defaults_and_equivalent_spellings(self):
         for values in ({'Mute': ['Volume Up']}, {'Mute': ['Ctrl+A', 'ctrl+a']}):
@@ -138,6 +140,36 @@ class FocusedBindingTests(unittest.TestCase):
 
     def release(self, key, modifiers=Qt.NoModifier):
         return self.key(key, modifiers, kind=QEvent.KeyRelease)
+
+    def test_additional_tv_commands_dispatch_and_unavailable_remain_inactive(self):
+        self.window.api.remote_codes['Guide'] = 'test-guide'
+        self.configure(Guide=['F1'], NotAdvertised=['F2'], volume_up=['F3'])
+        self.assertTrue(self.key(Qt.Key_F1))
+        self.release(Qt.Key_F1)
+        self.window.send_ircc.assert_called_with('Guide')
+        self.assertFalse(self.key(Qt.Key_F2))
+        self.assertFalse(self.key(Qt.Key_F3))
+        self.release(Qt.Key_F3)
+        self.window.api.polling_responses = self.g['PollingResponses'](())
+        report = self.window._cached_state()
+        self.assertIn('NotAdvertised', report['hotkeys']['unavailable_tv_commands'])
+        self.assertNotIn('Guide', report['hotkeys']['unavailable_tv_commands'])
+        self.window.api.remote_codes['volume_up'] = 'test-raw-command'
+        self.window.adjust_volume.reset_mock()
+        self.assertTrue(self.key(Qt.Key_F3))
+        self.release(Qt.Key_F3)
+        self.window.send_ircc.assert_called_with('volume_up')
+        self.window.adjust_volume.assert_not_called()
+        del self.window.api.remote_codes['Guide']
+        self.assertFalse(self.key(Qt.Key_F1))
+
+    def test_unavailable_extra_command_does_not_own_native_volume_key(self):
+        self.configure(VolumeUp=[], NotAdvertised=['Volume Up'])
+        self.window._publish_native_volume_state()
+        self.assertNotIn('ircc:NotAdvertised', self.window._native_bound_actions)
+        self.window.api.remote_codes['NotAdvertised'] = 'test-command'
+        self.window._publish_native_volume_state()
+        self.assertIn('ircc:NotAdvertised', self.window._native_bound_actions)
 
     def test_custom_modified_volume_and_original_key_disabled(self):
         self.configure(VolumeUp=['Ctrl+Alt+Up'])

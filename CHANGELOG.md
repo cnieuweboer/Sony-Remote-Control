@@ -4,6 +4,8 @@ Release identifiers below come from the corresponding commits. Some releases upd
 
 ## 2026-10-22
 
+- Sony Remote 2026.10.22.2 — Allow additional TV-advertised command names in Shortcuts, preserving built-in routing actions, configuration validation and focus/ownership guards. Keep unavailable commands inactive and report them in dump diagnostics; document full-dump command discovery.
+
 - Sony Remote 2026.10.22.1 — Include session-only polling success, empty-inventory, failure-category and recovery counters in both dump formats, plus grouped request totals. Preserve polling, exceptions, removal and recovery behavior.
 
 ## 2026-10-21
