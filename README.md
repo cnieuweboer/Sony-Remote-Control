@@ -130,15 +130,9 @@ Edit `Shortcuts` to replace focused keyboard bindings; each action accepts a lis
 
 Names use [Qt portable shortcut notation](https://doc.qt.io/qt-6/qkeysequence.html#detailed-description). See the example JSON for all actions and [key-name examples and behavior](IMPLEMENTATION.md#configurable-focused-shortcuts) for media/numpad keys.
 
-Focused shortcuts use a Qt application event filter on all platforms; physical Windows volume keys use native interception to suppress Windows volume changes. Sony yields volume/mute to amplifier global ownership; open dropdowns keep arrows and Enter, and text input keeps its editing keys.
-
-Navigation and volume keys repeat when held; Mute and Play/Pause toggle once per press. Optional Windows SMTC playback routing remains separate; custom focused playback combinations still work alongside it.
-
-Hold **Volume +** or **Volume −** to repeat after half a second. With TV volume rate limiting enabled, the number shows your requested target until the TV catches up.
-
 ## Direct amplifier volume
 
-With both remotes running, Sony can send volume/mute commands directly to the amplifier, bypassing the slower TV/CEC path. It falls back to TV control when the amplifier is unavailable, in standby, or using another input.
+With both remotes running, the Sony remote can send volume/mute commands directly to the amplifier, bypassing the slower TV/CEC path. It falls back to TV control when the amplifier is unavailable, in standby, or using another input.
 
 A matching calibration automatically identifies the amplifier's TV input and displays TV-scale volume numbers. Without calibration, set `AmplifierTVInput` to the amplifier's input ID (such as `tv` or `hdmi1`); the displayed volume then follows Yamaha Remote’s raw/dB display setting. Update both remotes together.
 
