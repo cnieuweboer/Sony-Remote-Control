@@ -130,7 +130,7 @@ Edit `Shortcuts` to replace focused keyboard bindings; each action accepts a lis
 
 Additional TV commands can be added by their exact advertised name, for example `"Guide": ["F1"]`. Find available names in `--dump-state-full` under `polling_responses` → `system/getRemoteControllerInfo`; commands not advertised by the TV stay inactive and are listed in dump diagnostics.
 
-Names use [Qt portable shortcut notation](https://doc.qt.io/qt-6/qkeysequence.html#detailed-description). See the example JSON for all actions and [key-name examples and behavior](IMPLEMENTATION.md#configurable-focused-shortcuts) for media/numpad keys.
+For a complete reference of supported key names and shortcut syntax, see [KEYBOARD_SHORTCUTS](KEYBOARD_SHORTCUTS.md).
 
 ## Direct amplifier volume
 
