@@ -580,7 +580,7 @@ class CalibrationServer(QObject):
 APP_NAME = "Sony Remote"
 
 
-__version__ = "2026.10.21.24"
+__version__ = "2026.10.22.1"
 
 
 CONFIG_PATH = Path(__file__).resolve().with_name("SonyRemote.json")
@@ -1726,6 +1726,7 @@ class SonyApi:
             raise SonyConnectionError("Unable to reach the Sony TV.") from ex
 
     def rpc(self, service, method, params=None, version="1.0"):
+        request_type = f"{service}/{method}"
         payload = {
             "method": method,
             "params": [] if params is None else params,
@@ -1743,15 +1744,25 @@ class SonyApi:
         )
         try:
             result = json.loads(self._read_response(request).decode("utf-8"))
+        except DeviceConnectionError as ex:
+            self.polling_responses.failed(request_type, _connection_failure_category(ex))
+            raise
+        except DeviceResponseError:
+            self.polling_responses.failed(request_type, "http_errors")
+            raise
         except (UnicodeError, json.JSONDecodeError) as ex:
+            self.polling_responses.failed(request_type, "malformed_responses")
             raise DeviceResponseError("Sony returned invalid JSON.") from ex
         if not isinstance(result, dict):
+            self.polling_responses.failed(request_type, "malformed_responses")
             raise DeviceResponseError("Sony response must be a JSON object.")
         if "error" in result:
             error = result["error"]
             code = error[0] if isinstance(error, list) and error and isinstance(error[0], int) else "unknown"
+            self.polling_responses.failed(request_type, "device_rejections")
             raise DeviceResponseError(f"Sony rejected {method} (error code {code}).")
         if not isinstance(result.get("result"), list):
+            self.polling_responses.failed(request_type, "malformed_responses")
             raise DeviceResponseError("Sony response is missing a result list.")
         self.polling_responses.record(f"{service}/{method}", result)
         return result
@@ -1898,11 +1909,24 @@ def _state_age(observed_at, now):
     return round(max(0.0, now - observed_at), 3) if observed_at else None
 
 
+def _connection_failure_category(error):
+    while error is not None:
+        if isinstance(error, TimeoutError):
+            return "timeouts"
+        if isinstance(error, URLError) and isinstance(error.reason, TimeoutError):
+            return "timeouts"
+        error = error.__cause__
+    return "connection_failures"
+
+
 class PollingResponses:
     """Latest successful decoded response per allowlisted read; worker-thread safe."""
 
     def __init__(self, request_types):
         self._responses = dict.fromkeys(request_types)
+        self._counters = {key: dict.fromkeys(("successes", "empty_inventories", "failures",
+            "malformed_responses", "connection_failures", "timeouts", "http_errors",
+            "device_rejections", "recoveries", "consecutive_failures"), 0) for key in request_types}
         self._lock = threading.Lock()
 
     def record(self, request_type, response):
@@ -1912,6 +1936,32 @@ class PollingResponses:
                  "observed_at": time.monotonic(), "response": copy.deepcopy(response)}
         with self._lock:
             self._responses[request_type] = entry
+            counters = self._counters[request_type]
+            counters["successes"] += 1
+            if counters["consecutive_failures"]:
+                counters["recoveries"] += 1
+            counters["consecutive_failures"] = 0
+            if request_type in ("appControl/getApplicationList", "avContent/getCurrentExternalInputsStatus"):
+                empty = response.get("result") == [[]]
+            else:
+                empty = False
+            if empty:
+                counters["empty_inventories"] += 1
+
+    def failed(self, request_type, category):
+        if request_type not in self._counters:
+            return
+        with self._lock:
+            counters = self._counters[request_type]
+            counters["failures"] += 1
+            counters["consecutive_failures"] += 1
+            counters[category] += 1
+            if category == "timeouts":
+                counters["connection_failures"] += 1
+
+    def counters(self):
+        with self._lock:
+            return copy.deepcopy(self._counters)
 
     def snapshot(self, now):
         with self._lock:
@@ -1932,7 +1982,15 @@ class RequestHistory:
         if group not in ("status", "command", "apps", "inputs", "speakers", "background"):
             group = "background"
         outcome = "failure" if error is not None else "success"
-        record = self.groups.setdefault(group, {})
+        record = self.groups.setdefault(group, {"successes": 0, "failures": 0,
+                                                "recoveries": 0, "consecutive_failures": 0})
+        if error is None:
+            record["successes"] += 1
+            record["recoveries"] += bool(record["consecutive_failures"])
+            record["consecutive_failures"] = 0
+        else:
+            record["failures"] += 1
+            record["consecutive_failures"] += 1
         record[outcome] = {"at_utc": datetime.now(timezone.utc).isoformat(),
                            "observed_at": time.monotonic()}
         if error is not None:
@@ -4465,6 +4523,7 @@ class SonyRemote(QMainWindow):
     def _cached_state(self, *, full=False):
         now = time.monotonic()
         report = _cached_common(self, "tv", now)
+        report["polling_counters"] = self.api.polling_responses.counters()
         if full:
             report["mode"] = "cached_full"
             report["polling_responses"] = self.api.polling_responses.snapshot(now)

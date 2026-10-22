@@ -2,6 +2,10 @@
 
 Release identifiers below come from the corresponding commits. Some releases updated only the calibration helper; the remote and helper can therefore have different version numbers. Historical behavior may have been superseded by later releases.
 
+## 2026-10-22
+
+- Sony Remote 2026.10.22.1 — Include session-only polling success, empty-inventory, failure-category and recovery counters in both dump formats, plus grouped request totals. Preserve polling, exceptions, removal and recovery behavior.
+
 ## 2026-10-21
 
 - Sony Remote 2026.10.21.24 — Show the full-report privacy warning in the save confirmation popup and console output, as well as in the JSON.

@@ -85,6 +85,8 @@ class DumpTests(unittest.TestCase):
         self.assertEqual(full['mode'], 'cached_full')
         self.assertEqual(full['polling_responses']['status']['response']['extra'], 42)
         self.assertFalse(full['fresh_queries_performed'])
+        self.assertEqual(report['polling_counters'], full['polling_counters'])
+        self.assertEqual(report['polling_counters']['status']['successes'], 1)
         payload = json.dumps(report, allow_nan=False)
         self.assertEqual(report['mode'], 'cached')
         self.assertFalse(report['fresh_queries_performed'])
@@ -152,3 +154,72 @@ class DumpTests(unittest.TestCase):
                     self.assertEqual('Privacy warning:' in message, full)
                     if full:
                         self.assertIn('Review it before sharing', message)
+
+    def test_session_counters_recovery_empty_and_detached_snapshot(self):
+        key = 'appControl/getApplicationList' if BRAND == 'Sony' else 'system/getFeatures'
+        cache = R['PollingResponses']((key, 'status'))
+        empty = {'result': [[]]} if BRAND == 'Sony' else {'system': {'input_list': []}}
+        cache.failed(key, 'timeouts')
+        cache.failed(key, 'malformed_responses')
+        cache.record(key, empty)
+        cache.record(key, empty)
+        cache.failed('setTextForm', 'http_errors')
+        counters = cache.counters()
+        self.assertEqual(counters[key]['successes'], 2)
+        self.assertEqual(counters[key]['empty_inventories'], 2)
+        self.assertEqual(counters[key]['failures'], 2)
+        self.assertEqual(counters[key]['timeouts'], 1)
+        self.assertEqual(counters[key]['connection_failures'], 1)
+        self.assertEqual(counters[key]['recoveries'], 1)
+        self.assertEqual(counters[key]['consecutive_failures'], 0)
+        counters[key]['successes'] = 99
+        self.assertEqual(cache.counters()[key]['successes'], 2)
+        self.assertTrue(all(value == 0 for value in cache.counters()['status'].values()))
+        self.assertTrue(all(value == 0 for value in R['PollingResponses']((key,)).counters()[key].values()))
+
+    def test_api_failure_categories_and_recovery_preserve_exceptions(self):
+        from urllib.error import URLError, HTTPError
+        api = R[BRAND + 'Api']('device.local', 'SECRET') if BRAND == 'Sony' else R['YamahaApi']('device.local')
+        key = 'system/getPowerStatus' if BRAND == 'Sony' else 'main/getStatus'
+        read = api.get_power if BRAND == 'Sony' else api.get_status
+        opener = MagicMock()
+        globals_ = R[BRAND + 'Api'].__init__.__globals__
+        success = {'result': [{'status': 'active'}]} if BRAND == 'Sony' else {'response_code': 0, 'power': 'on'}
+        malformed = {'result': 12} if BRAND == 'Sony' else {'response_code': 'bad'}
+        rejected = {'error': [1, 'SECRET']} if BRAND == 'Sony' else {'response_code': 1}
+        with patch.dict(globals_, {'DEVICE_HTTP_OPENER': opener}):
+            for error in (URLError(TimeoutError('SECRET')), URLError(OSError('SECRET')), HTTPError('url', 503, 'SECRET', {}, None)):
+                opener.open.side_effect = error
+                with self.assertRaises(R['DeviceConnectionError'] if not isinstance(error, HTTPError) else R['DeviceResponseError']):
+                    read()
+            opener.open.side_effect = None
+            reply = opener.open.return_value.__enter__.return_value
+            for payload in (b'bad json', json.dumps(malformed).encode(), json.dumps(rejected).encode()):
+                reply.read.return_value = payload
+                with self.assertRaises(R['DeviceResponseError']):
+                    read()
+            reply.read.return_value = json.dumps(success).encode()
+            read()
+            read()
+        counters = api.polling_responses.counters()[key]
+        self.assertEqual(counters['successes'], 2)
+        self.assertEqual(counters['failures'], 6)
+        self.assertEqual(counters['malformed_responses'], 2)
+        self.assertEqual(counters['connection_failures'], 2)
+        self.assertEqual(counters['timeouts'], 1)
+        self.assertEqual(counters['http_errors'], 1)
+        self.assertEqual(counters['device_rejections'], 1)
+        self.assertEqual(counters['recoveries'], 1)
+        self.assertNotIn('SECRET', json.dumps(counters))
+
+    def test_group_counts_first_recovery_only(self):
+        history = R['RequestHistory']()
+        history.record('status', ValueError())
+        history.record('status', ValueError())
+        history.record('status')
+        history.record('status')
+        counts = history.snapshot(time.monotonic())['status']
+        self.assertEqual(counts['successes'], 2)
+        self.assertEqual(counts['failures'], 2)
+        self.assertEqual(counts['recoveries'], 1)
+        self.assertEqual(counts['consecutive_failures'], 0)
