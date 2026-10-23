@@ -437,15 +437,28 @@ class DiscoveryTests(unittest.TestCase):
         self.assertTrue(self.window.input_combo.isEnabled())
         self.window.show_error.assert_not_called()
 
-    def test_standby_keeps_power_and_successful_app_launcher_available(self):
+    def test_standby_disables_app_dropdown_and_favorites_until_tv_wakes(self):
         self.device.power = 'standby'
         self.start_and_settle()
         self.assertEqual(self.window.power_button.text(), 'Power On')
         self.assertTrue(self.window.power_button.isEnabled())
-        self.assertTrue(self.window.app_combo.isEnabled())
+        self.assertFalse(self.window.app_combo.isEnabled())
         self.assertFalse(self.window.volume_up.isEnabled())
         self.assertFalse(self.window.input_combo.isEnabled())
         self.assertFalse(self.buttons('Up')[0].isEnabled())
+
+        favorite = self.window.app_favorites_layout.itemAt(0).widget()
+        self.assertFalse(favorite.isEnabled())
+        self.device.power = 'active'
+        self.window.poll_status()
+        self.wait(lambda: self.window.last_power == 'active' and not self.window.poll_running)
+        self.assertTrue(self.window.app_combo.isEnabled())
+        self.assertTrue(favorite.isEnabled())
+        self.device.power = 'standby'
+        self.window.poll_status()
+        self.wait(lambda: self.window.last_power == 'standby' and not self.window.poll_running)
+        self.assertFalse(self.window.app_combo.isEnabled())
+        self.assertFalse(favorite.isEnabled())
 
     def test_unadvertised_ircc_command_stays_disabled_after_successful_discovery(self):
         self.start_and_settle()

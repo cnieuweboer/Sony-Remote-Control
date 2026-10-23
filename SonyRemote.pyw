@@ -580,7 +580,7 @@ class CalibrationServer(QObject):
 APP_NAME = "Sony Remote"
 
 
-__version__ = "2026.10.22.2"
+__version__ = "2026.10.23.1"
 
 
 CONFIG_PATH = Path(__file__).resolve().with_name("SonyRemote.json")
@@ -3488,8 +3488,7 @@ class SonyRemote(QMainWindow):
         self._discovery_ready.add(feature)
         self._discovery_errors.pop(feature, None)
         self.set_controls_enabled(self.last_power == "active",
-                                  power_enabled=self.last_power is not None,
-                                  app_enabled=self.last_power is not None)
+                                  power_enabled=self.last_power is not None)
         self._update_discovery_feedback()
 
     def _discovery_failed(self, feature, error):
@@ -3499,8 +3498,7 @@ class SonyRemote(QMainWindow):
         self._discovery_errors[feature] = (str(error) if isinstance(error, (DeviceConnectionError, DeviceResponseError))
                                            else f"Unexpected discovery error ({type(error).__name__}).")
         self.set_controls_enabled(self.last_power == "active",
-                                  power_enabled=self.last_power is not None,
-                                  app_enabled=self.last_power is not None)
+                                  power_enabled=self.last_power is not None)
         self._update_discovery_feedback()
 
     def _update_discovery_feedback(self):
@@ -3655,7 +3653,6 @@ class SonyRemote(QMainWindow):
             self.set_controls_enabled(
                 is_active,
                 power_enabled=True,
-                app_enabled=True,
             )
             self.update_power_ui(self.last_power)
             if not is_active:
@@ -3722,12 +3719,9 @@ class SonyRemote(QMainWindow):
         self,
         enabled,
         power_enabled=None,
-        app_enabled=None,
     ):
         if power_enabled is None:
             power_enabled = enabled
-        if app_enabled is None:
-            app_enabled = enabled
 
         self.power_button.setEnabled(power_enabled)
 
@@ -3749,8 +3743,7 @@ class SonyRemote(QMainWindow):
                          and self.api.resolve_remote_command(command) in self.api.remote_codes))
             button.setEnabled(bool(enabled and supported))
 
-        # App launching can wake the TV, so it retains standby availability.
-        apps_enabled = bool(app_enabled and "apps" in self._discovery_ready)
+        apps_enabled = bool(enabled and "apps" in self._discovery_ready)
         inputs_enabled = bool(enabled and "inputs" in self._discovery_ready)
         if hasattr(self, "app_combo"):
             self.app_combo.setEnabled(apps_enabled)
@@ -3809,7 +3802,7 @@ class SonyRemote(QMainWindow):
         self._volume_rate_loop_running = False
         self.volume_rate_timer.stop()
         self.power_button.setText("Offline")
-        self.set_controls_enabled(False, power_enabled=False, app_enabled=False)
+        self.set_controls_enabled(False, power_enabled=False)
         if self.config["VolumeControls"]:
             self.update_volume_ui({})
 
@@ -4693,7 +4686,6 @@ class SonyRemote(QMainWindow):
             return
         self.set_controls_enabled(
             self.last_power == "active", power_enabled=self.last_power is not None,
-            app_enabled=self.last_power is not None,
         )
         if self._volume_rate_loop_running and self._desired_volume is not None:
             self._schedule_volume_rate_step(0)
