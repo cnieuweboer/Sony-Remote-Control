@@ -4,6 +4,8 @@ Place SonyRemote.json and YamahaRemote.json beside this script. No IPC, imports
 from remotes, setting writes, automatic mute changes or automatic restoration.
 """
 import ipaddress
+import math
+import threading
 import json
 import sys
 import time
@@ -17,13 +19,14 @@ from PySide6.QtWidgets import (QApplication, QCheckBox, QFileDialog, QHBoxLayout
     QMainWindow, QMessageBox, QPlainTextEdit, QPushButton, QSpinBox,
     QVBoxLayout, QWidget)
 
-__version__ = '2026.10.24.2'
+__version__ = '2026.10.24.3'
 TV_INPUT = 'tv'
 OTHER_INPUT = 'usb_dac'
 POLL_SECONDS = .25
 SEND_SECONDS = .20
-BURST_SECONDS = 2.0
-OBSERVE_SECONDS = 3.0
+MAX_REPEAT_MS = 30000
+MAX_FINAL_DELAY_MS = 10000
+SKIPPED = object()
 TIMEOUT_SECONDS = 2.0
 OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
@@ -57,18 +60,26 @@ def base_url(host):
 
 
 class Device:
-    def __init__(self, settings, role):
+    def __init__(self, settings, role, trace=None):
         self.role = role
+        self.trace = trace
         self.url = base_url(settings['Host'])
         self.psk = settings.get('PreSharedKey', '')
         self.request_id = 0
 
-    def read_json(self, request):
-        with OPENER.open(request, timeout=TIMEOUT_SECONDS) as response:
-            result = json.loads(response.read().decode('utf-8'))
-        if not isinstance(result, dict):
-            raise ValueError('Device did not return a JSON object.')
-        return result
+    def read_json(self, request, endpoint):
+        started = time.monotonic()
+        ok = False
+        try:
+            with OPENER.open(request, timeout=TIMEOUT_SECONDS) as response:
+                result = json.loads(response.read().decode('utf-8'))
+            if not isinstance(result, dict):
+                raise ValueError('Device did not return a JSON object.')
+            ok = True
+            return result
+        finally:
+            if self.trace:
+                self.trace(self.role, endpoint, started, time.monotonic(), ok)
 
     def tv_rpc(self, service, method, params=None, version='1.0'):
         self.request_id += 1
@@ -77,7 +88,7 @@ class Device:
         request = urllib.request.Request(self.url + '/sony/' + service,
             data=json.dumps(payload).encode(), method='POST',
             headers={'Content-Type': 'application/json', 'X-Auth-PSK': self.psk})
-        result = self.read_json(request)
+        result = self.read_json(request, service + "/" + method)
         if 'error' in result:
             raise RuntimeError('TV rejected request: ' + repr(result['error']))
         if not isinstance(result.get('result'), list):
@@ -85,7 +96,7 @@ class Device:
         return result
 
     def amp_get(self, path):
-        result = self.read_json(self.url + '/YamahaExtendedControl/v1/' + path)
+        result = self.read_json(self.url + '/YamahaExtendedControl/v1/' + path, path.split('?')[0])
         if type(result.get('response_code')) is not int or result['response_code'] != 0:
             raise RuntimeError('Amplifier rejected request (response_code=' + repr(result.get('response_code')) + ').')
         return result
@@ -94,7 +105,7 @@ class Device:
         if self.role == 'amplifier':
             data = self.amp_get('main/getStatus')
             return {key: data.get(key) for key in ('power', 'input', 'volume', 'max_volume', 'mute')}
-        power = self.tv_rpc('system', 'getPowerStatus')['result'][0]['status']
+        power = self.power()
         if power != 'active':
             return dict(power=power, volume=None, mute=None)
         outputs = self.tv_rpc('audio', 'getVolumeInformation')['result'][0]
@@ -102,6 +113,9 @@ class Device:
         if info is None:
             raise ValueError('TV did not report its speaker volume target.')
         return dict(power=power, **{key: info.get(key) for key in ('target', 'volume', 'mute', 'minVolume', 'maxVolume')})
+
+    def power(self):
+        return self.tv_rpc('system', 'getPowerStatus')['result'][0]['status']
 
     def set_input(self, input_id):
         return self.amp_get('main/setInput?input=' + quote(input_id, safe=''))
@@ -114,60 +128,77 @@ class Device:
 
 class Signals(QObject):
     started = Signal(str, str, float)
-    done = Signal(str, str, object, object, float)
+    done = Signal(str, str, object, object, float, float)
 
 
 class Job(QRunnable):
-    def __init__(self, role, kind, function):
+    def __init__(self, role, kind, function, allowed=None):
         super().__init__()
         self.role, self.kind, self.function = role, kind, function
+        self.allowed = allowed
         self.signals = Signals()
 
     def run(self):
         started = time.monotonic()
+        if self.allowed is not None and not self.allowed(started):
+            self.signals.done.emit(self.role, self.kind, SKIPPED, None, started, started)
+            return
         self.signals.started.emit(self.role, self.kind, started)
         result = error = None
         try:
             result = self.function()
         except Exception as caught:
             error = caught
-        self.signals.done.emit(self.role, self.kind, result, error, started)
+        self.signals.done.emit(self.role, self.kind, result, error, started, time.monotonic())
 
 
 class Window(QMainWindow):
+    http_event = Signal(str, str, float, float, bool)
+
     def __init__(self, tv, amp):
         super().__init__()
-        self.devices = dict(tv=Device(tv, 'tv'), amplifier=Device(amp, 'amplifier'))
+        self.devices = dict(tv=Device(tv, 'tv', self.http_event.emit),
+                            amplifier=Device(amp, 'amplifier', self.http_event.emit))
+        self.http_event.connect(self.log_http)
         self.pool = QThreadPool(self)
         self.pool.setMaxThreadCount(2)
         self.jobs = {}
         self.state = dict(tv=None, amplifier=None)
         self.observed = dict(tv=0., amplifier=0.)
         self.sample_started = dict(tv=0., amplifier=0.)
+        self.audio_observed = dict(tv=0., amplifier=0.)
+        self.audio_started = dict(tv=0., amplifier=0.)
         self.next_poll = dict(tv=0., amplifier=0.)
         self.stage = None
-        self.manual_input = self.manual_tv_target = None
+        self.tv_initialized = False
+        self.pending_reads = {}
+        self.cancelled = threading.Event()
+        self.manual_input = None
         self.closed = False
         self.started = time.monotonic()
-        self.baseline = None
-        self.sent = 0
+        self.sent = self.skipped = 0
         self.changes = []
+        self.first_send_at = self.repeat_end = self.next_slot = None
+        self.baseline = None
         self.setWindowTitle('TV / amplifier CEC handover prototype ' + __version__)
-        self.resize(850, 570)
-        panel = QWidget()
-        layout = QVBoxLayout(panel)
+        self.resize(960, 670)
+        panel = QWidget(self)
         self.setCentralWidget(panel)
-        warning = QLabel('Close BOTH normal remotes to avoid interference. Use a silent TV source and a safe amplifier volume.\n'
-            'This test changes amplifier input and TV volume. CEC may also change amplifier volume or mute.\n'
-            'No automatic restoration: check TV/amplifier volume, mute and input afterward.')
+        layout = QVBoxLayout(panel)
+        warning = QLabel('Close BOTH normal remotes. Use a silent TV source and safe amplifier volume. '
+            'The TV and amplifier must stay on. No automatic mute or restoration: check their volume/mute/input afterward.')
         warning.setWordWrap(True)
         layout.addWidget(warning)
-        self.labels = {}
-        for role in self.devices:
-            self.labels[role] = QLabel(role + ': waiting for status')
-            self.labels[role].setWordWrap(True)
-            layout.addWidget(self.labels[role])
-        self.auto_watch = QCheckBox('Automatically run the TV volume burst when amplifier changes tv → usb_dac')
+        info = QLabel('Required: amplifier input/status monitoring every 250 ms (also returns volume/mute). '
+            'TV readiness/range is read initially or with Refresh; no recurring TV reads outside experiments. '
+            'Optional measurements may slow sends; missed 200 ms opportunities are skipped.')
+        info.setWordWrap(True)
+        layout.addWidget(info)
+        self.labels = {role: QLabel() for role in self.devices}
+        for label in self.labels.values():
+            label.setWordWrap(True)
+            layout.addWidget(label)
+        self.auto_watch = QCheckBox('Automatically test each confirmed tv → usb_dac transition')
         self.auto_watch.setChecked(True)
         layout.addWidget(self.auto_watch)
         row = QHBoxLayout()
@@ -177,240 +208,373 @@ class Window(QMainWindow):
             button.clicked.connect(lambda checked=False, value=input_id: self.switch(value))
             self.input_buttons.append(button)
             row.addWidget(button)
+        self.refresh = QPushButton('Refresh TV readiness / range')
+        self.refresh.clicked.connect(self.refresh_tv)
+        row.addWidget(self.refresh)
         layout.addLayout(row)
         row = QHBoxLayout()
-        row.addWidget(QLabel('Absolute TV target:'))
+        row.addWidget(QLabel('TV target:'))
         self.target = QSpinBox()
         self.target.setRange(0, 100)
         self.target.setValue(10)
         row.addWidget(self.target)
-        self.single = QPushButton('Send TV volume once')
-        self.single.clicked.connect(self.send_single)
-        row.addWidget(self.single)
-        self.test = QPushButton('Switch to usb_dac + test 2-second burst')
+        row.addWidget(QLabel('Repeat duration (ms):'))
+        self.duration = QSpinBox()
+        self.duration.setRange(0, MAX_REPEAT_MS)
+        self.duration.setSingleStep(200)
+        self.duration.setValue(2000)
+        self.duration.setToolTip('0 sends once. Otherwise sends repeat every 200 ms within this elapsed window, from the first request start.')
+        row.addWidget(self.duration)
+        row.addWidget(QLabel('Final measurement delay (ms):'))
+        self.final_delay = QSpinBox()
+        self.final_delay.setRange(0, MAX_FINAL_DELAY_MS)
+        self.final_delay.setSingleStep(100)
+        self.final_delay.setValue(0)
+        row.addWidget(self.final_delay)
+        layout.addLayout(row)
+        row = QHBoxLayout()
+        self.measure_tv = QCheckBox('Measure TV before / after commands and at end')
+        self.measure_tv.setChecked(True)
+        self.measure_tv.setToolTip('Each TV measurement reads power, then volume/mute (two HTTP requests). Off means no TV reads during the experiment.')
+        self.measure_amp = QCheckBox('Extra amplifier measurements before / after / at end')
+        self.measure_amp.setChecked(True)
+        self.measure_amp.setToolTip('Reuse required status reads when suitable; otherwise request extra status. Required input monitoring always continues.')
+        row.addWidget(self.measure_tv)
+        row.addWidget(self.measure_amp)
+        layout.addLayout(row)
+        row = QHBoxLayout()
+        self.test = QPushButton('Switch to usb_dac + run test')
         self.test.clicked.connect(self.start_test)
         row.addWidget(self.test)
-        self.stop = QPushButton('Stop test')
+        self.stop = QPushButton('Stop / disarm automatic test')
         self.stop.clicked.connect(self.stop_test)
         row.addWidget(self.stop)
+        save = QPushButton('Save log…')
+        save.clicked.connect(self.save_log)
+        row.addWidget(save)
         layout.addLayout(row)
-        self.status = QLabel('Waiting for fresh device status.')
+        self.status = QLabel('Waiting for initial device status.')
         self.status.setWordWrap(True)
         layout.addWidget(self.status)
         self.log = QPlainTextEdit()
         self.log.setReadOnly(True)
         layout.addWidget(self.log, 1)
-        save = QPushButton('Save log…')
-        save.clicked.connect(self.save_log)
-        layout.addWidget(save)
         self.timer = QTimer(self)
-        self.timer.setInterval(20)
+        self.timer.setInterval(10)
         self.timer.timeout.connect(self.tick)
         self.timer.start()
-        self.message('Polling each device about every 250 ms; one outstanding request per device. '
-                     'TV reads include separate power and volume requests. Inputs: tv -> usb_dac.')
+        self.message('INITIAL: one TV readiness/range read; required amplifier main/getStatus monitoring. '
+                     'No output selection can be inferred from target="speaker" alone.')
         self.update_controls()
 
     def message(self, text):
-        self.log.appendPlainText(f'{time.monotonic() - self.started:8.3f}s  {text}')
+        self.log.appendPlainText(f'{time.monotonic() - self.started:9.3f}s  {text}')
+
+    def log_http(self, role, endpoint, started, ended, ok):
+        if self.closed:
+            return
+        job = self.jobs.get(role)
+        kind = job.kind if job else 'request'
+        self.message(f'HTTP {role} [{kind}] {endpoint}: start +{started-self.started:.3f}s, '
+                     f'end +{ended-self.started:.3f}s, {1000*(ended-started):.1f} ms; '
+                     + ('JSON received' if ok else 'FAILED'))
 
     def fresh(self, role):
-        return self.state[role] is not None and time.monotonic() - self.observed[role] < 1.5
+        limit = 1.5 if role == 'amplifier' else 3.0
+        return self.state[role] is not None and time.monotonic() - self.observed[role] < limit
 
-    def submit(self, role, kind, function):
+    def tv_ready(self):
+        state = self.state['tv'] or {}
+        minimum, maximum = state.get('minVolume'), state.get('maxVolume')
+        return (state.get('power') == 'active'
+                and type(minimum) is int and type(maximum) is int
+                and minimum <= self.target.value() <= maximum)
+
+    def submit(self, role, kind, function, allowed=None):
         if self.closed or role in self.jobs:
             return False
-        job = Job(role, kind, function)
+        job = Job(role, kind, function, allowed)
         self.jobs[role] = job
         job.signals.started.connect(self.request_started)
         job.signals.done.connect(self.completed)
         self.pool.start(job)
-        self.update_controls()
         return True
 
     def request_started(self, role, kind, started):
-        if self.closed or kind == 'poll':
+        if self.closed:
             return
-        relative = (f'; +{started - self.burst_start:.3f}s after usb_dac detection'
-                    if kind.startswith('burst volume') else '')
-        self.message(f'{role} {kind} REQUEST START +{started - self.started:.3f}s{relative}')
+        self.message(f'JOB {role} [{kind}] START +{started-self.started:.3f}s')
+        if kind == 'volume' and self.stage:
+            self.sent += 1
+            if self.first_send_at is None:
+                self.first_send_at = started
+                self.repeat_end = started + self.options['duration_ms'] / 1000
+                self.next_slot = started + SEND_SECONDS
+                self.message(f'First volume request: +{started-self.detected_at:.3f}s after detection; '
+                             f'repeat window ends +{self.repeat_end-self.started:.3f}s.')
+            else:
+                self.message(f'Volume request #{self.sent}: +{started-self.first_send_at:.3f}s from first send.')
 
-    def completed(self, role, kind, result, error, request_started):
+    def completed(self, role, kind, result, error, request_started, ended):
         self.jobs.pop(role, None)
         if self.closed:
             return
+        if result is SKIPPED:
+            self.message(f'{role} [{kind}] skipped before starting: cancelled or repeat window ended.')
+            if self.stage:
+                self.stage = 'between'
+            return
         if error is not None:
-            # Do not log request headers, credentials, hosts or exception messages.
-            self.message(f'{role} {kind} FAILED: {type(error).__name__}')
+            self.message(f'{role} [{kind}] FAILED: {type(error).__name__}')
             self.state[role] = None
-            self.labels[role].setText(role + ': request failed (' + type(error).__name__ + ')')
             self.next_poll[role] = time.monotonic() + .5
             if self.stage:
-                self.finish('Test stopped on a device request failure. Check device settings manually.')
-        elif kind == 'poll':
-            previous = self.state[role] if self.fresh(role) else None
-            previous_request = self.sample_started[role]
-            changed = result != self.state[role]
-            self.state[role] = result
-            self.observed[role] = time.monotonic()
-            self.sample_started[role] = request_started
-            self.labels[role].setText(role + ': ' + json.dumps(result))
-            if changed or self.stage:
-                self.message(f'{role} status (request +{request_started - self.started:.3f}s): ' + json.dumps(result))
-            if (role == 'amplifier' and self.stage is None and self.auto_watch.isChecked()
-                    and previous and previous.get('power') == 'on' and previous.get('input') == TV_INPUT
-                    and result.get('power') == 'on' and result.get('input') == OTHER_INPUT):
-                self.message(f'AUTO detected tv → usb_dac. Last tv-input poll started +{previous_request - self.started:.3f}s; '
-                             f'usb_dac report received +{self.observed[role] - self.started:.3f}s. '
-                             'Exact physical switch time is not observable.')
-                if self.tv_target_valid():
-                    self.begin_burst(result, 'Automatic handover', previous)
-                else:
-                    self.message('Automatic burst skipped: no fresh, active TV status with a valid target range.')
-            if self.stage and role == 'amplifier':
-                if result.get('power') != 'on':
-                    self.finish('Test stopped: amplifier is not on.')
-                elif self.stage in ('burst', 'observe') and result.get('input') != OTHER_INPUT:
-                    self.finish('Test stopped: amplifier left usb_dac.')
-                elif self.stage == 'wait_input' and request_started >= self.switch_completed and result.get('input') == OTHER_INPUT:
-                    self.begin_burst(result, 'Button-driven handover')
-                elif self.stage in ('burst', 'observe') and result.get('volume') != self.baseline.get('volume'):
-                    if not self.changes or self.changes[-1] != result.get('volume'):
-                        self.changes.append(result.get('volume'))
-                        self.message('AMPLIFIER VOLUME CHANGED after handover: ' + repr(result.get('volume')))
-            if self.stage and role == 'tv' and result.get('power') != 'active':
-                self.finish('Test stopped: TV is not on.')
-        else:
-            self.message(f'{role} {kind} acknowledged (request +{request_started - self.started:.3f}s; '
-                         f'response after {time.monotonic() - request_started:.3f}s).')
-            self.next_poll[role] = 0
-            if kind == 'test switch' and self.stage == 'switching':
-                self.stage = 'wait_input'
-                self.switch_completed = time.monotonic()
+                self.finish('Test stopped on a request failure; no retry.')
+            self.update_controls()
+            return
+        self.message(f'JOB {role} [{kind}] END +{ended-self.started:.3f}s ({1000*(ended-request_started):.1f} ms)')
+        if kind in ('monitor', 'initial', 'refresh') or kind.startswith('measure '):
+            self.accept_status(role, kind, result, request_started, ended)
+        elif kind == 'volume' and self.stage:
+            self.last_send_finished = ended
+            self.message(f'TV volume {self.options["target"]} acknowledged; acknowledgement alone does not prove its effect.')
+            self.stage = 'post'
+            self.queue_measurements('post', ended)
+        elif kind == 'test switch' and self.stage == 'switching':
+            self.stage = 'wait_input'
+            self.switch_completed = ended
+            self.next_poll['amplifier'] = 0
+        elif kind.startswith('input '):
+            self.next_poll['amplifier'] = 0
         self.update_controls()
 
-    def tv_target_valid(self):
-        state = self.state['tv'] or {}
-        minimum, maximum = state.get('minVolume'), state.get('maxVolume')
-        return (self.fresh('tv') and state.get('power') == 'active'
-                and type(minimum) is int and type(maximum) is int
-                and minimum <= self.target.value() <= maximum)
+    def accept_status(self, role, kind, result, request_started, ended):
+        previous = self.state[role] if self.fresh(role) else None
+        previous_started = self.sample_started[role]
+        self.state[role] = result
+        self.audio_observed[role] = ended
+        self.audio_started[role] = request_started
+        if role == 'tv':
+            self.tv_initialized = True
+            if kind in ('initial', 'refresh'):
+                minimum, maximum = result.get('minVolume'), result.get('maxVolume')
+                if type(minimum) is int and type(maximum) is int and 0 <= minimum <= maximum <= 2147483647:
+                    self.target.setRange(minimum, maximum)
+        self.observed[role] = ended
+        self.sample_started[role] = request_started
+        self.next_poll[role] = ended + POLL_SECONDS
+        self.message(f'{role} [{kind}] RESULT: ' + json.dumps(result))
+        current = self.state[role]
+        pending = self.pending_reads.get(role)
+        if pending and request_started >= pending['after']:
+            self.message(f'{role} {pending["phase"]} measurement satisfied by [{kind}]: ' + json.dumps(current))
+            del self.pending_reads[role]
+        expected_power = 'on' if role == 'amplifier' else 'active'
+        if self.stage and current.get('power') != expected_power:
+            self.finish(f'Test stopped: {role} is not on.')
+            return
+        if role != 'amplifier':
+            return
+        if self.stage in ('pre', 'sending', 'post', 'between', 'final_delay', 'final'):
+            if current.get('input') != OTHER_INPUT:
+                self.finish('Test stopped: amplifier left usb_dac.')
+                return
+            if (type(current.get('volume')) is int and type(self.baseline.get('volume')) is int
+                    and current['volume'] != self.baseline['volume']):
+                if not self.changes or self.changes[-1] != current.get('volume'):
+                    self.changes.append(current.get('volume'))
+                    self.message('AMPLIFIER VOLUME CHANGED: ' + repr(current.get('volume')))
+        elif self.stage == 'wait_input' and request_started >= self.switch_completed and current.get('input') == OTHER_INPUT:
+            self.begin_experiment(current, 'Button-driven handover')
+        elif (self.stage is None and self.auto_watch.isChecked() and previous
+              and previous.get('power') == 'on' and previous.get('input') == TV_INPUT
+              and current.get('power') == 'on' and current.get('input') == OTHER_INPUT):
+            self.message(f'AUTO tv → usb_dac: previous TV-input poll start +{previous_started-self.started:.3f}s; '
+                         f'USB report received +{ended-self.started:.3f}s. Exact physical switch time is unknown.')
+            if self.tv_ready():
+                self.begin_experiment(current, 'Automatic handover', previous)
+            else:
+                self.message('Automatic test skipped: refresh TV readiness/range first.')
 
-    def update_controls(self):
-        idle = self.stage is None
-        for button in self.input_buttons:
-            button.setEnabled(idle and self.fresh('amplifier')
-                              and self.state['amplifier'].get('power') == 'on')
-        self.single.setEnabled(idle and self.tv_target_valid())
-        self.test.setEnabled(idle and self.tv_target_valid() and self.fresh('amplifier')
-                             and self.state['amplifier'].get('power') == 'on'
-                             and self.state['amplifier'].get('input') == TV_INPUT)
-        if self.status.text() == 'Waiting for fresh device status.' and self.fresh('tv') and self.fresh('amplifier'):
-            self.status.setText('Ready. Watch tv → usb_dac automatically with the checkbox, or use the test button.')
-        self.auto_watch.setEnabled(idle)
-        self.target.setEnabled(idle)
-        self.stop.setEnabled(not idle)
+    def begin_experiment(self, amp_status, reason, previous=None):
+        if not self.tv_ready():
+            self.finish('Test not started: TV readiness/range unavailable.')
+            return
+        self.options = dict(target=self.target.value(), duration_ms=self.duration.value(),
+                            final_delay_ms=self.final_delay.value(), tv=self.measure_tv.isChecked(),
+                            amplifier=self.measure_amp.isChecked())
+        self.cancelled = threading.Event()
+        self.detected_at = time.monotonic()
+        self.baseline = amp_status.copy()
+        self.initial_tv_volume = None
+        self.sent = self.skipped = 0
+        self.changes = []
+        self.first_send_at = self.repeat_end = self.next_slot = None
+        self.pending_reads.clear()
+        self.manual_input = None
+        self.stage = 'pre'
+        self.message(reason + ': SETTINGS ' + json.dumps(self.options))
+        self.message('Confirmed usb_dac; amplifier baseline from REQUIRED input monitoring: ' + json.dumps(self.baseline))
+        if previous:
+            self.message('Previous tv-input sample: ' + json.dumps(previous))
+        if self.options['amplifier']:
+            self.message('amplifier pre measurement REUSED required input/status response; no duplicate request.')
+        else:
+            self.message('Extra amplifier measurements OFF. Required input reads still return volume/mute.')
+        if self.options['tv']:
+            self.pending_reads['tv'] = dict(phase='pre', after=self.detected_at)
+        else:
+            self.message('TV measurements OFF: TV-on/range is assumed from startup/manual readiness. '
+                         'No TV reads during or after experiment; TV volume effect will be unmeasured.')
+        self.update_controls()
+        self.drive_experiment(time.monotonic())
+
+    def queue_measurements(self, phase, after):
+        self.pending_reads = {role: dict(phase=phase, after=after)
+                              for role in ('tv', 'amplifier') if self.options[role]}
+
+    def drive_reads(self):
+        for role, pending in list(self.pending_reads.items()):
+            if (self.sample_started[role] >= pending['after'] and self.state[role] is not None
+                    and (role == 'amplifier' or self.audio_started[role] >= pending['after'])):
+                self.message(f'{role} {pending["phase"]} measurement REUSED existing response: ' + json.dumps(self.state[role]))
+                if pending['phase'] == 'pre' and role == 'tv':
+                    self.initial_tv_volume = self.state[role].get('volume')
+                del self.pending_reads[role]
+            elif role not in self.jobs:
+                self.submit(role, 'measure ' + pending['phase'], self.devices[role].poll)
+
+    def send_volume(self):
+        token, deadline = self.cancelled, self.repeat_end
+        target = self.options['target']
+        self.stage = 'sending'
+        self.submit('tv', 'volume', lambda: self.devices['tv'].set_tv_volume(target),
+                    lambda started: not token.is_set() and (deadline is None or started < deadline))
+
+    def advance_clock(self, now, can_send):
+        if self.next_slot is None or self.next_slot >= self.repeat_end or now < self.next_slot:
+            return
+        last_due = min(now, self.repeat_end - 1e-9)
+        count = max(0, math.floor((last_due - self.next_slot) / SEND_SECONDS) + 1)
+        if not count:
+            return
+        send = can_send and now < self.repeat_end
+        missed = count - int(send)
+        self.next_slot += count * SEND_SECONDS
+        if missed:
+            self.skipped += missed
+            self.message(f'SKIPPED {missed} nominal 200 ms send opportunity/opportunities: busy with requests/measurements or elapsed window. No backlog.')
+        if send:
+            self.send_volume()
+
+    def drive_experiment(self, now):
+        if not self.stage or self.stage in ('wait_switch', 'switching', 'wait_input'):
+            return
+        if not self.fresh('amplifier'):
+            self.finish('Test stopped: required amplifier status became stale.')
+            return
+        state = self.state['tv'] or {}
+        if state.get('power') != 'active':
+            self.finish('Test stopped: TV is not on.')
+            return
+        minimum, maximum = state.get('minVolume'), state.get('maxVolume')
+        if not (type(minimum) is int and type(maximum) is int
+                and minimum <= self.options['target'] <= maximum):
+            self.finish('Test stopped: TV target is outside its reported range, or range is unknown.')
+            return
+        if self.pending_reads:
+            self.drive_reads()
+        if self.stage == 'pre' and not self.pending_reads and 'tv' not in self.jobs:
+            self.initial_tv_volume = self.state['tv'].get('volume') if self.options['tv'] else None
+            self.send_volume()
+        elif self.stage == 'post' and not self.pending_reads:
+            self.stage = 'between'
+        if self.first_send_at is not None:
+            self.advance_clock(now, self.stage == 'between' and not self.pending_reads and 'tv' not in self.jobs)
+        if self.stage == 'between' and now >= self.repeat_end:
+            self.stage = 'final_delay'
+            self.final_due = max(self.repeat_end, self.last_send_finished) + self.options['final_delay_ms'] / 1000
+            self.message(f'Send window complete: {self.sent} sends, {self.skipped} skipped opportunities. No more volume commands.')
+        if self.stage == 'final_delay' and now >= self.final_due:
+            self.stage = 'final'
+            self.queue_measurements('final', now)
+            self.drive_reads()
+        if self.stage == 'final' and not self.pending_reads:
+            tv_result = (f'TV measured {self.initial_tv_volume} → {self.state["tv"].get("volume")}; '
+                         f'target {self.options["target"]}.' if self.options['tv'] else 'TV volume effect unmeasured.')
+            self.finish('RESULT: ' + tv_result + f' Amplifier last observed raw {self.baseline.get("volume")} → {self.state["amplifier"].get("volume")}; '
+                        'volume changes observed: ' + repr(self.changes)
+                        + '. Observations do not prove which audio output was active or establish causation.')
+        elif self.stage:
+            self.status.setText(f'{self.stage}: {self.sent} sends, {self.skipped} skipped; target {self.options["target"]}.')
+
+    def start_test(self):
+        if not self.test.isEnabled():
+            return
+        self.stage = 'wait_switch'
+        self.manual_input = None
+        self.test_deadline = time.monotonic() + 8
+        self.message('BUTTON TEST: switching amplifier to usb_dac; fresh confirmation required before measurement/send.')
+        self.update_controls()
+
+    def stop_test(self):
+        self.auto_watch.setChecked(False)
+        self.finish('Stopped; automatic watching disabled. An in-flight HTTP request may complete.')
+
+    def finish(self, message):
+        self.cancelled.set()
+        self.stage = None
+        self.pending_reads.clear()
+        self.message(message)
+        self.status.setText(message + ' Check device volume/mute/input afterward.')
+        self.update_controls()
 
     def switch(self, input_id):
         self.message('Request amplifier input ' + input_id)
         self.manual_input = input_id
 
-    def send_single(self):
-        if self.tv_target_valid():
-            value = self.target.value()
-            self.message('Request ONE absolute TV volume ' + str(value))
-            self.manual_tv_target = value
+    def refresh_tv(self):
+        if self.stage is None and 'tv' not in self.jobs:
+            self.submit('tv', 'refresh', self.devices['tv'].poll)
 
-    def start_test(self):
-        if not self.test.isEnabled():
-            return
-        self.sent = 0
-        self.changes = []
-        self.test_target = self.target.value()
-        self.manual_input = self.manual_tv_target = None
-        self.stage = 'wait_switch'
-        self.test_deadline = time.monotonic() + 8
-        self.message('START TEST. Before switch: amplifier=' + json.dumps(self.state['amplifier'])
-                     + '; tv=' + json.dumps(self.state['tv']) + '; target=' + str(self.test_target))
-        self.status.setText('Switching amplifier to usb_dac; waiting for confirmation before TV commands.')
-
-    def begin_burst(self, status, reason, previous=None):
-        self.sent = 0
-        self.changes = []
-        self.manual_input = self.manual_tv_target = None
-        self.test_target = self.target.value()
-        self.baseline = status.copy()
-        self.burst_start = time.monotonic()
-        self.burst_end = self.burst_start + BURST_SECONDS
-        self.next_send = self.burst_start
-        self.stage = 'burst'
-        self.message(reason + ': confirmed usb_dac BEFORE TV sends. Amplifier baseline: ' + json.dumps(self.baseline))
-        if previous is not None:
-            self.message('Previous tv-input sample: ' + json.dumps(previous))
-        self.status.setText('usb_dac detected: starting automatic TV volume burst.')
-        self.send_burst_if_due(self.burst_start)
-
-    def send_burst_if_due(self, now):
-        if self.stage == 'burst' and self.next_send <= now < self.burst_end and 'tv' not in self.jobs:
-            self.sent += 1
-            self.message(f'Burst TV SET #{self.sent}: absolute {self.test_target}; queued +{now - self.burst_start:.3f}s after detection')
-            value = self.test_target
-            self.submit('tv', 'burst volume ' + str(value), lambda: self.devices['tv'].set_tv_volume(value))
-            self.next_send = now + SEND_SECONDS  # Skip missed slots; never build a backlog.
-
-    def stop_test(self):
-        self.auto_watch.setChecked(False)
-        self.finish('Stopped by user; automatic watching disabled. In-flight HTTP requests may still complete.')
-
-    def finish(self, message):
-        self.stage = None
-        self.message(message)
-        self.status.setText(message + ' Check volume/mute/input on both devices.')
-        self.update_controls()
+    def update_controls(self):
+        idle = self.stage is None
+        for button in self.input_buttons:
+            button.setEnabled(idle and self.fresh('amplifier') and self.state['amplifier'].get('power') == 'on')
+        self.test.setEnabled(idle and self.tv_ready() and self.fresh('amplifier')
+                             and self.state['amplifier'].get('power') == 'on'
+                             and self.state['amplifier'].get('input') == TV_INPUT)
+        self.refresh.setEnabled(idle and 'tv' not in self.jobs)
+        for widget in (self.target, self.duration, self.final_delay, self.measure_tv, self.measure_amp, self.auto_watch):
+            widget.setEnabled(idle)
+        self.stop.setEnabled(not idle)
+        for role, label in self.labels.items():
+            age = time.monotonic() - self.audio_observed[role] if self.audio_observed[role] else None
+            label.setText(role + ': ' + json.dumps(self.state[role])
+                          + (f'  [audio sample age {age:.1f}s]' if age is not None else '  [no audio sample]'))
+        if idle and self.status.text() == 'Waiting for initial device status.' and self.tv_ready() and self.fresh('amplifier'):
+            self.status.setText('Ready: choose settings, then switch tv → usb_dac externally or with the buttons.')
 
     def tick(self):
         now = time.monotonic()
-        if self.stage:
-            if any(not self.fresh(role) for role in self.devices):
-                self.finish('Test stopped: device status became stale.')
-            elif not self.tv_target_valid():
-                self.finish('Test stopped: TV target is outside its reported range, or TV is not active.')
-            elif self.stage in ('wait_switch', 'switching', 'wait_input') and now >= self.test_deadline:
+        if self.stage in ('wait_switch', 'switching', 'wait_input'):
+            if not self.fresh('amplifier') or not self.tv_ready():
+                self.finish('Test stopped: device readiness became uncertain.')
+            elif now >= self.test_deadline:
                 self.finish('Test stopped: usb_dac was not confirmed within eight seconds.')
             elif self.stage == 'wait_switch' and 'amplifier' not in self.jobs:
                 self.stage = 'switching'
                 self.submit('amplifier', 'test switch', lambda: self.devices['amplifier'].set_input(OTHER_INPUT))
-            elif self.stage == 'burst':
-                if now >= self.burst_end:
-                    self.stage = 'observe'
-                    self.observe_end = now + OBSERVE_SECONDS
-                    self.message(f'Burst finished: {self.sent} sends started. Observing for three more seconds; no more volume commands.')
-                else:
-                    self.send_burst_if_due(now)
-                self.status.setText(
-                    f'TV burst: {self.sent} sends; amplifier baseline raw {self.baseline.get("volume")}. '
-                    if self.stage == 'burst' else 'Observing for delayed CEC reactions; no more volume commands.')
-            elif self.stage == 'observe' and now >= self.observe_end:
-                if self.changes:
-                    self.finish('RESULT: amplifier volume changes observed: ' + repr(self.changes) + '. Review the log; this does not identify their cause.')
-                else:
-                    self.finish('RESULT: no amplifier volume change observed in this test. This is not a guarantee for other timing or device states.')
-        if self.stage is None:
-            if self.manual_input is not None and 'amplifier' not in self.jobs:
-                value, self.manual_input = self.manual_input, None
-                if self.fresh('amplifier') and self.state['amplifier'].get('power') == 'on':
-                    self.submit('amplifier', 'input ' + value, lambda value=value: self.devices['amplifier'].set_input(value))
-            if self.manual_tv_target is not None and 'tv' not in self.jobs:
-                value, self.manual_tv_target = self.manual_tv_target, None
-                if self.tv_target_valid():
-                    self.submit('tv', 'set volume ' + str(value), lambda value=value: self.devices['tv'].set_tv_volume(value))
-        for role, device in self.devices.items():
-            if now >= self.next_poll[role] and role not in self.jobs:
-                # During the burst, don't let a two-request TV poll delay a due send.
-                if role == 'tv' and self.stage == 'burst' and now + .05 >= self.next_send:
-                    continue
-                self.next_poll[role] = now + POLL_SECONDS
-                self.submit(role, 'poll', device.poll)
+        elif self.stage:
+            self.drive_experiment(now)
+        if self.stage is None and self.manual_input is not None and 'amplifier' not in self.jobs:
+            value, self.manual_input = self.manual_input, None
+            if self.fresh('amplifier') and self.state['amplifier'].get('power') == 'on':
+                self.submit('amplifier', 'input ' + value, lambda value=value: self.devices['amplifier'].set_input(value))
+        if now >= self.next_poll['amplifier'] and 'amplifier' not in self.jobs:
+            self.submit('amplifier', 'monitor', self.devices['amplifier'].poll)
+        if self.stage is None and not self.tv_initialized and now >= self.next_poll['tv'] and 'tv' not in self.jobs:
+            self.submit('tv', 'initial', self.devices['tv'].poll)
         self.update_controls()
 
     def save_log(self):
@@ -424,6 +588,7 @@ class Window(QMainWindow):
 
     def closeEvent(self, event):
         self.closed = True
+        self.cancelled.set()
         self.stage = None
         self.timer.stop()
         self.pool.clear()
@@ -442,7 +607,7 @@ def main():
         return 1
     window.show()
     result = app.exec()
-    window.pool.waitForDone()  # Keep workers alive until bounded in-flight requests finish.
+    window.pool.waitForDone()
     return result
 
 

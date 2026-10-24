@@ -55,6 +55,7 @@ class Simulation:
     def device(self, role):
         class Fake:
             def poll(inner):return self.call(role, 'poll')
+            def power(inner):return self.call(role, 'power')['power']
             def set_input(inner,value):return self.call(role,'input',value)
             def set_tv_volume(inner,value):return self.call(role,'volume',value)
         return Fake()
@@ -64,68 +65,145 @@ class Tests(unittest.TestCase):
     def setUpClass(cls):
         cls.app = QApplication.instance() or QApplication([])
         cls.app.setQuitOnLastWindowClosed(False)
-    def wait(self, predicate, seconds=3):
+
+    def wait(self, predicate, seconds=4):
         deadline = time.monotonic() + seconds
         while time.monotonic() < deadline:
             self.app.processEvents()
-            if predicate():return
+            if predicate():
+                return
             time.sleep(.002)
         self.fail('Timeout waiting; ' + self.w.log.toPlainText())
-    def window(self, simulation):
-        timing = patch.dict(G, BURST_SECONDS=.25, OBSERVE_SECONDS=.12, SEND_SECONDS=.05, POLL_SECONDS=.03)
-        timing.start(); self.addCleanup(timing.stop)
-        self.w = R['Window']({'Host':'127.0.0.1','PreSharedKey':'dummy'}, {'Host':'127.0.0.1'})
-        self.w.devices = {role:simulation.device(role) for role in ('tv','amplifier')}
-        self.w.show()
-        def cleanup():
-            self.w.close()
-            self.w.pool.waitForDone()
-            self.app.processEvents()
-            self.w.deleteLater()
-            QCoreApplication.sendPostedEvents(None,QEvent.DeferredDelete)
-        self.addCleanup(cleanup)
-        self.wait(lambda:self.w.fresh('tv') and self.w.fresh('amplifier'))
-    def test_no_leak(self):
-        sim=Simulation()
-        self.window(sim)
-        self.w.start_test()
-        self.wait(lambda:self.w.status.text().startswith('RESULT'))
-        self.assertFalse(self.w.changes)
-        self.assertGreater(self.w.sent,0)
-        self.assertLessEqual(self.w.sent,5)
-        self.assertEqual(sim.maximum,dict(tv=1,amplifier=1))
-        sends=[e for e in sim.events if e[2]=='volume']
-        self.assertTrue(all(e[4]=='usb_dac' for e in sends))
-        usb_reads=[e[0] for e in sim.events if e[1]=='amplifier' and e[2]=='poll' and e[4]=='usb_dac']
-        self.assertLess(min(usb_reads), sends[0][0])
-        self.assertLess(sends[-1][0],self.w.burst_end)
-        self.assertEqual(sim.tv_volume,10)
-    def test_leak_detected(self):
-        sim=Simulation(leak=True)
-        self.window(sim);self.w.start_test()
-        self.wait(lambda:self.w.status.text().startswith('RESULT'))
-        self.assertTrue(self.w.changes)
-        self.assertIn('AMPLIFIER VOLUME CHANGED',self.w.log.toPlainText())
-    def test_stop_never_queues_more_volume(self):
-        sim=Simulation(latency=.02)
-        self.window(sim);self.w.start_test()
-        self.wait(lambda:self.w.sent>0)
-        self.w.stop_test()
-        deadline=time.monotonic()+.3
-        while time.monotonic()<deadline:self.app.processEvents();time.sleep(.002)
-        self.assertEqual(len([e for e in sim.events if e[2]=='volume']),1)
-    def test_failure_stops(self):
-        sim=Simulation(fail=True)
-        self.window(sim);self.w.start_test()
-        self.wait(lambda:self.w.stage is None and 'failure' in self.w.status.text())
-        self.assertEqual(self.w.sent,1)
+
     def settle(self, seconds=.2):
         deadline = time.monotonic() + seconds
         while time.monotonic() < deadline:
             self.app.processEvents()
             time.sleep(.002)
 
-    def test_external_input_change_automatically_starts_burst(self):
+    def window(self, simulation, tv=True, amp=True, duration=250):
+        timing = patch.dict(G, SEND_SECONDS=.05, POLL_SECONDS=.03)
+        timing.start()
+        self.addCleanup(timing.stop)
+        self.w = R['Window']({'Host':'127.0.0.1','PreSharedKey':'dummy'}, {'Host':'127.0.0.1'})
+        self.w.devices = {role:simulation.device(role) for role in ('tv','amplifier')}
+        self.w.duration.setValue(duration)
+        self.w.measure_tv.setChecked(tv)
+        self.w.measure_amp.setChecked(amp)
+        self.submissions = []
+        original = self.w.submit
+        def submit(role, kind, function, allowed=None):
+            accepted = original(role, kind, function, allowed)
+            if accepted:
+                self.submissions.append((time.monotonic(), role, kind))
+            return accepted
+        self.w.submit = submit
+        self.w.show()
+        window = self.w
+        def cleanup():
+            window.close()
+            window.pool.waitForDone()
+            self.app.processEvents()
+            window.deleteLater()
+            QCoreApplication.sendPostedEvents(None,QEvent.DeferredDelete)
+        self.addCleanup(cleanup)
+        self.wait(lambda:self.w.tv_ready() and self.w.fresh('amplifier'))
+
+    def run_button(self):
+        self.w.start_test()
+        self.wait(lambda:self.w.status.text().startswith('RESULT'))
+
+    def test_no_leak_and_full_measurement_rounds(self):
+        sim = Simulation()
+        self.window(sim)
+        self.run_button()
+        self.assertFalse(self.w.changes)
+        self.assertGreater(self.w.sent, 0)
+        self.assertLessEqual(self.w.sent, 5)
+        self.assertEqual(sim.maximum, dict(tv=1, amplifier=1))
+        sends = [event for event in sim.events if event[2] == 'volume']
+        self.assertTrue(all(event[4] == 'usb_dac' for event in sends))
+        self.assertLess(sends[-1][0], self.w.repeat_end)
+        kinds = [kind for _, role, kind in self.submissions if role == 'tv']
+        self.assertEqual(kinds.count('measure pre'), 1)
+        self.assertEqual(kinds.count('measure post'), self.w.sent)
+        self.assertEqual(kinds.count('measure final'), 1)
+        self.assertEqual(sim.tv_volume, 10)
+        self.assertIn('pre measurement REUSED', self.w.log.toPlainText())
+
+    def test_leak_detected_with_only_required_amplifier_monitoring(self):
+        sim = Simulation(leak=True)
+        self.window(sim, tv=False, amp=False)
+        self.run_button()
+        self.assertTrue(self.w.changes)
+        self.assertIn('TV volume effect unmeasured', self.w.status.text())
+        self.assertFalse(any(kind.startswith('measure') for _, _, kind in self.submissions))
+        tv_calls = [kind for started, role, kind in self.submissions
+                    if role == 'tv' and self.w.detected_at <= started <= self.w.last_send_finished]
+        self.assertTrue(all(kind == 'volume' for kind in tv_calls), tv_calls)
+        total = len([event for event in sim.events if event[1] == 'tv'])
+        self.settle(.15)
+        self.assertEqual(len([event for event in sim.events if event[1] == 'tv']), total)
+
+    def test_zero_duration_sends_once_then_final_round(self):
+        sim = Simulation()
+        self.window(sim, duration=0)
+        self.run_button()
+        self.assertEqual(self.w.sent, 1)
+        self.assertEqual(self.w.skipped, 0)
+        self.assertEqual(len([e for e in sim.events if e[2] == 'volume']), 1)
+        self.assertEqual(len([s for s in self.submissions if s[1:] == ('tv','measure final')]), 1)
+
+    def test_measurement_toggles_are_independent(self):
+        for tv, amp in ((True, False), (False, True)):
+            sim = Simulation()
+            self.window(sim, tv=tv, amp=amp, duration=0)
+            self.run_button()
+            reads = [(role, kind) for _, role, kind in self.submissions if kind.startswith('measure')]
+            self.assertEqual(any(role == 'tv' for role, _ in reads), tv)
+            self.assertEqual(any(role == 'amplifier' for role, _ in reads), amp)
+            # Each iteration closes its window before creating the next fixture.
+            self.w.close()
+            self.w.pool.waitForDone()
+            self.app.processEvents()
+
+    def test_slow_reads_skip_slots_without_backlog(self):
+        sim = Simulation(latency=.08)
+        self.window(sim, duration=250)
+        self.run_button()
+        self.assertGreater(self.w.skipped, 0)
+        self.assertLess(self.w.sent, 5)
+        self.assertIn('SKIPPED', self.w.log.toPlainText())
+        self.assertEqual(sim.maximum, dict(tv=1, amplifier=1))
+        self.assertTrue(all(e[0] < self.w.repeat_end for e in sim.events if e[2] == 'volume'))
+
+    def test_final_delay_is_separate_from_repeat_window(self):
+        sim = Simulation()
+        self.window(sim, duration=0)
+        self.w.final_delay.setValue(100)
+        self.run_button()
+        final = next(started for started, role, kind in self.submissions if role == 'tv' and kind == 'measure final')
+        self.assertGreaterEqual(final - self.w.last_send_finished, .095)
+        self.assertEqual(self.w.sent, 1)
+
+    def test_stop_disarms_and_never_queues_more_volume(self):
+        sim = Simulation(latency=.02)
+        self.window(sim)
+        self.w.start_test()
+        self.wait(lambda:self.w.sent > 0)
+        self.w.stop_test()
+        self.settle(.3)
+        self.assertFalse(self.w.auto_watch.isChecked())
+        self.assertEqual(len([e for e in sim.events if e[2] == 'volume']), 1)
+
+    def test_failure_stops_without_retry(self):
+        sim = Simulation(fail=True)
+        self.window(sim)
+        self.w.start_test()
+        self.wait(lambda:self.w.stage is None and 'failure' in self.w.status.text())
+        self.assertEqual(self.w.sent, 1)
+
+    def test_external_input_change_starts_automatically(self):
         sim = Simulation(leak=True)
         self.window(sim)
         with sim.lock:
@@ -133,63 +211,57 @@ class Tests(unittest.TestCase):
         self.wait(lambda:self.w.status.text().startswith('RESULT'))
         self.assertGreater(self.w.sent, 0)
         self.assertTrue(self.w.changes)
-        self.assertFalse(any(event[2] == 'input' for event in sim.events))
-        self.assertIn('AUTO detected tv', self.w.log.toPlainText())
-        self.assertIn('REQUEST START', self.w.log.toPlainText())
-        self.assertIn('after usb_dac detection', self.w.log.toPlainText())
+        self.assertFalse(any(e[2] == 'input' for e in sim.events))
+        self.assertIn('AUTO tv', self.w.log.toPlainText())
         count = self.w.sent
         self.settle()
         self.assertEqual(self.w.sent, count)
 
-    def test_initial_usb_dac_does_not_trigger_a_burst(self):
+    def test_initial_usb_dac_and_disabled_watch_do_not_send(self):
         sim = Simulation()
         sim.input = 'usb_dac'
         self.window(sim)
         self.settle()
         self.assertIsNone(self.w.stage)
-        self.assertFalse(any(event[2] == 'volume' for event in sim.events))
-
-    def test_automatic_watch_can_be_disabled(self):
-        sim = Simulation()
-        self.window(sim)
+        self.assertFalse(any(e[2] == 'volume' for e in sim.events))
         self.w.auto_watch.setChecked(False)
         with sim.lock:
-            sim.input = 'usb_dac'
-        self.wait(lambda:self.w.state['amplifier']['input'] == 'usb_dac')
-        self.settle()
-        self.assertIsNone(self.w.stage)
-        self.assertFalse(any(event[2] == 'volume' for event in sim.events))
-
-    def test_stop_disarms_watch_before_late_input_confirmation(self):
-        sim = Simulation()
-        self.window(sim)
-        self.w.start_test()
-        self.w.stop_test()
-        self.assertFalse(self.w.auto_watch.isChecked())
+            sim.input = 'tv'
+        self.wait(lambda:self.w.state['amplifier']['input'] == 'tv')
         with sim.lock:
             sim.input = 'usb_dac'
         self.settle()
-        self.assertIsNone(self.w.stage)
-        self.assertFalse(any(event[2] == 'volume' for event in sim.events))
+        self.assertFalse(any(e[2] == 'volume' for e in sim.events))
 
-    def test_config_and_exact_tv_method(self):
+    def test_cancelled_worker_does_not_send(self):
+        called = MagicMock()
+        job = R['Job']('tv', 'volume', called, allowed=lambda started:False)
+        job.run()
+        called.assert_not_called()
+
+    def test_config_and_exact_tv_method_with_http_timing(self):
         with tempfile.TemporaryDirectory() as folder:
-            root=Path(folder)
-            a=root/'SonyRemote.json';b=root/'YamahaRemote.json'
-            a.write_text(json.dumps(dict(Host='tv.local',PreSharedKey='SECRET',Ignored=True)))
+            root = Path(folder)
+            a, b = root / 'SonyRemote.json', root / 'YamahaRemote.json'
+            a.write_text(json.dumps(dict(Host='tv.local', PreSharedKey='SECRET', Ignored=True)))
             b.write_text(json.dumps(dict(Host='amp.local')))
-            initial=[p.read_bytes() for p in (a,b)]
-            tv,amp=R['load_settings'](root)
-            self.assertEqual(initial,[p.read_bytes() for p in (a,b)])
-            device=R['Device'](tv,'tv')
-            opener=MagicMock()
-            opener.open.return_value.__enter__.return_value.read.return_value=b'{"result":[0]}'
-            with patch.dict(G,OPENER=opener):device.set_tv_volume(10)
-            request=opener.open.call_args.args[0]
-            data=json.loads(request.data)
-            self.assertEqual(data['method'],'setAudioVolume')
-            self.assertEqual(data['version'],'1.2')
-            self.assertEqual(data['params'],[dict(target='speaker',volume='10',ui='on')])
-            self.assertEqual(request.get_header('X-auth-psk'),'SECRET')
+            initial = [p.read_bytes() for p in (a,b)]
+            tv, amp = R['load_settings'](root)
+            self.assertEqual(initial, [p.read_bytes() for p in (a,b)])
+            trace = MagicMock()
+            device = R['Device'](tv, 'tv', trace)
+            opener = MagicMock()
+            opener.open.return_value.__enter__.return_value.read.return_value = b'{"result":[0]}'
+            with patch.dict(G, OPENER=opener):
+                device.set_tv_volume(10)
+            request = opener.open.call_args.args[0]
+            data = json.loads(request.data)
+            self.assertEqual(data['method'], 'setAudioVolume')
+            self.assertEqual(data['version'], '1.2')
+            self.assertEqual(data['params'], [dict(target='speaker', volume='10', ui='on')])
+            self.assertEqual(trace.call_args.args[:2], ('tv', 'audio/setAudioVolume'))
+            self.assertTrue(trace.call_args.args[-1])
+            self.assertNotIn('SECRET', repr(trace.call_args))
 
-if __name__=='__main__':unittest.main()
+if __name__ == '__main__':
+    unittest.main()
