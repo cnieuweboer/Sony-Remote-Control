@@ -75,6 +75,7 @@ Set:
   "NavigationControlsCompact": false,
   "InputControls": false,
   "VolumeControls": true,
+  "VolumeRateLimit": {"Active": true, "RateMs": 600, "VerificationDelayMs": 500},
   "AmplifierTVInput": "",
   "PlaybackControls": true,
   "DiagnosticsEnabled": false,
@@ -98,6 +99,7 @@ Set:
 - `NavigationControlsCompact` — `false` (default) gives Input/Settings and Back/Home their own two-button rows; `true` places them in the corners of the three-by-three navigation grid.
 - `InputControls` — show the input selector and favorite input buttons.
 - `VolumeControls` — show volume and mute controls.
+- `VolumeRateLimit` — when active, TV volume changes use absolute targets, waiting `RateMs` after each command and an extra `VerificationDelayMs` to confirm a target reading. Defaults are 600/500 ms; disabled uses direct relative commands, and amplifier IPC routing is unaffected.
 - `DefaultTvVolume` — optionally set TV speaker volume after the amplifier leaves its configured TV input: `{"Volume": 10, "DelayMs": 1000, "RepeatCount": 0, "RepeatIntervalMs": 200}`. Set `Volume` to `null` to disable it; `RepeatCount` is the number of additional sends (zero sends once), and `RepeatIntervalMs` is the wait after each completed command before the next send. Choose a delay long enough for CEC to release the amplifier; changing volume or mute cancels the sequence.
 - `PlaybackControls` — show media playback controls.
 - `SMTCPlaybackKeys` — `false` by default. On Windows, use SMTC for global playback keys and disable focused interception of physical playback keys; requires the optional packages above. Participation pauses when the TV is unavailable or during calibration. Active amplifier global bindings take priority over conflicting playback keys.

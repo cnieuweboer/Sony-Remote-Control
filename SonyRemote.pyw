@@ -580,7 +580,7 @@ class CalibrationServer(QObject):
 APP_NAME = "Sony Remote"
 
 
-__version__ = "2026.10.24.6"
+__version__ = "2026.10.24.7"
 
 
 CONFIG_PATH = Path(__file__).resolve().with_name("SonyRemote.json")
@@ -715,7 +715,8 @@ DEFAULT_CONFIG = {
     "DefaultTvVolume": {"Volume": None, "DelayMs": 1000, "RepeatCount": 0, "RepeatIntervalMs": 200},
     "VolumeRateLimit": {
         "Active": True,
-        "RateMs": 500,
+        "RateMs": 600,
+        "VerificationDelayMs": 500,
     },
     "DiagnosticsEnabled": False,
     "SMTCPlaybackKeys": False,
@@ -1101,16 +1102,13 @@ def validate_config(raw_config, *, allow_incomplete=False):
     rate_limit = config["VolumeRateLimit"]
     if not isinstance(rate_limit, dict):
         raise ConfigError('"VolumeRateLimit" must be an object.')
-    if set(rate_limit) - {"Active", "RateMs"}:
+    if set(rate_limit) - set(DEFAULT_CONFIG["VolumeRateLimit"]):
         raise ConfigError('"VolumeRateLimit" has unknown fields.')
-    normalized_rate_limit = DEFAULT_CONFIG["VolumeRateLimit"].copy()
-    normalized_rate_limit.update(rate_limit)
-    if not isinstance(normalized_rate_limit["Active"], bool):
+    if not isinstance(rate_limit["Active"], bool):
         raise ConfigError('"VolumeRateLimit.Active" must be true or false.')
-    rate_ms = normalized_rate_limit["RateMs"]
-    if isinstance(rate_ms, bool) or not isinstance(rate_ms, int) or rate_ms < 1:
-        raise ConfigError('"VolumeRateLimit.RateMs" must be a positive integer.')
-    config["VolumeRateLimit"] = normalized_rate_limit
+    for key in ("RateMs", "VerificationDelayMs"):
+        if type(rate_limit[key]) is not int or rate_limit[key] < 1:
+            raise ConfigError(f'"VolumeRateLimit.{key}" must be a positive integer.')
 
     sequence = config["TextInputSubmitSequence"]
     if (not isinstance(sequence, list) or not sequence
@@ -2938,6 +2936,9 @@ class SonyRemote(QMainWindow):
         self._volume_rate_loop_running = False
         self._volume_rate_step_running = False
         self._volume_rate_progress = None
+        self._volume_rate_phase = "read"
+        self._volume_rate_due = 0.0
+        self._volume_rate_candidate = None
         self._pending_volume_commands = 0
         self._volume_generation = 0
 
@@ -4219,6 +4220,9 @@ class SonyRemote(QMainWindow):
             return
 
         if not self._volume_rate_loop_running:
+            self._volume_rate_phase = "read"
+            self._volume_rate_due = 0.0
+            self._volume_rate_candidate = None
             self._volume_rate_progress = None
             self._volume_rate_loop_running = True
             self._schedule_volume_rate_step(0)
@@ -4231,86 +4235,138 @@ class SonyRemote(QMainWindow):
         self.volume_rate_timer.start(max(0, int(delay_ms)))
 
     def _volume_rate_step(self):
-        if (
-            self._shutting_down
-            or self._use_amplifier()
-            or not self._volume_rate_loop_running
-            or self._volume_rate_step_running
-            or self._desired_volume is None
-        ):
+        if (self._shutting_down or self._use_amplifier()
+                or not self._volume_rate_loop_running or self._volume_rate_step_running
+                or self._desired_volume is None):
             return
-
+        if self._calibration_blocked() or self.last_power != "active":
+            self._volume_rate_loop_running = False
+            self._desired_volume = None
+            self.volume_rate_timer.stop()
+            return
         self._volume_rate_step_running = True
         epoch = getattr(self, "_volume_route_epoch", 0)
+        generation, target = self._volume_generation, self._desired_volume
+        phase = self._volume_rate_phase
+        candidate = self._volume_rate_candidate
+        due = self._volume_rate_due
+
+        def current_intent():
+            return (not self._shutting_down and not self._calibration_blocked()
+                    and self.last_power == "active" and not self._use_amplifier()
+                    and self._volume_rate_loop_running
+                    and epoch == getattr(self, "_volume_route_epoch", 0)
+                    and generation == self._volume_generation)
 
         def step():
+            # Qt timers may fire slightly early. Enforce silence at the API boundary.
+            if time.monotonic() < due:
+                return {"deferred": due}
+            if not current_intent():
+                return {"superseded": True}
             info = self.api.get_volume()
             observed_at = time.monotonic()
-            current = int(info.get("volume", 0))
-            target = self._desired_volume
-            if (epoch != getattr(self, "_volume_route_epoch", 0)
-                    or self._use_amplifier() or not self._volume_rate_loop_running
-                    or target is None or current == target):
-                return {"done": True, "info": info, "observed_at": observed_at}
-            generation = self._volume_generation
-            progress = getattr(self, "_volume_rate_progress", None)
+            result = {"info": info, "observed_at": observed_at}
+            if not current_intent():
+                return dict(result, superseded=True)
+            current = int(info["volume"])
+            if candidate is not None and candidate[0] != generation and current == candidate[1]:
+                # A newer target must not infer its direction from the previous
+                # command's requested-value echo. Confirm that baseline first.
+                return dict(result, phase="verify", candidate=(generation, current),
+                            due=observed_at + self.config["VolumeRateLimit"]["VerificationDelayMs"] / 1000)
+            if current == target:
+                # A target echo is provisional and never advances progress tracking.
+                if phase == "verify" and candidate == (generation, target):
+                    return dict(result, done=True)
+                return dict(result, phase="verify",
+                            due=observed_at + self.config["VolumeRateLimit"]["VerificationDelayMs"] / 1000)
+            progress = self._volume_rate_progress
             if progress is not None and progress[:2] == (epoch, generation):
                 _, _, direction, best, progressed_at = progress
                 crossed = direction * (current - target) > 0
                 if direction * (current - best) > 0:
                     best, progressed_at = current, observed_at
-                stalled = observed_at - progressed_at >= VOLUME_NO_PROGRESS_SECONDS
-                if crossed or stalled:
-                    return {"done": True, "stopped_generation": generation,
-                            "info": info, "observed_at": observed_at}
+                if crossed or observed_at - progressed_at >= VOLUME_NO_PROGRESS_SECONDS:
+                    return dict(result, done=True)
             else:
                 direction = 1 if current < target else -1
                 best, progressed_at = current, observed_at
             self._volume_rate_progress = (epoch, generation, direction, best, progressed_at)
-            self.api.adjust_volume(direction)
-            return {"done": False, "info": info, "observed_at": observed_at}
+            if not current_intent():
+                return dict(result, superseded=True)
+            self.api.set_volume(target)
+            # Quiet time begins after the actual command finishes, not at queueing.
+            return dict(result, phase="read", command_sent=True,
+                        due=time.monotonic() + self.config["VolumeRateLimit"]["RateMs"] / 1000)
+
+        def schedule(ready_at=0.0):
+            self._volume_rate_due = ready_at
+            self._schedule_volume_rate_step(max(0, math.ceil((ready_at - time.monotonic()) * 1000)))
 
         def done(result):
             self._volume_rate_step_running = False
             if epoch != getattr(self, "_volume_route_epoch", 0):
                 if self._volume_rate_loop_running:
-                    self._schedule_volume_rate_step(0)
+                    schedule(result.get("due", 0.0) if result.get("command_sent") else 0.0)
                 return
-            if self._use_amplifier() or not self._volume_rate_loop_running:
+            if self._shutting_down or self._use_amplifier() or not self._volume_rate_loop_running:
                 return
-            info = result.get("info")
-            if not self._accept_volume_status(info, result["observed_at"]):
-                self._schedule_volume_rate_step()
+            if self._calibration_blocked() or self.last_power != "active":
+                self._volume_rate_loop_running = False
+                self._desired_volume = None
+                self.volume_rate_timer.stop()
                 return
-            # A newer keypress may have changed the target while this result
-            # waited for GUI delivery. Only finish against the current target.
-            finished = result.get("done") and (
-                self._desired_volume is None
-                or int(info.get("volume", 0)) == self._desired_volume
-                or result.get("stopped_generation") == self._volume_generation
-            )
+            if "deferred" in result:
+                schedule(result["deferred"])
+                return
+            accepted_observation = True
+            if result.get("info") is not None:
+                accepted_observation = self._accept_volume_status(result["info"], result["observed_at"])
+                self._status_sequence += 1
+            newer_intent = (generation != self._volume_generation or result.get("superseded")
+                            or not accepted_observation)
+            finished = result.get("done") and not newer_intent
             if finished:
                 self._volume_rate_loop_running = False
                 self._desired_volume = None
                 self._volume_rate_progress = None
-            self._status_sequence += 1
+                self._volume_rate_phase = "read"
+                self._volume_rate_candidate = None
+                self._volume_rate_due = 0.0
+            elif newer_intent:
+                self._volume_rate_phase = "read"
+                self._volume_rate_candidate = (generation, target) if result.get("command_sent") else candidate
+            else:
+                self._volume_rate_phase = result["phase"]
+                self._volume_rate_candidate = (result.get("candidate", (generation, target))
+                    if result["phase"] == "verify" or result.get("command_sent") else None)
             if self.config["VolumeControls"]:
-                self.update_volume_ui(self.last_volume)
+                self.update_volume_ui(self.last_volume or {})
             if self.calibration_server is not None:
                 self.calibration_server.publish()
             if finished:
                 self._request_poll(200, groups={"volume"})
             else:
-                self._schedule_volume_rate_step()
+                # A newer press may skip an old verification, but never a command's quiet time.
+                ready_at = result.get("due", 0.0) if result.get("command_sent") or not newer_intent else 0.0
+                if not accepted_observation:
+                    ready_at = max(ready_at, time.monotonic() + self.config["VolumeRateLimit"]["RateMs"] / 1000)
+                schedule(ready_at)
 
         def failed(error):
             self._volume_rate_step_running = False
-            if epoch != getattr(self, "_volume_route_epoch", 0):
+            if self._shutting_down or not self._volume_rate_loop_running:
+                return
+            if epoch != getattr(self, "_volume_route_epoch", 0) or generation != self._volume_generation:
                 if self._volume_rate_loop_running:
-                    self._schedule_volume_rate_step(0)
+                    self._volume_rate_phase = "read"
+                    self._volume_rate_candidate = None
+                    schedule(time.monotonic() + self.config["VolumeRateLimit"]["RateMs"] / 1000)
                 return
             self._volume_rate_loop_running = False
             self._desired_volume = None
+            self._volume_rate_progress = None
             self.handle_request_error(error)
             self._request_poll(200, groups={"volume"})
 
@@ -4750,7 +4806,9 @@ class SonyRemote(QMainWindow):
             "rate_limit": copy.deepcopy(self.config["VolumeRateLimit"]), "limiter_running": self._volume_rate_loop_running,
             "step_running": self._volume_rate_step_running, "pending_count": self._pending_volume_commands,
             "active_command_workers": len(self._command_workers),
-            "rate_timer_active": self.volume_rate_timer.isActive()}
+            "rate_timer_active": self.volume_rate_timer.isActive(),
+            "phase": self._volume_rate_phase,
+            "next_read_in_seconds": round(max(0, self._volume_rate_due - now), 3)}
         report["polling"]["held_groups"] = dict(self.polling._commands)
         return report
 

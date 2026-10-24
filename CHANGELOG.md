@@ -4,6 +4,8 @@ Release identifiers below come from the corresponding commits. Some releases upd
 
 ## 2026-10-24
 
+- Sony Remote 2026.10.24.7 — Use verified absolute targets for rate-limited TV volume control, with a 600 ms default command quiet period and new VerificationDelayMs (500 ms). Resume after provisional target rollback without resetting no-progress tracking; preserve newer keypresses, cancellation, amplifier IPC routing and direct relative control when disabled. Preserve existing JSON rate values and fill missing settings automatically.
+
 - TVVolumeSettlePrototype 2026.10.24.4 — Add an independent absolute-mode quiet period measured after command completion, replacing the relative interval before volume reads. Use the separate confirmation delay only for apparent target arrivals, log quiet-period timing and disable irrelevant interval controls. The normal remote is unchanged.
 
 - TVVolumeSettlePrototype 2026.10.24.3 — Verify every provisional target reading and continue in the original direction after rollback, in both command modes. Replace single-correction behavior with bounded verification/retry; requested-value echoes never reset the no-progress timer. The normal remote is unchanged.

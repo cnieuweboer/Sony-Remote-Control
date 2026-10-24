@@ -20,8 +20,9 @@
   "PlaybackControls": true,
   "VolumeControls": true,
   "VolumeRateLimit": {
-    "Active": false,
-    "RateMs": 300
+    "Active": true,
+    "RateMs": 600,
+    "VerificationDelayMs": 500
   },
   "DiagnosticsEnabled": false,
   "SMTCPlaybackKeys": false,

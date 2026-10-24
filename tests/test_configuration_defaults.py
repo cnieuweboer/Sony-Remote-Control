@@ -54,10 +54,20 @@ class ConfigurationDefaultsTests(unittest.TestCase):
             self.assertEqual(saved['Shortcuts']['Mute'], [])
             self.assertEqual(saved['Inputs'], {})
             if NAME == 'Sony':
-                self.assertEqual(saved['VolumeRateLimit'], {'Active': False, 'RateMs': 500})
+                self.assertEqual(saved['VolumeRateLimit'], {'Active': False, 'RateMs': 600, 'VerificationDelayMs': 500})
                 self.assertEqual(saved['DefaultTvVolume']['Volume'], None)
             else:
                 self.assertEqual(saved['GlobalShortcuts']['VolumeUp'], [])
+
+    @unittest.skipUnless(NAME == 'Sony', 'TV volume verification setting')
+    def test_existing_rate_is_preserved_when_verification_is_added(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / 'remote.json'
+            path.write_text(json.dumps({'VolumeRateLimit': {'Active': True, 'RateMs': 300}}))
+            with patch.dict(R['load_config'].__globals__, CONFIG_PATH=path):
+                R['load_config']()
+            self.assertEqual(json.loads(path.read_text())['VolumeRateLimit'],
+                             {'Active': True, 'RateMs': 300, 'VerificationDelayMs': 500})
 
     def test_invalid_existing_values_do_not_get_repaired_or_saved(self):
         for raw in ({'DarkMode': None}, {'Shortcuts': None}, {'Unknown': True}):

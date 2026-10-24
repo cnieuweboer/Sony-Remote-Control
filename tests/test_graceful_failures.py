@@ -57,6 +57,9 @@ class Device:
         self.request('volume')
         return {'volume': 20, 'mute': False, 'minVolume': 0, 'maxVolume': 100}
 
+    def set_volume(self, target):
+        self.request('set_volume')
+
     def resolve_remote_command(self, name):
         return REMOTE['SonyApi'].resolve_remote_command(self, name)
 
@@ -646,7 +649,7 @@ class DiscoveryTests(unittest.TestCase):
         self.window._volume_rate_loop_running = True
         self.window.poll_running = True
         self.device.get_volume = Mock(return_value={'volume': 25, 'mute': True})
-        self.device.adjust_volume = Mock()
+        self.device.set_volume = Mock()
         jobs = []
         power_time = self.window._status_observed_at
         with patch.object(self.window, 'run_command', side_effect=lambda function, **callbacks:
@@ -658,7 +661,7 @@ class DiscoveryTests(unittest.TestCase):
         callbacks['on_result'](result)
         self.window.poll_running = False
         self.device.get_volume.assert_called_once()
-        self.device.adjust_volume.assert_called_once_with(1)
+        self.device.set_volume.assert_called_once_with(40)
         self.assertEqual(self.window.volume_value.text(), '40')
         self.assertEqual(self.window.mute_button.text(), 'Unmute')
         self.assertEqual(self.window.last_volume['volume'], 25)
@@ -692,6 +695,44 @@ class DiscoveryTests(unittest.TestCase):
         self.assertEqual(self.window._volume_observed_at, observed_at)
         self.assertEqual(self.window.volume_value.text(), '40')
         self.assertEqual(self.window.mute_button.text(), 'Unmute')
+
+    def drive_verified_volume(self, cec):
+        self.settle_volume_controls()
+        self.window.config['VolumeRateLimit'].update(RateMs=15, VerificationDelayMs=10)
+        state = {'actual': 20, 'echo': None}
+        events = []
+        def read():
+            value = state['actual'] if state['echo'] is None else state['echo']
+            state['echo'] = None
+            events.append(('read', time.monotonic(), value))
+            return {'volume': value, 'mute': True, 'minVolume': 0, 'maxVolume': 100}
+        def command(target):
+            events.append(('command', time.monotonic(), target))
+            state['actual'] = state['actual'] + 1 if cec else target
+            if cec:
+                state['echo'] = target
+        self.device.get_volume = read
+        self.device.set_volume = command
+        self.window.adjust_volume(3)
+        self.wait(lambda: not self.window._volume_rate_loop_running)
+        commands = [item for item in events if item[0] == 'command']
+        self.assertEqual([item[2] for item in commands], [23] * (3 if cec else 1))
+        self.assertEqual(state['actual'], 23)
+        self.assertEqual(self.window.volume_value.text(), '23')
+        self.assertEqual(self.window.mute_button.text(), 'Unmute')
+        self.assertIsNone(self.window._desired_volume)
+        for index, event in enumerate(events):
+            if event[0] == 'command':
+                self.assertEqual(events[index+1][0], 'read')
+                self.assertGreaterEqual(events[index+1][1] - event[1], .015)
+        self.assertEqual([item[2] for item in events[-2:]], [23, 23])
+        self.assertGreaterEqual(events[-1][1] - events[-2][1], .01)
+
+    def test_verified_absolute_loop_sends_one_command_for_tv_speakers(self):
+        self.drive_verified_volume(cec=False)
+
+    def test_verified_absolute_loop_recovers_from_cec_requested_value_echoes(self):
+        self.drive_verified_volume(cec=True)
 
     def test_volume_polling_resumes_after_limiter_stops(self):
         self.settle_volume_controls()
