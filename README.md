@@ -133,7 +133,7 @@ Edit `Shortcuts` to replace focused keyboard bindings; each action accepts a lis
 
 Additional TV commands can be added by their exact advertised name, for example `"Guide": ["F1"]`. Find available names in `--dump-state-full` under `polling_responses` → `system/getRemoteControllerInfo`; commands not advertised by the TV stay inactive and are listed in dump diagnostics.
 
-For a complete reference of supported key names and shortcut syntax, see [KEYBOARD_SHORTCUTS](KEYBOARD_SHORTCUTS.md).
+For supported key names and shortcut syntax, see [KEYBOARD_SHORTCUTS](KEYBOARD_SHORTCUTS.md). Mouse button and wheel names can also be added to the same `Shortcuts` lists; see [mouse bindings](KEYBOARD_SHORTCUTS.md#mouse-bindings).
 
 ## Direct amplifier volume
 

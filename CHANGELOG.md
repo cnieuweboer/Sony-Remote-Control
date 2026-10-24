@@ -4,6 +4,8 @@ Release identifiers below come from the corresponding commits. Some releases upd
 
 ## 2026-10-24
 
+- Sony Remote 2026.10.24.8 — Support focused MouseMiddle/MouseBack/MouseForward and WheelUp/Down/Left/Right bindings in Shortcuts, preserving normal dropdown/text-field interaction and keyboard-only global ownership. Include mouse bindings in button shortcut tooltips.
+
 - Sony Remote 2026.10.24.7 — Use verified absolute targets for rate-limited TV volume control, with a 600 ms default command quiet period and new VerificationDelayMs (500 ms). Resume after provisional target rollback without resetting no-progress tracking; preserve newer keypresses, cancellation, amplifier IPC routing and direct relative control when disabled. Preserve existing JSON rate values and fill missing settings automatically.
 
 - TVVolumeSettlePrototype 2026.10.24.4 — Add an independent absolute-mode quiet period measured after command completion, replacing the relative interval before volume reads. Use the separate confirmation delay only for apparent target arrivals, log quiet-period timing and disable irrelevant interval controls. The normal remote is unchanged.

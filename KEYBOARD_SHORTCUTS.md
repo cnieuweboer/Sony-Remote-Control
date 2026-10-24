@@ -16,6 +16,24 @@ This document mainly covers keys whose names are less obvious, such as the numer
 
 ---
 
+## Mouse bindings
+
+These literal names can be used in `Shortcuts` lists alongside keyboard keys, for example `"VolumeUp": ["Volume Up", "WheelUp"]`:
+
+| Name | Mouse action |
+| --- | --- |
+| `MouseMiddle` | Press the middle button / wheel |
+| `MouseBack` | Press the back side button |
+| `MouseForward` | Press the forward side button |
+| `WheelUp` | Scroll up |
+| `WheelDown` | Scroll down |
+| `WheelLeft` | Scroll / tilt left |
+| `WheelRight` | Scroll / tilt right |
+
+Mouse bindings work only over the focused remote window. Dropdowns and text fields keep normal mouse behavior. Left/right clicks are reserved; mouse names do not support modifier prefixes and cannot be used in Yamaha's `GlobalShortcuts`. Wheel directions follow the events delivered by your OS and mouse driver.
+
+---
+
 ## Modifiers
 
 The following modifiers can be added before another key:
