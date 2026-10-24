@@ -374,7 +374,7 @@ class UnrestrictedVolumePollingTests(unittest.TestCase):
         self.callbacks = []
         self.window = SimpleNamespace(
             _shutting_down=False, _amplifier_routed=False, last_power='active', _standby_confirmation_after=None,
-            _pending_volume_commands=0, _volume_generation=0,
+            _pending_volume_commands=0, _volume_generation=0, _volume_route_epoch=0,
             _volume_rate_loop_running=False, _desired_volume=None,
             _calibration_blocked=lambda: False, _route_volume_command=lambda command: False,
             config={'VolumeRateLimit': {'Active': False}},

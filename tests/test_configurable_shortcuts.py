@@ -77,7 +77,7 @@ class ShortcutConfigurationTests(unittest.TestCase):
                     document['Shortcuts'] = shortcuts
                 path.write_text(json.dumps(document), encoding='utf-8')
                 with patch.dict(load.__globals__, CONFIG_PATH=path):
-                    config = load()
+                    load()
                 saved = json.loads(path.read_text())
                 self.assertEqual(set(saved['Shortcuts']), set(REMOTE['DEFAULT_SHORTCUTS']))
                 self.assertEqual(saved['Host'], 'device.local')

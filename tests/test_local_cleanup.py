@@ -148,7 +148,7 @@ class RuntimeMappingTests(unittest.TestCase):
     def test_display_preparation_preserves_scale_and_estimates(self):
         document = self.document()
         mapping = REMOTE["prepare_volume_mapping"](document)
-        self.assertEqual((mapping["raw_min"], mapping["raw_max"], mapping["tv_min"], mapping["tv_max"]), (0, 3, 0, 2))
+        self.assertEqual(mapping["raw_max"], 3)
         self.assertEqual((mapping["tv_id"], mapping["amplifier_id"], mapping["input"]), ("tv-id", "amp-id", "tv"))
         for raw, expected in ((0, (0, False)), (1, (0.5, False)), (2, (1, True)), (3, (2, False))):
             self.assertEqual(REMOTE["mapped_tv_volume"](mapping, raw), expected)

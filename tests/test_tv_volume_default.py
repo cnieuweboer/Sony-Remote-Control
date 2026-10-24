@@ -231,6 +231,7 @@ class TvDefaultsTests(unittest.TestCase):
         w._amplifier_routed = True
         w.amplifier_state['input'] = 'tv'
         w._volume_generation = 0
+        w._volume_route_epoch = 0
         w.volume_rate_timer = Mock()
         w.calibration_active = False
         w._refresh_playback_routing = Mock()

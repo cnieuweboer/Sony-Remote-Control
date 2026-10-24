@@ -218,6 +218,8 @@ class InventoryUiTests(unittest.TestCase):
         self.assertFalse(old['Removed'])
 
     def test_periodic_input_response_is_reused_for_inventory(self):
+        # Startup may still have an ordinary input/status read in flight.
+        self.fixture.wait(lambda: not self.w.poll_running and not self.w._input_status_running)
         entries = [{'uri':'hdmi','title':'HDMI','connection':False}]
         self.w._discovery_ready.add('inputs')
         self.w._discovery_pending.clear()

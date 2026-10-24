@@ -222,7 +222,7 @@ class MappingSnapshotTests(unittest.TestCase):
         with patch.dict(GLOBALS, {'CONFIG_PATH': path}):
             reload_mapping(remote)
             self.assertEqual(path.reads, 1)
-            self.assertEqual(remote.volume_mapping['lookup'][2]['tv'], 1)
+            self.assertEqual(REMOTE['mapped_tv_volume'](remote.volume_mapping, 2)[0], 1)
             previous = remote.volume_mapping
             reload_mapping(remote)
         self.assertEqual(path.reads, 2)

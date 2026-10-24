@@ -580,7 +580,7 @@ class CalibrationServer(QObject):
 APP_NAME = "Sony Remote"
 
 
-__version__ = "2026.10.24.11"
+__version__ = "2026.10.24.12"
 
 
 CONFIG_PATH = Path(__file__).resolve().with_name("SonyRemote.json")
@@ -790,13 +790,12 @@ def prepare_volume_mapping(document):
             # Round i/N to tenths without floating-point ties, and never
             # round a member of TV bucket T into the next integer T+1.
             fraction = min(9, (20 * (raw - start) + count) // (2 * count))
-            lookup.append({"raw": raw, "tv": levels[raw],
-                           "display_tenths": 10 * levels[raw] + fraction,
+            lookup.append({"display_tenths": 10 * levels[raw] + fraction,
                            "source": "interpolated" if raw in estimated else "mapped"})
         start = end
     return {"input": document["amplifier_tv_input"],
             "tv_id": document["tv_device_id"], "amplifier_id": document["amplifier_device_id"],
-            "raw_min": 0, "raw_max": len(levels) - 1, "tv_min": levels[0], "tv_max": levels[-1],
+            "raw_max": len(levels) - 1,
             "lookup": lookup}
 
 
@@ -1198,7 +1197,6 @@ def validate_config(raw_config, *, allow_incomplete=False):
     default = config["DefaultTvVolume"]
     if not isinstance(default, dict) or set(default) - set(DEFAULT_CONFIG["DefaultTvVolume"]):
         raise ConfigError('"DefaultTvVolume" must be an object with Volume, DelayMs, RepeatCount and RepeatIntervalMs.')
-    default = dict(DEFAULT_CONFIG["DefaultTvVolume"], **default)
     if default["Volume"] is not None and (type(default["Volume"]) is not int or default["Volume"] < 0):
         raise ConfigError('"DefaultTvVolume.Volume" must be a non-negative integer or null to disable.')
     for key in ("DelayMs", "RepeatCount", "RepeatIntervalMs"):
@@ -4298,7 +4296,7 @@ class SonyRemote(QMainWindow):
         routed = self._use_amplifier()
         falling_back = self._amplifier_routed and not routed
         if routed != self._amplifier_routed:
-            self._volume_route_epoch = getattr(self, "_volume_route_epoch", 0) + 1
+            self._volume_route_epoch += 1
             self._volume_generation += 1
             self._desired_volume = None
             self._volume_rate_loop_running = False
@@ -4393,7 +4391,7 @@ class SonyRemote(QMainWindow):
             self._pending_volume_commands += 1
             def finished():
                 self._pending_volume_commands -= 1
-                if self._pending_volume_commands or epoch != getattr(self, "_volume_route_epoch", 0):
+                if self._pending_volume_commands or epoch != self._volume_route_epoch:
                     return
                 generation = self._volume_generation
                 def volume_is_idle():
@@ -4404,9 +4402,9 @@ class SonyRemote(QMainWindow):
                         return True
                     return False
                 self._request_poll(200, volume_is_idle, groups={"volume"})
-            epoch = getattr(self, "_volume_route_epoch", 0)
+            epoch = self._volume_route_epoch
             accepted = self.run_command(
-                lambda: None if self._amplifier_routed or epoch != getattr(self, "_volume_route_epoch", 0) else self.api.adjust_volume(1 if amount > 0 else -1),
+                lambda: None if self._amplifier_routed or epoch != self._volume_route_epoch else self.api.adjust_volume(1 if amount > 0 else -1),
                 on_finished=finished,
             )
             if not accepted:
@@ -4441,7 +4439,7 @@ class SonyRemote(QMainWindow):
             self.volume_rate_timer.stop()
             return
         self._volume_rate_step_running = True
-        epoch = getattr(self, "_volume_route_epoch", 0)
+        epoch = self._volume_route_epoch
         generation, target = self._volume_generation, self._desired_volume
         phase = self._volume_rate_phase
         candidate = self._volume_rate_candidate
@@ -4451,7 +4449,7 @@ class SonyRemote(QMainWindow):
             return (not self._shutting_down and not self._calibration_blocked()
                     and self.last_power == "active" and not self._use_amplifier()
                     and self._volume_rate_loop_running
-                    and epoch == getattr(self, "_volume_route_epoch", 0)
+                    and epoch == self._volume_route_epoch
                     and generation == self._volume_generation)
 
         def step():
@@ -4502,7 +4500,7 @@ class SonyRemote(QMainWindow):
 
         def done(result):
             self._volume_rate_step_running = False
-            if epoch != getattr(self, "_volume_route_epoch", 0):
+            if epoch != self._volume_route_epoch:
                 if self._volume_rate_loop_running:
                     schedule(result.get("due", 0.0) if result.get("command_sent") else 0.0)
                 return
@@ -4554,7 +4552,7 @@ class SonyRemote(QMainWindow):
             self._volume_rate_step_running = False
             if self._shutting_down or not self._volume_rate_loop_running:
                 return
-            if epoch != getattr(self, "_volume_route_epoch", 0) or generation != self._volume_generation:
+            if epoch != self._volume_route_epoch or generation != self._volume_generation:
                 if self._volume_rate_loop_running:
                     self._volume_rate_phase = "read"
                     self._volume_rate_candidate = None

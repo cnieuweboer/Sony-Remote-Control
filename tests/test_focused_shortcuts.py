@@ -7,7 +7,7 @@ from unittest.mock import Mock, patch
 from PySide6.QtCore import QEvent, Qt
 from PySide6.QtGui import QKeyEvent, QKeySequence, QShortcut, QTextCursor
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QDialog
+from PySide6.QtWidgets import QDialog
 import test_graceful_failures as fixture
 
 
