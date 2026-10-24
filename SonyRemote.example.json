@@ -35,7 +35,8 @@
   "DefaultTvVolume": {
     "Volume": null,
     "DelayMs": 1000,
-    "RepeatMs": 0
+    "RepeatCount": 0,
+    "RepeatIntervalMs": 200
   },
   "Shortcuts": {
     "VolumeUp": [

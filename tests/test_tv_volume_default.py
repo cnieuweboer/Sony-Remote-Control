@@ -13,7 +13,7 @@ R = runpy.run_path(str(Path(__file__).resolve().parents[1] / 'SonyRemote.pyw'), 
 
 class TvDefaultMigrationTests(unittest.TestCase):
     def test_missing_block_and_partial_fields_are_saved_preserving_preferences(self):
-        for settings in (None, {}, {'Volume': 12}, {'Volume': None, 'DelayMs': 750, 'RepeatMs': 600}):
+        for settings in (None, {}, {'Volume': 12}, {'Volume': None, 'DelayMs': 750, 'RepeatCount': 2, 'RepeatIntervalMs': 200}):
             with self.subTest(settings=settings), tempfile.TemporaryDirectory() as folder:
                 path = Path(folder) / 'SonyRemote.json'
                 document = R['_default_config_copy']()
@@ -35,12 +35,25 @@ class TvDefaultMigrationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / 'SonyRemote.json'
             document = R['_default_config_copy']()
-            document['DefaultTvVolume'] = {'Volume': '', 'DelayMs': 750, 'RepeatMs': 600}
+            document['DefaultTvVolume'] = {'Volume': '', 'DelayMs': 750, 'RepeatCount': 2, 'RepeatIntervalMs': 200}
             path.write_text(json.dumps(document))
             with patch.dict(R['load_config'].__globals__, CONFIG_PATH=path):
                 config = R['load_config']()
-            self.assertEqual(config['DefaultTvVolume'], {'Volume': None, 'DelayMs': 750, 'RepeatMs': 600})
+            self.assertEqual(config['DefaultTvVolume'], {'Volume': None, 'DelayMs': 750, 'RepeatCount': 2, 'RepeatIntervalMs': 200})
             self.assertEqual(json.loads(path.read_text())['DefaultTvVolume'], config['DefaultTvVolume'])
+
+    def test_old_duration_migrates_to_slot_count(self):
+        for duration, count in ((0, 0), (200, 0), (300, 1), (600, 2), (1000, 4)):
+            with self.subTest(duration=duration), tempfile.TemporaryDirectory() as folder:
+                path = Path(folder) / 'SonyRemote.json'
+                document = R['_default_config_copy']()
+                document['DefaultTvVolume'] = {'Volume': 10, 'DelayMs': 750, 'RepeatMs': duration}
+                path.write_text(json.dumps(document))
+                with patch.dict(R['load_config'].__globals__, CONFIG_PATH=path):
+                    config = R['load_config']()
+                expected = {'Volume': 10, 'DelayMs': 750, 'RepeatCount': count, 'RepeatIntervalMs': 200}
+                self.assertEqual(config['DefaultTvVolume'], expected)
+                self.assertEqual(json.loads(path.read_text())['DefaultTvVolume'], expected)
 
     def test_zero_volume_remains_enabled(self):
         config = R['validate_config']({'DefaultTvVolume': {'Volume': 0}}, allow_incomplete=True)
@@ -87,7 +100,7 @@ class TvDefaultsTests(unittest.TestCase):
     def setUp(self):
         self.w = QWidget()
         w = self.w
-        w.config = {'DefaultTvVolume': {'Volume': 10, 'DelayMs': 1000, 'RepeatMs': 0}}
+        w.config = {'DefaultTvVolume': {'Volume': 10, 'DelayMs': 1000, 'RepeatCount': 0, 'RepeatIntervalMs': 200}}
         w._shutting_down = False
         w._calibration_blocked = Mock(return_value=False)
         w.last_power = 'active'
@@ -100,6 +113,8 @@ class TvDefaultsTests(unittest.TestCase):
         self.jobs = []
         w.run_command = lambda fn, **callbacks: self.jobs.append((fn, callbacks)) or True
         self.c = R['TvVolumeDefault'](w)
+        self.c.start()
+        self.c.timer.stop()
         self.addCleanup(self.c.cancel)
         self.addCleanup(w.deleteLater)
 
@@ -138,18 +153,38 @@ class TvDefaultsTests(unittest.TestCase):
         self.execute()
         self.w.api.set_volume.assert_not_called()
 
-    def test_repeat_has_deadline_and_no_late_queued_send(self):
-        self.w.config['DefaultTvVolume']['RepeatMs'] = 1000
-        with patch.object(R['time'], 'monotonic', return_value=20):
+    def test_exact_repeat_count_despite_slow_work(self):
+        self.w.config['DefaultTvVolume'].update(RepeatCount=2, RepeatIntervalMs=350)
+        self.c.start()
+        self.c.timer.stop()
+        for index in range(3):
             self.c.send()
-            self.execute()
-            self.assertEqual(self.c.deadline, 21)
-            self.assertTrue(self.c.timer.isActive())
-            self.c.timer.stop()
-            self.c.send()
-        with patch.object(R['time'], 'monotonic', return_value=22):
-            self.execute()
-        self.w.api.set_volume.assert_called_once_with(10)
+            self.assertFalse(self.c.timer.isActive())  # Never overlap requests.
+            with patch.object(R['time'], 'monotonic', return_value=10000 * (index + 1)):
+                self.execute()
+            self.assertEqual(self.w.api.set_volume.call_count, index + 1)
+            self.assertEqual(self.c.remaining, 2 - index)
+            if index < 2:
+                self.assertTrue(self.c.timer.isActive())
+                self.assertEqual(self.c.timer.interval(), 350)
+                self.c.timer.stop()
+        self.assertFalse(self.c.timer.isActive())
+        self.c.send()
+        self.assertFalse(self.jobs)
+        self.w._request_poll.assert_called_once()
+
+    def test_repeat_failure_stops_remaining_sends(self):
+        self.w.config['DefaultTvVolume'].update(RepeatCount=3)
+        self.c.start()
+        self.c.timer.stop()
+        self.c.send()
+        self.execute()
+        self.c.timer.stop()
+        self.w.api.set_volume.side_effect = TimeoutError('uncertain outcome')
+        self.c.send()
+        self.execute()
+        self.assertEqual(self.w.api.set_volume.call_count, 2)
+        self.assertEqual(self.c.remaining, 0)
         self.assertFalse(self.c.timer.isActive())
 
     def test_invalid_range_never_sends_or_retries(self):
@@ -178,9 +213,12 @@ class TvDefaultsTests(unittest.TestCase):
     def test_config_validation(self):
         validate = R['validate_config']
         self.assertEqual(validate({}, allow_incomplete=True)['DefaultTvVolume'],
-                         {'Volume': None, 'DelayMs': 1000, 'RepeatMs': 0})
-        for value in ({'Volume': ''}, {'Volume': 10.5}, {'Volume': False}, {'Volume': True}, {'Volume': -1}, {'Volume': '10'}, {'DelayMs': -1},
-                      {'RepeatMs': 1.5}, {'Unknown': 1}, []):
+                         {'Volume': None, 'DelayMs': 1000, 'RepeatCount': 0, 'RepeatIntervalMs': 200})
+        for value in ({'Volume': ''}, {'Volume': 10.5}, {'Volume': False}, {'Volume': True},
+                      {'Volume': -1}, {'Volume': '10'}, {'DelayMs': -1},
+                      {'RepeatCount': 1.5}, {'RepeatCount': -1}, {'RepeatCount': True},
+                      {'RepeatIntervalMs': 0}, {'RepeatIntervalMs': False},
+                      {'RepeatIntervalMs': None}, {'RepeatMs': 0}, {'Unknown': 1}, []):
             with self.subTest(value=value), self.assertRaises(R['ConfigError']):
                 validate({'DefaultTvVolume': value}, allow_incomplete=True)
 

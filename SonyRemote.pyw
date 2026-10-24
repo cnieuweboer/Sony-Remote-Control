@@ -580,7 +580,7 @@ class CalibrationServer(QObject):
 APP_NAME = "Sony Remote"
 
 
-__version__ = "2026.10.24.4"
+__version__ = "2026.10.24.5"
 
 
 CONFIG_PATH = Path(__file__).resolve().with_name("SonyRemote.json")
@@ -711,7 +711,7 @@ DEFAULT_CONFIG = {
     "PlaybackControls": True,
     "VolumeControls": True,
     "AmplifierTVInput": "",
-    "DefaultTvVolume": {"Volume": None, "DelayMs": 1000, "RepeatMs": 0},
+    "DefaultTvVolume": {"Volume": None, "DelayMs": 1000, "RepeatCount": 0, "RepeatIntervalMs": 200},
     "VolumeRateLimit": {
         "Active": True,
         "RateMs": 500,
@@ -1085,14 +1085,16 @@ def validate_config(raw_config, *, allow_incomplete=False):
     config["AmplifierTVInput"] = config["AmplifierTVInput"].strip()
 
     default = config["DefaultTvVolume"]
-    if not isinstance(default, dict) or set(default) - {"Volume", "DelayMs", "RepeatMs"}:
-        raise ConfigError('"DefaultTvVolume" must be an object with Volume, DelayMs and RepeatMs.')
+    if not isinstance(default, dict) or set(default) - set(DEFAULT_CONFIG["DefaultTvVolume"]):
+        raise ConfigError('"DefaultTvVolume" must be an object with Volume, DelayMs, RepeatCount and RepeatIntervalMs.')
     default = dict(DEFAULT_CONFIG["DefaultTvVolume"], **default)
     if default["Volume"] is not None and (type(default["Volume"]) is not int or default["Volume"] < 0):
         raise ConfigError('"DefaultTvVolume.Volume" must be a non-negative integer or null to disable.')
-    for key in ("DelayMs", "RepeatMs"):
+    for key in ("DelayMs", "RepeatCount", "RepeatIntervalMs"):
         if type(default[key]) is not int or default[key] < 0:
             raise ConfigError(f'"DefaultTvVolume.{key}" must be a non-negative integer.')
+    if default["RepeatIntervalMs"] < 1:
+        raise ConfigError('"DefaultTvVolume.RepeatIntervalMs" must be a positive integer.')
     config["DefaultTvVolume"] = default
 
     rate_limit = config["VolumeRateLimit"]
@@ -1143,9 +1145,16 @@ def load_config():
     migrated_disabled = isinstance(tv_default, dict) and tv_default.get("Volume") == ""
     if migrated_disabled:
         tv_default["Volume"] = None
+    migrated_repeat = isinstance(tv_default, dict) and "RepeatMs" in tv_default
+    if migrated_repeat:
+        duration = tv_default.pop("RepeatMs")
+        if type(duration) is not int or duration < 0:
+            raise ConfigError('"DefaultTvVolume.RepeatMs" must be a non-negative integer before migration.')
+        # Old sends used 200 ms slots, excluding the duration's endpoint.
+        tv_default.setdefault("RepeatCount", max(0, (duration - 1) // 200))
     config = validate_config(raw_config, allow_incomplete=True)
     updated = copy.deepcopy(raw_config)
-    changed = _add_missing_settings(updated) or migrated_disabled
+    changed = _add_missing_settings(updated) or migrated_disabled or migrated_repeat
     # Discovered entry fields remain the responsibility of their own validators.
     for collection in ("Apps", "Inputs"):
         if any("Removed" not in item for item in raw_config.get(collection, {}).values()):
@@ -2806,12 +2815,12 @@ class TvVolumeDefault(QObject):
         self.timer = QTimer(self)
         self.timer.setSingleShot(True)
         self.timer.timeout.connect(self.send)
-        self.deadline = None
+        self.remaining = 0
 
     def cancel(self):
         self.token += 1
         self.timer.stop()
-        self.deadline = None
+        self.remaining = 0
 
     def allowed(self):
         w = self.window
@@ -2826,20 +2835,20 @@ class TvVolumeDefault(QObject):
         self.cancel()
         setting = self.window.config["DefaultTvVolume"]
         if setting["Volume"] is not None and self.allowed():
+            self.remaining = setting["RepeatCount"] + 1
             self.timer.start(setting["DelayMs"])
 
     def send(self):
-        if not self.allowed():
+        if not self.allowed() or self.remaining <= 0:
             self.cancel()
             return
         w = self.window
         setting = w.config["DefaultTvVolume"]
-        now = time.monotonic()
-        if self.deadline is not None and now >= self.deadline:
-            return
         token = self.token
         target = setting["Volume"]
+        sent = False
         def command():
+            nonlocal sent
             if token != self.token or not self.allowed():
                 return
             info = w.api.get_volume()
@@ -2849,17 +2858,19 @@ class TvVolumeDefault(QObject):
             if (type(minimum) is not int or type(maximum) is not int
                     or not minimum <= target <= maximum):
                 raise ValueError("DefaultTvVolume.Volume is outside the TV's reported volume range.")
-            if self.deadline is not None and time.monotonic() >= self.deadline:
-                return
-            if self.deadline is None:
-                self.deadline = time.monotonic() + setting["RepeatMs"] / 1000
             w.api.set_volume(target)
+            sent = True
         def finished():
             if token != self.token:
                 return
-            if self.allowed() and self.deadline is not None and time.monotonic() + .2 < self.deadline:
-                self.timer.start(200)
+            if not sent:
+                self.cancel()
+                return
+            self.remaining -= 1
+            if self.allowed() and self.remaining > 0:
+                self.timer.start(setting["RepeatIntervalMs"])
             else:
+                self.cancel()
                 w._request_poll(200, groups={"volume"})
         def failed(error):
             self.cancel()

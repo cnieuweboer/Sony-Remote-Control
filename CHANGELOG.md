@@ -4,6 +4,8 @@ Release identifiers below come from the corresponding commits. Some releases upd
 
 ## 2026-10-24
 
+- Sony Remote 2026.10.24.5 — Replace duration-based TV volume repetition with RepeatCount (additional sends) and RepeatIntervalMs (wait after completion). Keep exact counts despite slow commands, stop on cancellation/failure, and migrate old duration settings.
+
 - Sony Remote 2026.10.24.4 — Use null rather than an empty string to disable DefaultTvVolume.Volume, preserve integer zero as a valid target, and migrate existing disabled values at startup.
 
 - Sony Remote 2026.10.24.3 — Centralize filling and saving missing configuration settings from DEFAULT_CONFIG, including nested settings blocks. Preserve explicit values and keep discovered app/input entry handling separate.
