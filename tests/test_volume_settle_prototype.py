@@ -42,7 +42,8 @@ class Tests(unittest.TestCase):
     def run_test(self, readings, target=21, **kwargs):
         api = Api(readings)
         result = R['run_experiment'](api, target, 500, 500, self.cancel, self.logs.append,
-            absolute=kwargs.get('absolute', False), clock=lambda: self.now,
+            absolute=kwargs.get('absolute', False), quiet_ms=kwargs.get('quiet_ms', 500),
+            clock=lambda: self.now,
             wait=kwargs.get('wait', self.wait), observed=kwargs.get('observed'))
         return api, result
 
@@ -169,6 +170,43 @@ class Tests(unittest.TestCase):
         self.assertEqual(api.absolute_commands, [20])
         self.assertFalse(api.commands)
 
+    def test_absolute_quiet_read_replaces_relative_interval(self):
+        observations = []
+        api = Api([32, 31, 30, 29, 28, 27, 26, 26])
+        result = R['run_experiment'](api, 26, 300, 500, self.cancel, self.logs.append,
+            absolute=True, quiet_ms=500, clock=lambda: self.now, wait=self.wait,
+            observed=lambda info: observations.append((self.now, info['volume'])))
+        self.assertEqual(result, 'retained')
+        self.assertEqual(api.absolute_commands, [26] * 6)
+        self.assertEqual(self.waits, [.5] * 7)  # Six quiet periods, one final confirmation.
+        self.assertEqual(observations[1], (.5, 31))
+        self.assertEqual(self.now, 3.5)
+
+    def test_quiet_period_starts_after_command_completion(self):
+        api = Api([20, 21, 21])
+        def slow_command(target):
+            api.absolute_commands.append(target)
+            self.now += .2
+        api.set_volume = slow_command
+        observations = []
+        result = R['run_experiment'](api, 21, 300, 500, self.cancel, self.logs.append,
+            absolute=True, quiet_ms=800, clock=lambda: self.now, wait=self.wait,
+            observed=lambda info: observations.append(self.now))
+        self.assertEqual(result, 'retained')
+        self.assertEqual(observations, [0, 1.0, 1.5])
+        self.assertEqual(self.waits, [.8, .5])
+
+    def test_stop_during_absolute_quiet_period_prevents_all_further_reads(self):
+        api = Api([20])
+        def stop(seconds):
+            self.cancel.set()
+            return True
+        with self.assertRaises(R['Cancelled']):
+            R['run_experiment'](api, 21, 300, 500, self.cancel, self.logs.append,
+                absolute=True, quiet_ms=500, clock=lambda: self.now, wait=stop)
+        self.assertEqual(api.absolute_commands, [21])
+        self.assertFalse(api.commands)
+
     def test_absolute_api_payload(self):
         api = R['TvApi']({'Host': 'device.local', 'PreSharedKey': 'test-only'}, self.logs.append)
         api.rpc = Mock(return_value=[0])
@@ -223,6 +261,7 @@ class WindowTests(unittest.TestCase):
         self.pump_until(lambda: self.window.worker is None)
         self.assertEqual(self.window.target.value(), 20)
         self.window.target.setValue(21)
+        self.window.quiet.setValue(1)
         self.window.rate.setValue(1)
         self.window.delay.setValue(1)
         self.window.start_test()
@@ -238,6 +277,7 @@ class WindowTests(unittest.TestCase):
         self.window.api = api
         self.window.absolute.setChecked(True)
         self.window.target.setValue(21)
+        self.window.quiet.setValue(1)
         self.window.rate.setValue(1)
         self.window.delay.setValue(1)
         self.window.start_test()
@@ -253,6 +293,7 @@ class WindowTests(unittest.TestCase):
         self.window.api = api
         self.window.absolute.setChecked(True)
         self.window.target.setValue(26)
+        self.window.quiet.setValue(1)
         self.window.rate.setValue(1)
         self.window.delay.setValue(1)
         self.window.start_test()
@@ -261,6 +302,16 @@ class WindowTests(unittest.TestCase):
         self.assertFalse(api.commands)
         self.assertTrue(any('RESULT: target 26 retained' in line for line in self.window.history))
         self.assertEqual(sum('TARGET NOT SETTLED' in line for line in self.window.history), 5)
+
+    def test_mode_controls_select_only_the_relevant_interval(self):
+        self.assertTrue(self.window.rate.isEnabled())
+        self.assertFalse(self.window.quiet.isEnabled())
+        self.window.absolute.setChecked(True)
+        self.assertFalse(self.window.rate.isEnabled())
+        self.assertTrue(self.window.quiet.isEnabled())
+        self.window.absolute.setChecked(False)
+        self.assertTrue(self.window.rate.isEnabled())
+        self.assertFalse(self.window.quiet.isEnabled())
 
     def test_stop_interrupts_worker_settle_wait(self):
         api = Api([21])

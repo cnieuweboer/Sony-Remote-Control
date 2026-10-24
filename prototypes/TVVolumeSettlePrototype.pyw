@@ -17,7 +17,7 @@ from PySide6.QtWidgets import (QApplication, QCheckBox, QFileDialog, QFormLayout
     QHBoxLayout, QLabel, QMainWindow, QMessageBox, QPlainTextEdit, QPushButton,
     QSpinBox, QVBoxLayout, QWidget)
 
-__version__ = '2026.10.24.3'
+__version__ = '2026.10.24.4'
 NO_PROGRESS_SECONDS = 5.0
 OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
@@ -121,7 +121,7 @@ def read_volume(api, log, label, observed=None):
 
 
 def run_experiment(api, target, rate_ms, verify_ms, cancel, log,
-                   *, absolute=False, clock=time.monotonic, wait=None, observed=None):
+                   *, absolute=False, quiet_ms=500, clock=time.monotonic, wait=None, observed=None):
     """Require delayed target confirmation, resuming only in the original direction."""
     wait = cancel.wait if wait is None else wait
     def check_cancelled():
@@ -137,7 +137,7 @@ def run_experiment(api, target, rate_ms, verify_ms, cancel, log,
 
     check_cancelled()
     log('SETTINGS: ' + json.dumps(dict(target=target, rate_ms=rate_ms,
-                                     verify_ms=verify_ms,
+                                     verify_ms=verify_ms, quiet_ms=quiet_ms,
                                      command_mode="absolute" if absolute else "relative")))
     power = api.get_power()
     log('Initial TV power: ' + str(power))
@@ -189,8 +189,15 @@ def run_experiment(api, target, rate_ms, verify_ms, cancel, log,
         log(f'SEND {sends+1}: {command_label}; observed {current}, target {target}')
         send()
         sends += 1
-        pause(rate_ms)
-        current = observe('LIMITER READ')
+        if absolute:
+            completed_at = clock()
+            log(f'ABSOLUTE QUIET START: {quiet_ms} ms after command completion; no intervening requests.')
+            pause(quiet_ms)
+            log(f'ABSOLUTE QUIET COMPLETE: {(clock()-completed_at)*1000:.1f} ms; reading actual volume next.')
+            current = observe('ABSOLUTE QUIET READ')
+        else:
+            pause(rate_ms)
+            current = observe('LIMITER READ')
 
 
 class Signals(QObject):
@@ -261,14 +268,20 @@ class Window(QMainWindow):
         rate = rate_limit.get('RateMs', 500) if isinstance(rate_limit, dict) else 500
         self.rate.setValue(rate if type(rate) is int and 1 <= rate <= 10000 else 500)
         self.rate.setSuffix(' ms')
-        form.addRow('Volume command interval', self.rate)
+        form.addRow('Relative command interval', self.rate)
+        self.quiet = QSpinBox()
+        self.quiet.setRange(0, 10000)
+        self.quiet.setValue(500)
+        self.quiet.setSuffix(' ms')
+        form.addRow('Absolute quiet period after command', self.quiet)
         self.delay = QSpinBox()
         self.delay.setRange(0, 10000)
         self.delay.setValue(500)
         self.delay.setSuffix(' ms')
-        form.addRow('Verification delay after target', self.delay)
+        form.addRow('Confirmation delay after target reading', self.delay)
         self.absolute = QCheckBox('Send absolute target values on every attempt (experimental)')
         layout.addWidget(self.absolute)
+        self.absolute.toggled.connect(self._update_mode_controls)
         layout.addWidget(QLabel('Each target reading must pass the delayed check. If still short, commands resume.'))
         buttons = QHBoxLayout()
         layout.addLayout(buttons)
@@ -288,6 +301,7 @@ class Window(QMainWindow):
         self.activity = QPlainTextEdit()
         self.activity.setReadOnly(True)
         layout.addWidget(self.activity)
+        self._update_mode_controls()
         self.log('Prototype ready. Read current volume, choose a target, then run the test. No automatic commands at startup.')
 
     def log(self, message):
@@ -300,9 +314,14 @@ class Window(QMainWindow):
         self.history.append(line)
         self.activity.appendPlainText(line)
 
+    def _update_mode_controls(self):
+        idle = self.worker is None
+        self.rate.setEnabled(idle and not self.absolute.isChecked())
+        self.quiet.setEnabled(idle and self.absolute.isChecked())
+
     def start_test(self):
         self.launch(dict(target=self.target.value(), rate_ms=self.rate.value(),
-                         verify_ms=self.delay.value(),
+                         verify_ms=self.delay.value(), quiet_ms=self.quiet.value(),
                          absolute=self.absolute.isChecked()))
 
     def launch(self, settings):
@@ -312,7 +331,7 @@ class Window(QMainWindow):
         self.worker.signals.log.connect(self.log)
         self.worker.signals.observed.connect(self.observed)
         self.worker.signals.finished.connect(self.finished)
-        for widget in (self.refresh, self.start, self.target, self.rate, self.delay, self.absolute):
+        for widget in (self.refresh, self.start, self.target, self.rate, self.quiet, self.delay, self.absolute):
             widget.setEnabled(False)
         self.stop.setEnabled(True)
         self.pool.start(self.worker)
@@ -333,9 +352,10 @@ class Window(QMainWindow):
 
     def finished(self):
         self.worker = None
-        for widget in (self.refresh, self.start, self.target, self.rate, self.delay, self.absolute):
+        for widget in (self.refresh, self.start, self.target, self.rate, self.quiet, self.delay, self.absolute):
             widget.setEnabled(True)
         self.stop.setEnabled(False)
+        self._update_mode_controls()
         self.log('Idle. Check actual volume/mute on TV, amplifier and computer as appropriate.')
         if self.closing:
             self.close()
