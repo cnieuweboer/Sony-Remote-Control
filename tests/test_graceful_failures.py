@@ -11,9 +11,9 @@ import unittest
 from unittest.mock import Mock, patch
 
 os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QPushButton
+from PySide6.QtWidgets import QApplication, QPushButton, QMessageBox
 
 ROOT = Path(__file__).resolve().parents[1]
 REMOTE = runpy.run_path(str(ROOT / 'SonyRemote.pyw'), run_name='discovery_tests')
@@ -59,6 +59,10 @@ class Device:
 
     def set_volume(self, target):
         self.request('set_volume')
+
+    def set_power(self, on):
+        self.request('set_power')
+        self.power = 'active' if on else 'standby'
 
     def resolve_remote_command(self, name):
         return REMOTE['SonyApi'].resolve_remote_command(self, name)
@@ -727,6 +731,69 @@ class DiscoveryTests(unittest.TestCase):
                 self.assertGreaterEqual(events[index+1][1] - event[1], .015)
         self.assertEqual([item[2] for item in events[-2:]], [23, 23])
         self.assertGreaterEqual(events[-1][1] - events[-2][1], .01)
+
+    def test_app_standby_immediately_cancels_pending_volume_quiet_timer(self):
+        self.settle_volume_controls()
+        self.window.adjust_volume(3)
+        self.wait(lambda: self.device.calls['set_volume'] > 0)
+        volume_reads = self.device.calls['volume']
+        self.window.toggle_power()
+        self.assertFalse(self.window._volume_rate_loop_running)
+        self.assertFalse(self.window.volume_rate_timer.isActive())
+        self.assertIsNone(self.window._desired_volume)
+        self.wait(lambda: self.window.last_power == 'standby')
+        self.assertEqual(self.device.calls['volume'], volume_reads)
+        self.window.show_error.assert_not_called()
+
+    def test_volume_read_rejected_after_app_standby_request_is_cancelled_silently(self):
+        self.settle_volume_controls()
+        hold = threading.Event()
+        self.device.holds['volume'] = hold
+        before = self.device.calls['volume']
+        self.window.adjust_volume(3)
+        self.wait(lambda: self.device.calls['volume'] > before)
+        self.window.toggle_power()
+        self.device.failures['volume'] = REMOTE['DeviceResponseError']('TV rejected getVolumeInformation')
+        hold.set()
+        self.wait(lambda: self.window.last_power == 'standby')
+        self.assertFalse(self.window._volume_rate_loop_running)
+        self.assertIsNone(self.window._desired_volume)
+        self.assertEqual(self.device.calls['set_volume'], 0)
+        self.window.show_error.assert_not_called()
+
+    def test_rejected_power_command_still_reports_its_error(self):
+        self.settle_volume_controls()
+        self.device.failures['set_power'] = REMOTE['DeviceResponseError']('TV rejected power request')
+        self.window.toggle_power()
+        self.wait(lambda: self.window.show_error.called)
+        self.window.show_error.assert_called_once_with('TV rejected power request')
+
+    def test_standby_and_offline_updates_leave_dialog_buttons_enabled(self):
+        self.settle_volume_controls()
+        # A dialog can be parented anywhere in the remote's widget tree.
+        box = QMessageBox(self.window.centralWidget())
+        box.setStandardButtons(QMessageBox.Ok)
+        self.window.last_power = 'standby'
+        self.window.set_controls_enabled(False, power_enabled=True)
+        self.assertFalse(self.window.volume_up.isEnabled())
+        self.assertTrue(box.button(QMessageBox.Ok).isEnabled())
+        self.window.set_offline()
+        self.assertTrue(box.button(QMessageBox.Ok).isEnabled())
+        box.deleteLater()
+
+    def test_real_error_dialog_ok_stays_enabled_during_standby_update(self):
+        self.settle_volume_controls()
+        results = []
+        def update_while_open():
+            box = QApplication.activeModalWidget()
+            self.window.last_power = 'standby'
+            self.window.set_controls_enabled(False, power_enabled=True)
+            results.append(isinstance(box, QMessageBox) and box.button(QMessageBox.Ok).isEnabled())
+            if box is not None:
+                box.accept()
+        QTimer.singleShot(0, update_while_open)
+        REMOTE['SonyRemote'].show_error(self.window, 'A command failed')
+        self.assertEqual(results, [True])
 
     def test_verified_absolute_loop_sends_one_command_for_tv_speakers(self):
         self.drive_verified_volume(cec=False)

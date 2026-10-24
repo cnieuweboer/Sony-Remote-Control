@@ -433,6 +433,23 @@ class UnrestrictedVolumePollingTests(unittest.TestCase):
         self.refresh.call_args.args[1]()
         self.window.poll_status.assert_called_once_with()
 
+    def test_cancelled_relative_commands_do_not_send_or_schedule_old_refresh(self):
+        jobs = []
+        def enqueue(function, **callbacks):
+            jobs.append((function, callbacks))
+            return True
+        self.window.run_command = enqueue
+        self.press()
+        self.press()
+        self.window._volume_route_epoch = 1  # App standby invalidates previous volume work.
+        self.window._desired_volume = None
+        for function, callbacks in jobs:
+            function()
+            callbacks['on_finished']()
+        self.window.api.adjust_volume.assert_not_called()
+        self.assertEqual(self.window._pending_volume_commands, 0)
+        self.refresh.assert_not_called()
+
     def test_active_rate_limiter_suppresses_delayed_poll(self):
         self.press()
         self.callbacks[0]()

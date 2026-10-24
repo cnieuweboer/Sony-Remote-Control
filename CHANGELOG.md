@@ -4,6 +4,8 @@ Release identifiers below come from the corresponding commits. Some releases upd
 
 ## 2026-10-24
 
+- Sony Remote 2026.10.24.9 — Cancel pending volume work immediately when requesting standby, invalidate queued relative changes and their follow-up reads, and ignore late errors from the cancelled limiter. Restrict control enable/disable updates to main-window buttons so error dialogs remain usable in standby/offline states.
+
 - Sony Remote 2026.10.24.8 — Support focused MouseMiddle/MouseBack/MouseForward and WheelUp/Down/Left/Right bindings in Shortcuts, preserving normal dropdown/text-field interaction and keyboard-only global ownership. Include mouse bindings in button shortcut tooltips.
 
 - Sony Remote 2026.10.24.7 — Use verified absolute targets for rate-limited TV volume control, with a 600 ms default command quiet period and new VerificationDelayMs (500 ms). Resume after provisional target rollback without resetting no-progress tracking; preserve newer keypresses, cancellation, amplifier IPC routing and direct relative control when disabled. Preserve existing JSON rate values and fill missing settings automatically.

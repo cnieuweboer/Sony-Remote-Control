@@ -580,7 +580,7 @@ class CalibrationServer(QObject):
 APP_NAME = "Sony Remote"
 
 
-__version__ = "2026.10.24.8"
+__version__ = "2026.10.24.9"
 
 
 CONFIG_PATH = Path(__file__).resolve().with_name("SonyRemote.json")
@@ -3051,6 +3051,7 @@ class SonyRemote(QMainWindow):
         self._volume_rate_candidate = None
         self._pending_volume_commands = 0
         self._volume_generation = 0
+        self._volume_route_epoch = 0
 
         self.tv_volume_default = TvVolumeDefault(self)
         self.amplifier_state = None
@@ -3972,8 +3973,8 @@ class SonyRemote(QMainWindow):
             if widget is not None:
                 widget.setEnabled(enabled)
 
-        for button in self.findChildren(QPushButton):
-            if button is self.power_button:
+        for button in self.centralWidget().findChildren(QPushButton):
+            if button is self.power_button or button.window() is not self:
                 continue
             command = button.property("remoteCommand")
             supported = (command is None or ("remote_codes" in self._discovery_ready
@@ -4106,6 +4107,20 @@ class SonyRemote(QMainWindow):
         if self._calibration_blocked():
             return
         turn_on = self.last_power != "active"
+        if not turn_on:
+            # Cancel intent before queueing standby: old reads/errors and queued
+            # relative commands must not continue after the power command.
+            self._volume_route_epoch += 1
+            self._volume_generation += 1
+            self._desired_volume = None
+            self._volume_rate_loop_running = False
+            self._volume_rate_progress = None
+            self._volume_rate_phase = "read"
+            self._volume_rate_candidate = None
+            self._volume_rate_due = 0.0
+            self.volume_rate_timer.stop()
+            if self.config["VolumeControls"]:
+                self.update_volume_ui(self.last_volume or {})
         self.power_button.setEnabled(False)
         accepted = self.run_command(
             lambda: self.api.set_power(turn_on),
@@ -4307,7 +4322,7 @@ class SonyRemote(QMainWindow):
             self._pending_volume_commands += 1
             def finished():
                 self._pending_volume_commands -= 1
-                if self._pending_volume_commands:
+                if self._pending_volume_commands or epoch != getattr(self, "_volume_route_epoch", 0):
                     return
                 generation = self._volume_generation
                 def volume_is_idle():
