@@ -580,7 +580,7 @@ class CalibrationServer(QObject):
 APP_NAME = "Sony Remote"
 
 
-__version__ = "2026.10.24.1"
+__version__ = "2026.10.24.2"
 
 
 CONFIG_PATH = Path(__file__).resolve().with_name("SonyRemote.json")
@@ -1128,10 +1128,13 @@ def load_config():
     collections = ("Apps", "Inputs") if "Apps" in config else ("Inputs",)
     missing_removed = any("Removed" not in item for collection in collections
                           for item in raw_config.get(collection, {}).values())
+    missing_tv_default = set(DEFAULT_CONFIG["DefaultTvVolume"]) - set(raw_config.get("DefaultTvVolume", {}))
     if ("Shortcuts" not in raw_config or set(DEFAULT_SHORTCUTS) - set(raw_config["Shortcuts"])
-            or missing_removed):
+            or missing_removed or missing_tv_default):
         updated = dict(raw_config)
         updated["Shortcuts"] = config["Shortcuts"]
+        if missing_tv_default:
+            updated["DefaultTvVolume"] = config["DefaultTvVolume"]
         if missing_removed:
             for collection in collections:
                 updated[collection] = config[collection]

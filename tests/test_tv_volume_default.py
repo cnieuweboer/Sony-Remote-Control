@@ -1,4 +1,6 @@
 """Handover defaults use confirmed routing and never revive cancelled writes."""
+import json
+import tempfile
 from pathlib import Path
 import runpy
 from types import SimpleNamespace
@@ -7,6 +9,58 @@ from unittest.mock import Mock, patch
 from PySide6.QtWidgets import QApplication, QWidget
 
 R = runpy.run_path(str(Path(__file__).resolve().parents[1] / 'SonyRemote.pyw'), run_name='tv_defaults_test')
+
+
+class TvDefaultMigrationTests(unittest.TestCase):
+    def test_missing_block_and_partial_fields_are_saved_preserving_preferences(self):
+        for settings in (None, {}, {'Volume': 12}, {'Volume': '', 'DelayMs': 750, 'RepeatMs': 600}):
+            with self.subTest(settings=settings), tempfile.TemporaryDirectory() as folder:
+                path = Path(folder) / 'SonyRemote.json'
+                document = R['_default_config_copy']()
+                if settings is None:
+                    del document['DefaultTvVolume']
+                else:
+                    document['DefaultTvVolume'] = settings
+                document['Apps'] = {'example': {'Name': 'Example', 'NameOverride': 'Custom',
+                                               'Hidden': True, 'Favorite': True, 'Removed': False}}
+                path.write_text(json.dumps(document))
+                with patch.dict(R['load_config'].__globals__, CONFIG_PATH=path):
+                    config = R['load_config']()
+                saved = json.loads(path.read_text())
+                self.assertEqual(saved['DefaultTvVolume'], config['DefaultTvVolume'])
+                self.assertEqual(saved['Apps'], document['Apps'])
+                self.assertEqual(saved['DefaultTvVolume'], dict(R['DEFAULT_CONFIG']['DefaultTvVolume'], **(settings or {})))
+
+    def test_migration_does_not_overwrite_concurrent_edit(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / 'SonyRemote.json'
+            path.write_text('{}')
+            newer = '{"Host": "edited.local"}'
+            save = R['save_config']
+            def edit_then_save(config, **kwargs):
+                path.write_text(newer)
+                return save(config, **kwargs)
+            with patch.dict(R['load_config'].__globals__, CONFIG_PATH=path, save_config=edit_then_save):
+                R['load_config']()
+            self.assertEqual(path.read_text(), newer)
+
+    def test_complete_configuration_is_not_rewritten(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / 'SonyRemote.json'
+            text = json.dumps(R['_default_config_copy'](), indent=4)
+            path.write_text(text)
+            with patch.dict(R['load_config'].__globals__, CONFIG_PATH=path):
+                R['load_config']()
+            self.assertEqual(path.read_text(), text)
+
+    def test_invalid_block_is_not_rewritten(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / 'SonyRemote.json'
+            text = json.dumps({'DefaultTvVolume': {'DelayMs': -1}})
+            path.write_text(text)
+            with patch.dict(R['load_config'].__globals__, CONFIG_PATH=path), self.assertRaises(R['ConfigError']):
+                R['load_config']()
+            self.assertEqual(path.read_text(), text)
 
 
 class TvDefaultsTests(unittest.TestCase):
