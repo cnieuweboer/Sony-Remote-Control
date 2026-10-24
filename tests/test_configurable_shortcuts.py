@@ -81,9 +81,9 @@ class ShortcutConfigurationTests(unittest.TestCase):
                 saved = json.loads(path.read_text())
                 self.assertEqual(set(saved['Shortcuts']), set(REMOTE['DEFAULT_SHORTCUTS']))
                 self.assertEqual(saved['Host'], 'device.local')
-                self.assertEqual(saved['Shortcuts'], config['Shortcuts'])
+                self.assertEqual(saved['Shortcuts'], dict(REMOTE['DEFAULT_SHORTCUTS'], **(shortcuts or {})))
                 if shortcuts is not None:
-                    self.assertEqual(saved['Shortcuts']['Mute'], [])
+                    self.assertEqual(saved['Shortcuts']['Mute'], '')
 
     def test_bad_configuration_is_not_rewritten(self):
         with tempfile.TemporaryDirectory() as folder:

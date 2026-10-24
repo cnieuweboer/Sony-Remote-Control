@@ -580,7 +580,7 @@ class CalibrationServer(QObject):
 APP_NAME = "Sony Remote"
 
 
-__version__ = "2026.10.24.2"
+__version__ = "2026.10.24.3"
 
 
 CONFIG_PATH = Path(__file__).resolve().with_name("SonyRemote.json")
@@ -1046,6 +1046,20 @@ def show_missing_config_settings(config):
         )
 
 
+def _add_missing_settings(config, defaults=None):
+    """Fill absent settings in place; preserve explicit values and dynamic entries."""
+    defaults = DEFAULT_CONFIG if defaults is None else defaults
+    changed = False
+    for key, default in defaults.items():
+        if key not in config:
+            config[key] = copy.deepcopy(default)
+            changed = True
+        elif (key not in ("Apps", "Inputs") and isinstance(default, dict)
+              and isinstance(config[key], dict)):
+            changed = _add_missing_settings(config[key], default) or changed
+    return changed
+
+
 def validate_config(raw_config, *, allow_incomplete=False):
     if not isinstance(raw_config, dict):
         raise ConfigError("The configuration root must be a JSON object.")
@@ -1053,8 +1067,8 @@ def validate_config(raw_config, *, allow_incomplete=False):
     if unknown:
         raise ConfigError("Unknown configuration setting(s): " + ", ".join(sorted(unknown)) + ".")
 
-    config = _default_config_copy()
-    config.update(raw_config)
+    config = copy.deepcopy(raw_config)
+    _add_missing_settings(config)
     config["Shortcuts"] = _validate_shortcuts(config["Shortcuts"])
     config["Host"] = _validate_host(config["Host"])
     if not isinstance(config["PreSharedKey"], str):
@@ -1125,19 +1139,14 @@ def load_config():
     except OSError as ex:
         raise ConfigError(f"Unable to read {CONFIG_PATH.name}: {ex}") from ex
     config = validate_config(raw_config, allow_incomplete=True)
-    collections = ("Apps", "Inputs") if "Apps" in config else ("Inputs",)
-    missing_removed = any("Removed" not in item for collection in collections
-                          for item in raw_config.get(collection, {}).values())
-    missing_tv_default = set(DEFAULT_CONFIG["DefaultTvVolume"]) - set(raw_config.get("DefaultTvVolume", {}))
-    if ("Shortcuts" not in raw_config or set(DEFAULT_SHORTCUTS) - set(raw_config["Shortcuts"])
-            or missing_removed or missing_tv_default):
-        updated = dict(raw_config)
-        updated["Shortcuts"] = config["Shortcuts"]
-        if missing_tv_default:
-            updated["DefaultTvVolume"] = config["DefaultTvVolume"]
-        if missing_removed:
-            for collection in collections:
-                updated[collection] = config[collection]
+    updated = copy.deepcopy(raw_config)
+    changed = _add_missing_settings(updated)
+    # Discovered entry fields remain the responsibility of their own validators.
+    for collection in ("Apps", "Inputs"):
+        if any("Removed" not in item for item in raw_config.get(collection, {}).values()):
+            updated[collection] = config[collection]
+            changed = True
+    if changed:
         save_config(updated, expected_digest=hashlib.sha256(content).digest())
     return config
 

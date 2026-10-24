@@ -455,3 +455,8 @@ Sony accepts additional non-empty action names in `Shortcuts` alongside predefin
 After the delay, commands run on the existing serialized command pool. The TV's reported speaker range is checked before each absolute set (`audio/setAudioVolume`, version 1.2); out-of-range values stop the sequence without clamping. Repeats are spaced at least 200 ms apart, without catch-up or an additional send at the end of the repeat period. Queued writes recheck cancellation, routing and the repeat deadline. Failures cancel rather than retry. A normal volume refresh follows completion. Mute is never explicitly changed.
 
 User volume/mute/power actions, calibration, shutdown, return to the TV input or loss of usable amplifier state cancel the sequence. An HTTP request already sent cannot be recalled. Routing generations also invalidate older queued relative commands and limiter results, preventing an earlier TV target from competing with the handover. A later manual action may still wait for an already executing HTTP call.
+
+
+## Completing missing configuration settings
+
+`_add_missing_settings` fills absent keys from `DEFAULT_CONFIG`, recursively for settings blocks, using independent copies of mutable defaults. Explicit values are preserved, including empty strings, lists and false. `validate_config` uses it before field validation; invalid existing values still raise errors. At startup `load_config` validates before completing the saved document and writes only when something changed, with the existing digest check against concurrent edits. The generic check only ensures `Apps`/`Inputs` blocks exist; discovered entry fields and retired-setting migrations remain separate.

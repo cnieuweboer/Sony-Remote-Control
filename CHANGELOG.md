@@ -4,6 +4,8 @@ Release identifiers below come from the corresponding commits. Some releases upd
 
 ## 2026-10-24
 
+- Sony Remote 2026.10.24.3 — Centralize filling and saving missing configuration settings from DEFAULT_CONFIG, including nested settings blocks. Preserve explicit values and keep discovered app/input entry handling separate.
+
 - Sony Remote 2026.10.24.2 — Write missing DefaultTvVolume settings into existing configuration files at startup, preserving explicit values and checking for concurrent edits before saving.
 
 - Sony Remote 2026.10.24.1 — Add optional grouped DefaultTvVolume settings for confirmed amplifier TV-input handovers, with a delay, bounded repetition, TV range validation and cancellation on manual control or state changes. Invalidate older TV volume work across routing changes.
