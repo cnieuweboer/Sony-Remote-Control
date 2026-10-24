@@ -14,3 +14,7 @@ SonyRemote.json
 
 # Cached diagnostic reports may contain local runtime state.
 *-state-*.json
+
+# Local prototype test logs.
+CEC-handover-*.txt
+TV-volume-settle-*.txt
