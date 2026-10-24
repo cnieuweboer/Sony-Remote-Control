@@ -13,11 +13,11 @@ from pathlib import Path
 from urllib.parse import quote
 
 from PySide6.QtCore import QObject, QRunnable, QThreadPool, QTimer, Signal
-from PySide6.QtWidgets import (QApplication, QFileDialog, QHBoxLayout, QLabel,
+from PySide6.QtWidgets import (QApplication, QCheckBox, QFileDialog, QHBoxLayout, QLabel,
     QMainWindow, QMessageBox, QPlainTextEdit, QPushButton, QSpinBox,
     QVBoxLayout, QWidget)
 
-__version__ = '2026.10.24.1'
+__version__ = '2026.10.24.2'
 TV_INPUT = 'tv'
 OTHER_INPUT = 'usb_dac'
 POLL_SECONDS = .25
@@ -113,6 +113,7 @@ class Device:
 
 
 class Signals(QObject):
+    started = Signal(str, str, float)
     done = Signal(str, str, object, object, float)
 
 
@@ -124,6 +125,7 @@ class Job(QRunnable):
 
     def run(self):
         started = time.monotonic()
+        self.signals.started.emit(self.role, self.kind, started)
         result = error = None
         try:
             result = self.function()
@@ -141,6 +143,7 @@ class Window(QMainWindow):
         self.jobs = {}
         self.state = dict(tv=None, amplifier=None)
         self.observed = dict(tv=0., amplifier=0.)
+        self.sample_started = dict(tv=0., amplifier=0.)
         self.next_poll = dict(tv=0., amplifier=0.)
         self.stage = None
         self.manual_input = self.manual_tv_target = None
@@ -164,6 +167,9 @@ class Window(QMainWindow):
             self.labels[role] = QLabel(role + ': waiting for status')
             self.labels[role].setWordWrap(True)
             layout.addWidget(self.labels[role])
+        self.auto_watch = QCheckBox('Automatically run the TV volume burst when amplifier changes tv → usb_dac')
+        self.auto_watch.setChecked(True)
+        layout.addWidget(self.auto_watch)
         row = QHBoxLayout()
         self.input_buttons = []
         for input_id in (TV_INPUT, OTHER_INPUT):
@@ -185,7 +191,7 @@ class Window(QMainWindow):
         self.test.clicked.connect(self.start_test)
         row.addWidget(self.test)
         self.stop = QPushButton('Stop test')
-        self.stop.clicked.connect(lambda: self.finish('Stopped by user. In-flight HTTP requests may still complete.'))
+        self.stop.clicked.connect(self.stop_test)
         row.addWidget(self.stop)
         layout.addLayout(row)
         self.status = QLabel('Waiting for fresh device status.')
@@ -216,10 +222,18 @@ class Window(QMainWindow):
             return False
         job = Job(role, kind, function)
         self.jobs[role] = job
+        job.signals.started.connect(self.request_started)
         job.signals.done.connect(self.completed)
         self.pool.start(job)
         self.update_controls()
         return True
+
+    def request_started(self, role, kind, started):
+        if self.closed or kind == 'poll':
+            return
+        relative = (f'; +{started - self.burst_start:.3f}s after usb_dac detection'
+                    if kind.startswith('burst volume') else '')
+        self.message(f'{role} {kind} REQUEST START +{started - self.started:.3f}s{relative}')
 
     def completed(self, role, kind, result, error, request_started):
         self.jobs.pop(role, None)
@@ -234,24 +248,32 @@ class Window(QMainWindow):
             if self.stage:
                 self.finish('Test stopped on a device request failure. Check device settings manually.')
         elif kind == 'poll':
+            previous = self.state[role] if self.fresh(role) else None
+            previous_request = self.sample_started[role]
             changed = result != self.state[role]
             self.state[role] = result
             self.observed[role] = time.monotonic()
+            self.sample_started[role] = request_started
             self.labels[role].setText(role + ': ' + json.dumps(result))
-            if changed:
+            if changed or self.stage:
                 self.message(f'{role} status (request +{request_started - self.started:.3f}s): ' + json.dumps(result))
+            if (role == 'amplifier' and self.stage is None and self.auto_watch.isChecked()
+                    and previous and previous.get('power') == 'on' and previous.get('input') == TV_INPUT
+                    and result.get('power') == 'on' and result.get('input') == OTHER_INPUT):
+                self.message(f'AUTO detected tv → usb_dac. Last tv-input poll started +{previous_request - self.started:.3f}s; '
+                             f'usb_dac report received +{self.observed[role] - self.started:.3f}s. '
+                             'Exact physical switch time is not observable.')
+                if self.tv_target_valid():
+                    self.begin_burst(result, 'Automatic handover', previous)
+                else:
+                    self.message('Automatic burst skipped: no fresh, active TV status with a valid target range.')
             if self.stage and role == 'amplifier':
                 if result.get('power') != 'on':
                     self.finish('Test stopped: amplifier is not on.')
                 elif self.stage in ('burst', 'observe') and result.get('input') != OTHER_INPUT:
                     self.finish('Test stopped: amplifier left usb_dac.')
                 elif self.stage == 'wait_input' and request_started >= self.switch_completed and result.get('input') == OTHER_INPUT:
-                    self.baseline = result.copy()
-                    self.burst_start = time.monotonic()
-                    self.burst_end = self.burst_start + BURST_SECONDS
-                    self.next_send = self.burst_start
-                    self.stage = 'burst'
-                    self.message('Confirmed usb_dac BEFORE TV sends. Amplifier baseline: ' + json.dumps(self.baseline))
+                    self.begin_burst(result, 'Button-driven handover')
                 elif self.stage in ('burst', 'observe') and result.get('volume') != self.baseline.get('volume'):
                     if not self.changes or self.changes[-1] != result.get('volume'):
                         self.changes.append(result.get('volume'))
@@ -259,7 +281,8 @@ class Window(QMainWindow):
             if self.stage and role == 'tv' and result.get('power') != 'active':
                 self.finish('Test stopped: TV is not on.')
         else:
-            self.message(f'{role} {kind} acknowledged (request +{request_started - self.started:.3f}s).')
+            self.message(f'{role} {kind} acknowledged (request +{request_started - self.started:.3f}s; '
+                         f'response after {time.monotonic() - request_started:.3f}s).')
             self.next_poll[role] = 0
             if kind == 'test switch' and self.stage == 'switching':
                 self.stage = 'wait_input'
@@ -283,7 +306,8 @@ class Window(QMainWindow):
                              and self.state['amplifier'].get('power') == 'on'
                              and self.state['amplifier'].get('input') == TV_INPUT)
         if self.status.text() == 'Waiting for fresh device status.' and self.fresh('tv') and self.fresh('amplifier'):
-            self.status.setText('Ready. Select amplifier input tv, then start the handover test, or use the manual controls.')
+            self.status.setText('Ready. Watch tv → usb_dac automatically with the checkbox, or use the test button.')
+        self.auto_watch.setEnabled(idle)
         self.target.setEnabled(idle)
         self.stop.setEnabled(not idle)
 
@@ -310,6 +334,34 @@ class Window(QMainWindow):
                      + '; tv=' + json.dumps(self.state['tv']) + '; target=' + str(self.test_target))
         self.status.setText('Switching amplifier to usb_dac; waiting for confirmation before TV commands.')
 
+    def begin_burst(self, status, reason, previous=None):
+        self.sent = 0
+        self.changes = []
+        self.manual_input = self.manual_tv_target = None
+        self.test_target = self.target.value()
+        self.baseline = status.copy()
+        self.burst_start = time.monotonic()
+        self.burst_end = self.burst_start + BURST_SECONDS
+        self.next_send = self.burst_start
+        self.stage = 'burst'
+        self.message(reason + ': confirmed usb_dac BEFORE TV sends. Amplifier baseline: ' + json.dumps(self.baseline))
+        if previous is not None:
+            self.message('Previous tv-input sample: ' + json.dumps(previous))
+        self.status.setText('usb_dac detected: starting automatic TV volume burst.')
+        self.send_burst_if_due(self.burst_start)
+
+    def send_burst_if_due(self, now):
+        if self.stage == 'burst' and self.next_send <= now < self.burst_end and 'tv' not in self.jobs:
+            self.sent += 1
+            self.message(f'Burst TV SET #{self.sent}: absolute {self.test_target}; queued +{now - self.burst_start:.3f}s after detection')
+            value = self.test_target
+            self.submit('tv', 'burst volume ' + str(value), lambda: self.devices['tv'].set_tv_volume(value))
+            self.next_send = now + SEND_SECONDS  # Skip missed slots; never build a backlog.
+
+    def stop_test(self):
+        self.auto_watch.setChecked(False)
+        self.finish('Stopped by user; automatic watching disabled. In-flight HTTP requests may still complete.')
+
     def finish(self, message):
         self.stage = None
         self.message(message)
@@ -333,12 +385,8 @@ class Window(QMainWindow):
                     self.stage = 'observe'
                     self.observe_end = now + OBSERVE_SECONDS
                     self.message(f'Burst finished: {self.sent} sends started. Observing for three more seconds; no more volume commands.')
-                elif now >= self.next_send and 'tv' not in self.jobs:
-                    self.sent += 1
-                    self.message(f'Burst TV SET #{self.sent}: absolute {self.test_target}')
-                    value = self.test_target
-                    self.submit('tv', 'burst volume ' + str(value), lambda: self.devices['tv'].set_tv_volume(value))
-                    self.next_send = now + SEND_SECONDS  # Skip missed slots; never build a backlog.
+                else:
+                    self.send_burst_if_due(now)
                 self.status.setText(
                     f'TV burst: {self.sent} sends; amplifier baseline raw {self.baseline.get("volume")}. '
                     if self.stage == 'burst' else 'Observing for delayed CEC reactions; no more volume commands.')

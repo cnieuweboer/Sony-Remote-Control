@@ -84,7 +84,7 @@ class Tests(unittest.TestCase):
             self.w.deleteLater()
             QCoreApplication.sendPostedEvents(None,QEvent.DeferredDelete)
         self.addCleanup(cleanup)
-        self.wait(lambda:self.w.test.isEnabled())
+        self.wait(lambda:self.w.fresh('tv') and self.w.fresh('amplifier'))
     def test_no_leak(self):
         sim=Simulation()
         self.window(sim)
@@ -110,7 +110,7 @@ class Tests(unittest.TestCase):
         sim=Simulation(latency=.02)
         self.window(sim);self.w.start_test()
         self.wait(lambda:self.w.sent>0)
-        self.w.finish('Stopped')
+        self.w.stop_test()
         deadline=time.monotonic()+.3
         while time.monotonic()<deadline:self.app.processEvents();time.sleep(.002)
         self.assertEqual(len([e for e in sim.events if e[2]=='volume']),1)
@@ -119,6 +119,59 @@ class Tests(unittest.TestCase):
         self.window(sim);self.w.start_test()
         self.wait(lambda:self.w.stage is None and 'failure' in self.w.status.text())
         self.assertEqual(self.w.sent,1)
+    def settle(self, seconds=.2):
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            self.app.processEvents()
+            time.sleep(.002)
+
+    def test_external_input_change_automatically_starts_burst(self):
+        sim = Simulation(leak=True)
+        self.window(sim)
+        with sim.lock:
+            sim.input = 'usb_dac'
+        self.wait(lambda:self.w.status.text().startswith('RESULT'))
+        self.assertGreater(self.w.sent, 0)
+        self.assertTrue(self.w.changes)
+        self.assertFalse(any(event[2] == 'input' for event in sim.events))
+        self.assertIn('AUTO detected tv', self.w.log.toPlainText())
+        self.assertIn('REQUEST START', self.w.log.toPlainText())
+        self.assertIn('after usb_dac detection', self.w.log.toPlainText())
+        count = self.w.sent
+        self.settle()
+        self.assertEqual(self.w.sent, count)
+
+    def test_initial_usb_dac_does_not_trigger_a_burst(self):
+        sim = Simulation()
+        sim.input = 'usb_dac'
+        self.window(sim)
+        self.settle()
+        self.assertIsNone(self.w.stage)
+        self.assertFalse(any(event[2] == 'volume' for event in sim.events))
+
+    def test_automatic_watch_can_be_disabled(self):
+        sim = Simulation()
+        self.window(sim)
+        self.w.auto_watch.setChecked(False)
+        with sim.lock:
+            sim.input = 'usb_dac'
+        self.wait(lambda:self.w.state['amplifier']['input'] == 'usb_dac')
+        self.settle()
+        self.assertIsNone(self.w.stage)
+        self.assertFalse(any(event[2] == 'volume' for event in sim.events))
+
+    def test_stop_disarms_watch_before_late_input_confirmation(self):
+        sim = Simulation()
+        self.window(sim)
+        self.w.start_test()
+        self.w.stop_test()
+        self.assertFalse(self.w.auto_watch.isChecked())
+        with sim.lock:
+            sim.input = 'usb_dac'
+        self.settle()
+        self.assertIsNone(self.w.stage)
+        self.assertFalse(any(event[2] == 'volume' for event in sim.events))
+
     def test_config_and_exact_tv_method(self):
         with tempfile.TemporaryDirectory() as folder:
             root=Path(folder)
