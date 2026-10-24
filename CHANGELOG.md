@@ -4,6 +4,8 @@ Release identifiers below come from the corresponding commits. Some releases upd
 
 ## 2026-10-24
 
+- TVVolumeSettlePrototype 2026.10.24.3 — Verify every provisional target reading and continue in the original direction after rollback, in both command modes. Replace single-correction behavior with bounded verification/retry; requested-value echoes never reset the no-progress timer. The normal remote is unchanged.
+
 - TVVolumeSettlePrototype 2026.10.24.2 — Add an optional absolute-command mode that sends the target number on every attempt and correction, retaining observed-progress checks, stop conditions and explicit command-mode logging. The normal remote is unchanged.
 
 - Add standalone TVVolumeSettlePrototype.pyw (2026.10.24.1): relative target-volume test, configurable delayed verification, optional single correction, timestamped logs and cancellation. The normal Sony Remote is unchanged.

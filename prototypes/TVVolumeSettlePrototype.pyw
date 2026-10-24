@@ -17,7 +17,7 @@ from PySide6.QtWidgets import (QApplication, QCheckBox, QFileDialog, QFormLayout
     QHBoxLayout, QLabel, QMainWindow, QMessageBox, QPlainTextEdit, QPushButton,
     QSpinBox, QVBoxLayout, QWidget)
 
-__version__ = '2026.10.24.2'
+__version__ = '2026.10.24.3'
 NO_PROGRESS_SECONDS = 5.0
 OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
@@ -120,9 +120,9 @@ def read_volume(api, log, label, observed=None):
     return volume, minimum, maximum
 
 
-def run_experiment(api, target, rate_ms, verify_ms, correction, cancel, log,
+def run_experiment(api, target, rate_ms, verify_ms, cancel, log,
                    *, absolute=False, clock=time.monotonic, wait=None, observed=None):
-    """Read actual progress after each chosen command, then verify settling once."""
+    """Require delayed target confirmation, resuming only in the original direction."""
     wait = cancel.wait if wait is None else wait
     def check_cancelled():
         if cancel.is_set():
@@ -137,7 +137,7 @@ def run_experiment(api, target, rate_ms, verify_ms, correction, cancel, log,
 
     check_cancelled()
     log('SETTINGS: ' + json.dumps(dict(target=target, rate_ms=rate_ms,
-                                     verify_ms=verify_ms, correction=correction,
+                                     verify_ms=verify_ms,
                                      command_mode="absolute" if absolute else "relative")))
     power = api.get_power()
     log('Initial TV power: ' + str(power))
@@ -157,12 +157,29 @@ def run_experiment(api, target, rate_ms, verify_ms, correction, cancel, log,
             api.set_volume(target)
         else:
             api.adjust_volume(direction)
-    while current != target:
+    target_seen = False
+    while True:
         check_cancelled()
+        if current == target:
+            reached_at = clock()
+            label = 'TARGET REPORTED AGAIN' if target_seen else 'TARGET FIRST REPORTED'
+            target_seen = True
+            log(f'{label}: {current}; provisional, {sends} sends. Waiting {verify_ms} ms before verification.')
+            pause(verify_ms)
+            current = observe('SETTLED CHECK')
+            log(f'Verification completed {(clock()-reached_at)*1000:.1f} ms after the provisional target reading.')
+            if current == target:
+                log(f'RESULT: target {target} retained after delayed verification; {sends} sends.')
+                return 'retained'
+            if not direction:
+                log(f'STOP: started at the target but now reports {current}; no original direction, no commands.')
+                return 'different'
+            log(f'TARGET NOT SETTLED: requested {target}, now reports {current}. Checking progress before continuing.')
         if direction * (current - target) > 0:
             log(f'STOP: crossed target at {current}; no reverse command. {sends} sends.')
             return 'crossed'
         now = clock()
+        # Provisional target readings must never reset the no-progress timer.
         if direction * (current - best) > 0:
             best, progressed_at = current, now
         if now - progressed_at >= NO_PROGRESS_SECONDS:
@@ -174,28 +191,6 @@ def run_experiment(api, target, rate_ms, verify_ms, correction, cancel, log,
         sends += 1
         pause(rate_ms)
         current = observe('LIMITER READ')
-
-    reached_at = clock()
-    log(f'TARGET FIRST REPORTED: {current}; {sends} {"absolute" if absolute else "relative"} sends. Waiting {verify_ms} ms before verification.')
-    pause(verify_ms)
-    current = observe('SETTLED CHECK')
-    log(f'Verification completed {(clock()-reached_at)*1000:.1f} ms after target was first reported.')
-    if current == target:
-        log('RESULT: target retained. No correction needed.')
-        return 'retained'
-    if not direction or current != target - direction:
-        log(f'RESULT: target {target}, actual {current}; not one step short in the original direction. No correction.')
-        return 'different'
-    if not correction:
-        log(f'RESULT: one step short ({current} instead of {target}). Correction disabled; would send {command_label} once.')
-        return 'short'
-    check_cancelled()
-    log(f'CORRECTION: sending {command_label} once. No further correction or limiter restart.')
-    send()
-    pause(verify_ms)
-    current = observe('AFTER CORRECTION')
-    log(f'RESULT: target {target}, actual {current} after one correction; stopping regardless of result.')
-    return 'corrected' if current == target else 'correction_unconfirmed'
 
 
 class Signals(QObject):
@@ -274,8 +269,7 @@ class Window(QMainWindow):
         form.addRow('Verification delay after target', self.delay)
         self.absolute = QCheckBox('Send absolute target values on every attempt (experimental)')
         layout.addWidget(self.absolute)
-        self.correction = QCheckBox('Allow one correction if exactly one step short (off by default)')
-        layout.addWidget(self.correction)
+        layout.addWidget(QLabel('Each target reading must pass the delayed check. If still short, commands resume.'))
         buttons = QHBoxLayout()
         layout.addLayout(buttons)
         self.refresh = QPushButton('Read current volume')
@@ -308,7 +302,7 @@ class Window(QMainWindow):
 
     def start_test(self):
         self.launch(dict(target=self.target.value(), rate_ms=self.rate.value(),
-                         verify_ms=self.delay.value(), correction=self.correction.isChecked(),
+                         verify_ms=self.delay.value(),
                          absolute=self.absolute.isChecked()))
 
     def launch(self, settings):
@@ -318,7 +312,7 @@ class Window(QMainWindow):
         self.worker.signals.log.connect(self.log)
         self.worker.signals.observed.connect(self.observed)
         self.worker.signals.finished.connect(self.finished)
-        for widget in (self.refresh, self.start, self.target, self.rate, self.delay, self.absolute, self.correction):
+        for widget in (self.refresh, self.start, self.target, self.rate, self.delay, self.absolute):
             widget.setEnabled(False)
         self.stop.setEnabled(True)
         self.pool.start(self.worker)
@@ -339,7 +333,7 @@ class Window(QMainWindow):
 
     def finished(self):
         self.worker = None
-        for widget in (self.refresh, self.start, self.target, self.rate, self.delay, self.absolute, self.correction):
+        for widget in (self.refresh, self.start, self.target, self.rate, self.delay, self.absolute):
             widget.setEnabled(True)
         self.stop.setEnabled(False)
         self.log('Idle. Check actual volume/mute on TV, amplifier and computer as appropriate.')
