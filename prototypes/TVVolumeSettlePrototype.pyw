@@ -1,4 +1,4 @@
-"""Standalone relative TV-volume settling experiment (PySide6 only).
+"""Standalone TV-volume command and settling experiment (PySide6 only).
 
 Copy SonyRemote.json beside this file. Close Sony Remote and other software
 volume controllers before testing. No IPC, config writes, mute changes or restore.
@@ -17,7 +17,7 @@ from PySide6.QtWidgets import (QApplication, QCheckBox, QFileDialog, QFormLayout
     QHBoxLayout, QLabel, QMainWindow, QMessageBox, QPlainTextEdit, QPushButton,
     QSpinBox, QVBoxLayout, QWidget)
 
-__version__ = '2026.10.24.1'
+__version__ = '2026.10.24.2'
 NO_PROGRESS_SECONDS = 5.0
 OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
@@ -57,10 +57,10 @@ class TvApi:
         self.log = log
         self.request_id = 0
 
-    def rpc(self, service, method, params=None):
+    def rpc(self, service, method, params=None, version='1.0'):
         self.request_id += 1
         payload = dict(method=method, id=self.request_id,
-                       params=[] if params is None else params, version='1.0')
+                       params=[] if params is None else params, version=version)
         request = urllib.request.Request(self.url + '/sony/' + service,
             data=json.dumps(payload).encode(), method='POST',
             headers={'Content-Type': 'application/json', 'X-Auth-PSK': self.psk})
@@ -93,6 +93,11 @@ class TvApi:
             [{'target': 'speaker', 'volume': f'{direction:+d}'}])
         self.log('Relative command acknowledged: ' + json.dumps(result))
 
+    def set_volume(self, target):
+        result = self.rpc('audio', 'setAudioVolume',
+            [{'target': 'speaker', 'volume': str(target), 'ui': 'on'}], version='1.2')
+        self.log('Absolute command acknowledged: ' + json.dumps(result))
+
 
 def integer(value, field):
     if type(value) is int:
@@ -116,8 +121,8 @@ def read_volume(api, log, label, observed=None):
 
 
 def run_experiment(api, target, rate_ms, verify_ms, correction, cancel, log,
-                   *, clock=time.monotonic, wait=None, observed=None):
-    """Serialized equivalent of the remote limiter, followed by one settling check."""
+                   *, absolute=False, clock=time.monotonic, wait=None, observed=None):
+    """Read actual progress after each chosen command, then verify settling once."""
     wait = cancel.wait if wait is None else wait
     def check_cancelled():
         if cancel.is_set():
@@ -132,7 +137,8 @@ def run_experiment(api, target, rate_ms, verify_ms, correction, cancel, log,
 
     check_cancelled()
     log('SETTINGS: ' + json.dumps(dict(target=target, rate_ms=rate_ms,
-                                     verify_ms=verify_ms, correction=correction)))
+                                     verify_ms=verify_ms, correction=correction,
+                                     command_mode="absolute" if absolute else "relative")))
     power = api.get_power()
     log('Initial TV power: ' + str(power))
     if power != 'active':
@@ -144,6 +150,13 @@ def run_experiment(api, target, rate_ms, verify_ms, correction, cancel, log,
     direction = 1 if current < target else -1 if current > target else 0
     best, progressed_at = current, clock()
     sends = 0
+    command_label = f'absolute {target}' if absolute else f'relative {direction:+d}'
+    def send():
+        check_cancelled()
+        if absolute:
+            api.set_volume(target)
+        else:
+            api.adjust_volume(direction)
     while current != target:
         check_cancelled()
         if direction * (current - target) > 0:
@@ -156,14 +169,14 @@ def run_experiment(api, target, rate_ms, verify_ms, correction, cancel, log,
             log(f'STOP: no closer volume for five seconds; actual {current}, target {target}. {sends} sends.')
             return 'stalled'
         check_cancelled()
-        log(f'SEND {sends+1}: relative {direction:+d}; observed {current}, target {target}')
-        api.adjust_volume(direction)
+        log(f'SEND {sends+1}: {command_label}; observed {current}, target {target}')
+        send()
         sends += 1
         pause(rate_ms)
         current = observe('LIMITER READ')
 
     reached_at = clock()
-    log(f'TARGET FIRST REPORTED: {current}; {sends} relative sends. Waiting {verify_ms} ms before verification.')
+    log(f'TARGET FIRST REPORTED: {current}; {sends} {"absolute" if absolute else "relative"} sends. Waiting {verify_ms} ms before verification.')
     pause(verify_ms)
     current = observe('SETTLED CHECK')
     log(f'Verification completed {(clock()-reached_at)*1000:.1f} ms after target was first reported.')
@@ -174,11 +187,11 @@ def run_experiment(api, target, rate_ms, verify_ms, correction, cancel, log,
         log(f'RESULT: target {target}, actual {current}; not one step short in the original direction. No correction.')
         return 'different'
     if not correction:
-        log(f'RESULT: one step short ({current} instead of {target}). Correction disabled; would send {direction:+d} once.')
+        log(f'RESULT: one step short ({current} instead of {target}). Correction disabled; would send {command_label} once.')
         return 'short'
     check_cancelled()
-    log(f'CORRECTION: sending {direction:+d} once. No further correction or limiter restart.')
-    api.adjust_volume(direction)
+    log(f'CORRECTION: sending {command_label} once. No further correction or limiter restart.')
+    send()
     pause(verify_ms)
     current = observe('AFTER CORRECTION')
     log(f'RESULT: target {target}, actual {current} after one correction; stopping regardless of result.')
@@ -259,6 +272,8 @@ class Window(QMainWindow):
         self.delay.setValue(500)
         self.delay.setSuffix(' ms')
         form.addRow('Verification delay after target', self.delay)
+        self.absolute = QCheckBox('Send absolute target values on every attempt (experimental)')
+        layout.addWidget(self.absolute)
         self.correction = QCheckBox('Allow one correction if exactly one step short (off by default)')
         layout.addWidget(self.correction)
         buttons = QHBoxLayout()
@@ -293,7 +308,8 @@ class Window(QMainWindow):
 
     def start_test(self):
         self.launch(dict(target=self.target.value(), rate_ms=self.rate.value(),
-                         verify_ms=self.delay.value(), correction=self.correction.isChecked()))
+                         verify_ms=self.delay.value(), correction=self.correction.isChecked(),
+                         absolute=self.absolute.isChecked()))
 
     def launch(self, settings):
         if self.worker is not None:
@@ -302,7 +318,7 @@ class Window(QMainWindow):
         self.worker.signals.log.connect(self.log)
         self.worker.signals.observed.connect(self.observed)
         self.worker.signals.finished.connect(self.finished)
-        for widget in (self.refresh, self.start, self.target, self.rate, self.delay, self.correction):
+        for widget in (self.refresh, self.start, self.target, self.rate, self.delay, self.absolute, self.correction):
             widget.setEnabled(False)
         self.stop.setEnabled(True)
         self.pool.start(self.worker)
@@ -323,7 +339,7 @@ class Window(QMainWindow):
 
     def finished(self):
         self.worker = None
-        for widget in (self.refresh, self.start, self.target, self.rate, self.delay, self.correction):
+        for widget in (self.refresh, self.start, self.target, self.rate, self.delay, self.absolute, self.correction):
             widget.setEnabled(True)
         self.stop.setEnabled(False)
         self.log('Idle. Check actual volume/mute on TV, amplifier and computer as appropriate.')

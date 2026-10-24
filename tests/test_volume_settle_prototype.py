@@ -17,6 +17,7 @@ class Api:
     def __init__(self, readings):
         self.readings = iter(readings)
         self.commands = []
+        self.absolute_commands = []
         self.power = 'active'
     def get_power(self):
         return self.power
@@ -24,6 +25,8 @@ class Api:
         return dict(target='speaker', volume=next(self.readings), minVolume=0, maxVolume=100, mute=False)
     def adjust_volume(self, direction):
         self.commands.append(direction)
+    def set_volume(self, target):
+        self.absolute_commands.append(target)
 
 
 class Tests(unittest.TestCase):
@@ -39,7 +42,8 @@ class Tests(unittest.TestCase):
     def run_test(self, readings, target=21, correction=False, **kwargs):
         api = Api(readings)
         result = R['run_experiment'](api, target, 500, 500, correction, self.cancel, self.logs.append,
-            clock=lambda: self.now, wait=kwargs.get('wait', self.wait), observed=kwargs.get('observed'))
+            absolute=kwargs.get('absolute', False), clock=lambda: self.now,
+            wait=kwargs.get('wait', self.wait), observed=kwargs.get('observed'))
         return api, result
 
     def test_target_retained_requires_no_correction(self):
@@ -123,6 +127,43 @@ class Tests(unittest.TestCase):
                     clock=lambda: self.now, wait=self.wait)
             self.assertEqual(api.commands, [])
 
+    def test_absolute_repeats_same_target_for_incremental_cec_progress(self):
+        for readings in ([17, 18, 19, 20, 20], [23, 22, 21, 20, 20]):
+            with self.subTest(readings=readings):
+                api, result = self.run_test(readings, target=20, absolute=True)
+                self.assertEqual(result, 'retained')
+                self.assertEqual(api.absolute_commands, [20, 20, 20])
+                self.assertFalse(api.commands)
+
+    def test_absolute_direct_jump_needs_only_one_command(self):
+        api, result = self.run_test([10, 20, 20], target=20, absolute=True)
+        self.assertEqual(result, 'retained')
+        self.assertEqual(api.absolute_commands, [20])
+        self.assertFalse(api.commands)
+
+    def test_absolute_correction_also_sends_target_not_relative_step(self):
+        api, result = self.run_test([19, 20, 19, 20], target=20, absolute=True, correction=True)
+        self.assertEqual(result, 'corrected')
+        self.assertEqual(api.absolute_commands, [20, 20])
+        self.assertFalse(api.commands)
+
+    def test_absolute_no_progress_and_overshoot_keep_existing_stop_rules(self):
+        api, result = self.run_test([20] * 11, absolute=True)
+        self.assertEqual(result, 'stalled')
+        self.assertEqual(api.absolute_commands, [21] * 10)
+        self.assertFalse(api.commands)
+        api, result = self.run_test([20, 22], absolute=True)
+        self.assertEqual(result, 'crossed')
+        self.assertEqual(api.absolute_commands, [21])
+        self.assertFalse(api.commands)
+
+    def test_absolute_api_payload(self):
+        api = R['TvApi']({'Host': 'device.local', 'PreSharedKey': 'test-only'}, self.logs.append)
+        api.rpc = Mock(return_value=[0])
+        api.set_volume(20)
+        api.rpc.assert_called_once_with('audio', 'setAudioVolume',
+            [{'target': 'speaker', 'volume': '20', 'ui': 'on'}], version='1.2')
+
     def test_relative_api_payload(self):
         api = R['TvApi']({'Host': 'device.local', 'PreSharedKey': 'test-only'}, self.logs.append)
         api.rpc = Mock(return_value=[0])
@@ -166,6 +207,7 @@ class WindowTests(unittest.TestCase):
         self.assertIsNone(self.window.worker)
         self.assertFalse(api.commands)
         self.assertFalse(self.window.correction.isChecked())
+        self.assertFalse(self.window.absolute.isChecked())
         self.window.launch(None)
         self.pump_until(lambda: self.window.worker is None)
         self.assertEqual(self.window.target.value(), 20)
@@ -179,6 +221,21 @@ class WindowTests(unittest.TestCase):
         self.assertTrue(any('FAKE HTTP' in line for line in self.window.history))
         self.assertTrue(self.window.start.isEnabled())
         self.assertFalse(self.window.stop.isEnabled())
+
+    def test_absolute_toggle_reaches_worker_and_is_locked_during_run(self):
+        api = Api([20, 21, 21])
+        self.window.api = api
+        self.window.absolute.setChecked(True)
+        self.window.target.setValue(21)
+        self.window.rate.setValue(1)
+        self.window.delay.setValue(1)
+        self.window.start_test()
+        self.assertFalse(self.window.absolute.isEnabled())
+        self.pump_until(lambda: self.window.worker is None)
+        self.assertEqual(api.absolute_commands, [21])
+        self.assertFalse(api.commands)
+        self.assertTrue(self.window.absolute.isEnabled())
+        self.assertTrue(any('"command_mode": "absolute"' in line for line in self.window.history))
 
     def test_stop_interrupts_worker_settle_wait(self):
         api = Api([21])

@@ -4,6 +4,8 @@ Release identifiers below come from the corresponding commits. Some releases upd
 
 ## 2026-10-24
 
+- TVVolumeSettlePrototype 2026.10.24.2 — Add an optional absolute-command mode that sends the target number on every attempt and correction, retaining observed-progress checks, stop conditions and explicit command-mode logging. The normal remote is unchanged.
+
 - Add standalone TVVolumeSettlePrototype.pyw (2026.10.24.1): relative target-volume test, configurable delayed verification, optional single correction, timestamped logs and cancellation. The normal Sony Remote is unchanged.
 
 - Sony Remote 2026.10.24.6 — Stop TV volume limiting after five seconds without closer observed progress or when the target is crossed, preventing endless retries and automatic reversals. Preserve newer user targets and refresh the actual volume after stopping.
