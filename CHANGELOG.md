@@ -4,6 +4,8 @@ Release identifiers below come from the corresponding commits. Some releases upd
 
 ## 2026-10-24
 
+- Sony Remote 2026.10.24.4 — Use null rather than an empty string to disable DefaultTvVolume.Volume, preserve integer zero as a valid target, and migrate existing disabled values at startup.
+
 - Sony Remote 2026.10.24.3 — Centralize filling and saving missing configuration settings from DEFAULT_CONFIG, including nested settings blocks. Preserve explicit values and keep discovered app/input entry handling separate.
 
 - Sony Remote 2026.10.24.2 — Write missing DefaultTvVolume settings into existing configuration files at startup, preserving explicit values and checking for concurrent edits before saving.

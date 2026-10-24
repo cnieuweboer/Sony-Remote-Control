@@ -13,7 +13,7 @@ R = runpy.run_path(str(Path(__file__).resolve().parents[1] / 'SonyRemote.pyw'), 
 
 class TvDefaultMigrationTests(unittest.TestCase):
     def test_missing_block_and_partial_fields_are_saved_preserving_preferences(self):
-        for settings in (None, {}, {'Volume': 12}, {'Volume': '', 'DelayMs': 750, 'RepeatMs': 600}):
+        for settings in (None, {}, {'Volume': 12}, {'Volume': None, 'DelayMs': 750, 'RepeatMs': 600}):
             with self.subTest(settings=settings), tempfile.TemporaryDirectory() as folder:
                 path = Path(folder) / 'SonyRemote.json'
                 document = R['_default_config_copy']()
@@ -30,6 +30,22 @@ class TvDefaultMigrationTests(unittest.TestCase):
                 self.assertEqual(saved['DefaultTvVolume'], config['DefaultTvVolume'])
                 self.assertEqual(saved['Apps'], document['Apps'])
                 self.assertEqual(saved['DefaultTvVolume'], dict(R['DEFAULT_CONFIG']['DefaultTvVolume'], **(settings or {})))
+
+    def test_old_disabled_value_is_saved_as_null(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / 'SonyRemote.json'
+            document = R['_default_config_copy']()
+            document['DefaultTvVolume'] = {'Volume': '', 'DelayMs': 750, 'RepeatMs': 600}
+            path.write_text(json.dumps(document))
+            with patch.dict(R['load_config'].__globals__, CONFIG_PATH=path):
+                config = R['load_config']()
+            self.assertEqual(config['DefaultTvVolume'], {'Volume': None, 'DelayMs': 750, 'RepeatMs': 600})
+            self.assertEqual(json.loads(path.read_text())['DefaultTvVolume'], config['DefaultTvVolume'])
+
+    def test_zero_volume_remains_enabled(self):
+        config = R['validate_config']({'DefaultTvVolume': {'Volume': 0}}, allow_incomplete=True)
+        self.assertEqual(config['DefaultTvVolume']['Volume'], 0)
+        self.assertIsNotNone(config['DefaultTvVolume']['Volume'])
 
     def test_migration_does_not_overwrite_concurrent_edit(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -145,7 +161,7 @@ class TvDefaultsTests(unittest.TestCase):
         self.assertFalse(self.c.timer.isActive())
 
     def test_disabled_and_unsafe_states_do_not_start(self):
-        self.w.config['DefaultTvVolume']['Volume'] = ''
+        self.w.config['DefaultTvVolume']['Volume'] = None
         self.c.start()
         self.assertFalse(self.c.timer.isActive())
         self.w.config['DefaultTvVolume']['Volume'] = 10
@@ -162,8 +178,8 @@ class TvDefaultsTests(unittest.TestCase):
     def test_config_validation(self):
         validate = R['validate_config']
         self.assertEqual(validate({}, allow_incomplete=True)['DefaultTvVolume'],
-                         {'Volume': '', 'DelayMs': 1000, 'RepeatMs': 0})
-        for value in ({'Volume': True}, {'Volume': -1}, {'Volume': '10'}, {'DelayMs': -1},
+                         {'Volume': None, 'DelayMs': 1000, 'RepeatMs': 0})
+        for value in ({'Volume': ''}, {'Volume': 10.5}, {'Volume': False}, {'Volume': True}, {'Volume': -1}, {'Volume': '10'}, {'DelayMs': -1},
                       {'RepeatMs': 1.5}, {'Unknown': 1}, []):
             with self.subTest(value=value), self.assertRaises(R['ConfigError']):
                 validate({'DefaultTvVolume': value}, allow_incomplete=True)

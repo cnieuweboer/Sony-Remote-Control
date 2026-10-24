@@ -450,7 +450,7 @@ Sony accepts additional non-empty action names in `Shortcuts` alongside predefin
 
 ## TV speaker default after amplifier input handover
 
-`DefaultTvVolume` contains `Volume` (non-negative raw TV integer, or empty to disable), `DelayMs` (default 1000) and `RepeatMs` (default 0). A fresh, online/on amplifier IPC transition from the configured/calibrated TV input to another input starts a single cancellable sequence while the TV is active. Initial connection, stale/offline status and standby alone do not trigger it. The existing input selection used for volume routing remains authoritative; there are no additional amplifier requests.
+`DefaultTvVolume` contains `Volume` (non-negative raw TV integer, or JSON `null` to disable), `DelayMs` (default 1000) and `RepeatMs` (default 0). A fresh, online/on amplifier IPC transition from the configured/calibrated TV input to another input starts a single cancellable sequence while the TV is active. Initial connection, stale/offline status and standby alone do not trigger it. The existing input selection used for volume routing remains authoritative; there are no additional amplifier requests.
 
 After the delay, commands run on the existing serialized command pool. The TV's reported speaker range is checked before each absolute set (`audio/setAudioVolume`, version 1.2); out-of-range values stop the sequence without clamping. Repeats are spaced at least 200 ms apart, without catch-up or an additional send at the end of the repeat period. Queued writes recheck cancellation, routing and the repeat deadline. Failures cancel rather than retry. A normal volume refresh follows completion. Mute is never explicitly changed.
 
@@ -460,3 +460,5 @@ User volume/mute/power actions, calibration, shutdown, return to the TV input or
 ## Completing missing configuration settings
 
 `_add_missing_settings` fills absent keys from `DEFAULT_CONFIG`, recursively for settings blocks, using independent copies of mutable defaults. Explicit values are preserved, including empty strings, lists and false. `validate_config` uses it before field validation; invalid existing values still raise errors. At startup `load_config` validates before completing the saved document and writes only when something changed, with the existing digest check against concurrent edits. The generic check only ensures `Apps`/`Inputs` blocks exist; discovered entry fields and retired-setting migrations remain separate.
+
+Integer-only settings that support a disabled state use JSON `null`; zero remains a valid numeric value. Older empty-string DefaultTvVolume disabled values are converted to null at startup.

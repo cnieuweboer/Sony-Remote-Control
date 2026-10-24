@@ -33,7 +33,7 @@
   "DropdownAnimationWorkaround": true,
   "AmplifierTVInput": "",
   "DefaultTvVolume": {
-    "Volume": "",
+    "Volume": null,
     "DelayMs": 1000,
     "RepeatMs": 0
   },

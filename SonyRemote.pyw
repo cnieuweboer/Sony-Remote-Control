@@ -580,7 +580,7 @@ class CalibrationServer(QObject):
 APP_NAME = "Sony Remote"
 
 
-__version__ = "2026.10.24.3"
+__version__ = "2026.10.24.4"
 
 
 CONFIG_PATH = Path(__file__).resolve().with_name("SonyRemote.json")
@@ -711,7 +711,7 @@ DEFAULT_CONFIG = {
     "PlaybackControls": True,
     "VolumeControls": True,
     "AmplifierTVInput": "",
-    "DefaultTvVolume": {"Volume": "", "DelayMs": 1000, "RepeatMs": 0},
+    "DefaultTvVolume": {"Volume": None, "DelayMs": 1000, "RepeatMs": 0},
     "VolumeRateLimit": {
         "Active": True,
         "RateMs": 500,
@@ -1088,8 +1088,8 @@ def validate_config(raw_config, *, allow_incomplete=False):
     if not isinstance(default, dict) or set(default) - {"Volume", "DelayMs", "RepeatMs"}:
         raise ConfigError('"DefaultTvVolume" must be an object with Volume, DelayMs and RepeatMs.')
     default = dict(DEFAULT_CONFIG["DefaultTvVolume"], **default)
-    if default["Volume"] != "" and (type(default["Volume"]) is not int or default["Volume"] < 0):
-        raise ConfigError('"DefaultTvVolume.Volume" must be a non-negative integer or an empty string.')
+    if default["Volume"] is not None and (type(default["Volume"]) is not int or default["Volume"] < 0):
+        raise ConfigError('"DefaultTvVolume.Volume" must be a non-negative integer or null to disable.')
     for key in ("DelayMs", "RepeatMs"):
         if type(default[key]) is not int or default[key] < 0:
             raise ConfigError(f'"DefaultTvVolume.{key}" must be a non-negative integer.')
@@ -1138,9 +1138,14 @@ def load_config():
         raise ConfigError(f"{CONFIG_PATH.name} must use UTF-8 encoding.") from ex
     except OSError as ex:
         raise ConfigError(f"Unable to read {CONFIG_PATH.name}: {ex}") from ex
+    # Convert the former disabled sentinel when upgrading an existing file.
+    tv_default = raw_config.get("DefaultTvVolume") if isinstance(raw_config, dict) else None
+    migrated_disabled = isinstance(tv_default, dict) and tv_default.get("Volume") == ""
+    if migrated_disabled:
+        tv_default["Volume"] = None
     config = validate_config(raw_config, allow_incomplete=True)
     updated = copy.deepcopy(raw_config)
-    changed = _add_missing_settings(updated)
+    changed = _add_missing_settings(updated) or migrated_disabled
     # Discovered entry fields remain the responsibility of their own validators.
     for collection in ("Apps", "Inputs"):
         if any("Removed" not in item for item in raw_config.get(collection, {}).values()):
@@ -2820,7 +2825,7 @@ class TvVolumeDefault(QObject):
     def start(self):
         self.cancel()
         setting = self.window.config["DefaultTvVolume"]
-        if setting["Volume"] != "" and self.allowed():
+        if setting["Volume"] is not None and self.allowed():
             self.timer.start(setting["DelayMs"])
 
     def send(self):

@@ -37,7 +37,7 @@ class ConfigurationDefaultsTests(unittest.TestCase):
     def test_load_persists_all_missing_settings_preserving_user_values(self):
         raw = {'Host': 'device.local', 'DarkMode': False, 'Shortcuts': {'Mute': []}}
         if NAME == 'Sony':
-            raw.update(VolumeRateLimit={'Active': False}, DefaultTvVolume={'Volume': ''})
+            raw.update(VolumeRateLimit={'Active': False}, DefaultTvVolume={'Volume': None})
         else:
             raw['GlobalShortcuts'] = {'VolumeUp': []}
         with tempfile.TemporaryDirectory() as folder:
@@ -55,7 +55,7 @@ class ConfigurationDefaultsTests(unittest.TestCase):
             self.assertEqual(saved['Inputs'], {})
             if NAME == 'Sony':
                 self.assertEqual(saved['VolumeRateLimit'], {'Active': False, 'RateMs': 500})
-                self.assertEqual(saved['DefaultTvVolume']['Volume'], '')
+                self.assertEqual(saved['DefaultTvVolume']['Volume'], None)
             else:
                 self.assertEqual(saved['GlobalShortcuts']['VolumeUp'], [])
 
