@@ -4,6 +4,8 @@ Release identifiers below come from the corresponding commits. Some releases upd
 
 ## 2026-10-24
 
+- Sony Remote 2026.10.24.11 — Validate consumed polling response contents before recording success or recovery. Malformed power/audio, app/input inventories, remote-command lists and application status now raise DeviceResponseError, increment malformed-response counters once, and preserve the last valid cached response. Valid empty inventories and extra device fields remain supported.
+
 - Sony Remote 2026.10.24.10 — Make focused keyboard, native volume and mouse control obey standby availability. Disable TV controls immediately on an app-requested standby, retain the block until a power query started after command completion confirms the state, and restore controls on rejected or unqueued power commands without reviving cancelled volume targets. Yamaha global control remains independent.
 
 - Sony Remote 2026.10.24.9 — Cancel pending volume work immediately when requesting standby, invalidate queued relative changes and their follow-up reads, and ignore late errors from the cancelled limiter. Restrict control enable/disable updates to main-window buttons so error dialogs remain usable in standby/offline states.

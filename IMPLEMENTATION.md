@@ -494,3 +494,10 @@ An app-requested standby cancels the TV volume target and timer before queueing 
 `set_controls_enabled` updates only central-widget buttons whose top-level window is the remote. It never changes buttons belonging to QMessageBox or other child dialogs, including dialogs parented under the central widget. Standby/offline updates can therefore disable remote controls while an open dialog's OK button remains usable.
 
 TV action availability is centralized in `_tv_controls_available`. Focused keyboard and mouse actions, the Windows volume-key snapshot/drain, SMTC availability and ordinary action entry points follow the TV's confirmed active state. Requesting standby immediately blocks new actions and withdraws focused TV-volume override permission. A successful power command keeps that block until a power query started after command completion returns; an older response or a volume-only poll cannot reopen controls. Rejection restores availability from the current state, connection failure keeps the device offline, and queue rejection removes the temporary block. The power button remains available to wake a confirmed standby TV. Yamaha's independent global volume ownership is unchanged.
+
+
+## Poll response validation and counters
+
+Known read responses are validated at the HTTP boundary before a polling success, recovery or cached full response is recorded. Validation covers fields consumed by the remote, permits additional device fields and accepts valid empty inventories. Invalid contents raise `DeviceResponseError`, increment `failures` and `malformed_responses` once, and leave the previous valid cached response intact; only a subsequent valid device response counts as recovery. HTTP errors, device rejections and connection failures retain their separate categories.
+
+`tests/test_poll_response_validation.py` exercises real API decoding with mocked HTTP responses, including nested malformed contents, preserved caches, recovery counts, extra fields and empty inventories. Yamaha also validates each advertised speaker output before recording its state response, without requiring unsupported outputs.

@@ -580,7 +580,7 @@ class CalibrationServer(QObject):
 APP_NAME = "Sony Remote"
 
 
-__version__ = "2026.10.24.10"
+__version__ = "2026.10.24.11"
 
 
 CONFIG_PATH = Path(__file__).resolve().with_name("SonyRemote.json")
@@ -1909,8 +1909,45 @@ class SonyApi:
         if not isinstance(result.get("result"), list):
             self.polling_responses.failed(request_type, "malformed_responses")
             raise DeviceResponseError("Sony response is missing a result list.")
-        self.polling_responses.record(f"{service}/{method}", result)
+        try:
+            self._validate_poll_response(request_type, result["result"])
+        except DeviceResponseError:
+            self.polling_responses.failed(request_type, "malformed_responses")
+            raise
+        self.polling_responses.record(request_type, result)
         return result
+
+    @staticmethod
+    def _validate_poll_response(request_type, result):
+        if request_type == "system/getPowerStatus":
+            if (not result or not isinstance(result[0], dict)
+                    or result[0].get("status") not in ("active", "standby")):
+                raise DeviceResponseError("Sony returned an invalid power status.")
+        elif request_type in ("appControl/getApplicationList", "avContent/getCurrentExternalInputsStatus"):
+            if not result:
+                raise DeviceResponseError("Sony response is missing its inventory list.")
+            _inventory_ids(result[0], "uri", "title")
+        elif request_type == "audio/getVolumeInformation":
+            if not result or not isinstance(result[0], list):
+                raise DeviceResponseError("Sony returned an invalid volume list.")
+            for entry in result[0]:
+                if (not isinstance(entry, dict) or not isinstance(entry.get("target"), str)
+                        or type(entry.get("volume")) is not int or type(entry.get("mute")) is not bool
+                        or any(key in entry and type(entry[key]) is not int for key in ("minVolume", "maxVolume"))
+                        or not entry.get("minVolume", -math.inf) <= entry["volume"] <= entry.get("maxVolume", math.inf)):
+                    raise DeviceResponseError("Sony returned invalid volume or mute information.")
+        elif request_type == "system/getRemoteControllerInfo":
+            if (len(result) < 2 or not isinstance(result[1], list)
+                    or any(not isinstance(item, dict)
+                           or any(not isinstance(item.get(key), str) or not item[key].strip()
+                                  for key in ("name", "value")) for item in result[1])):
+                raise DeviceResponseError("Sony returned invalid remote-control commands.")
+        elif request_type == "appControl/getApplicationStatusList":
+            if (not result or not isinstance(result[0], list)
+                    or any(not isinstance(item, dict)
+                           or any(not isinstance(item.get(key), str) for key in ("name", "status"))
+                           for item in result[0])):
+                raise DeviceResponseError("Sony returned invalid application status information.")
 
     def get_power(self):
         return self.rpc("system", "getPowerStatus")["result"][0]["status"]
