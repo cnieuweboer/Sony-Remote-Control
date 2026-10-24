@@ -4,6 +4,8 @@ Release identifiers below come from the corresponding commits. Some releases upd
 
 ## 2026-10-24
 
+- Sony Remote 2026.10.24.6 — Stop TV volume limiting after five seconds without closer observed progress or when the target is crossed, preventing endless retries and automatic reversals. Preserve newer user targets and refresh the actual volume after stopping.
+
 - Sony Remote 2026.10.24.5 — Replace duration-based TV volume repetition with RepeatCount (additional sends) and RepeatIntervalMs (wait after completion). Keep exact counts despite slow commands, stop on cancellation/failure, and migrate old duration settings.
 
 - Sony Remote 2026.10.24.4 — Use null rather than an empty string to disable DefaultTvVolume.Volume, preserve integer zero as a valid target, and migrate existing disabled values at startup.

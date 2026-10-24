@@ -580,7 +580,7 @@ class CalibrationServer(QObject):
 APP_NAME = "Sony Remote"
 
 
-__version__ = "2026.10.24.5"
+__version__ = "2026.10.24.6"
 
 
 CONFIG_PATH = Path(__file__).resolve().with_name("SonyRemote.json")
@@ -599,6 +599,7 @@ STATUS_MAX_AGE_SECONDS = 6.0
 
 
 MAX_PENDING_COMMANDS = 16
+VOLUME_NO_PROGRESS_SECONDS = 5.0
 
 
 CONFIG_RESTART_DEBOUNCE_MS = 250
@@ -2936,6 +2937,7 @@ class SonyRemote(QMainWindow):
         self._desired_volume = None
         self._volume_rate_loop_running = False
         self._volume_rate_step_running = False
+        self._volume_rate_progress = None
         self._pending_volume_commands = 0
         self._volume_generation = 0
 
@@ -4217,6 +4219,7 @@ class SonyRemote(QMainWindow):
             return
 
         if not self._volume_rate_loop_running:
+            self._volume_rate_progress = None
             self._volume_rate_loop_running = True
             self._schedule_volume_rate_step(0)
 
@@ -4249,7 +4252,21 @@ class SonyRemote(QMainWindow):
                     or self._use_amplifier() or not self._volume_rate_loop_running
                     or target is None or current == target):
                 return {"done": True, "info": info, "observed_at": observed_at}
-            direction = 1 if current < target else -1
+            generation = self._volume_generation
+            progress = getattr(self, "_volume_rate_progress", None)
+            if progress is not None and progress[:2] == (epoch, generation):
+                _, _, direction, best, progressed_at = progress
+                crossed = direction * (current - target) > 0
+                if direction * (current - best) > 0:
+                    best, progressed_at = current, observed_at
+                stalled = observed_at - progressed_at >= VOLUME_NO_PROGRESS_SECONDS
+                if crossed or stalled:
+                    return {"done": True, "stopped_generation": generation,
+                            "info": info, "observed_at": observed_at}
+            else:
+                direction = 1 if current < target else -1
+                best, progressed_at = current, observed_at
+            self._volume_rate_progress = (epoch, generation, direction, best, progressed_at)
             self.api.adjust_volume(direction)
             return {"done": False, "info": info, "observed_at": observed_at}
 
@@ -4270,10 +4287,12 @@ class SonyRemote(QMainWindow):
             finished = result.get("done") and (
                 self._desired_volume is None
                 or int(info.get("volume", 0)) == self._desired_volume
+                or result.get("stopped_generation") == self._volume_generation
             )
             if finished:
                 self._volume_rate_loop_running = False
                 self._desired_volume = None
+                self._volume_rate_progress = None
             self._status_sequence += 1
             if self.config["VolumeControls"]:
                 self.update_volume_ui(self.last_volume)

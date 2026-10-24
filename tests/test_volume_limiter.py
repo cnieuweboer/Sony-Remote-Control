@@ -151,6 +151,89 @@ class VolumeLimiterTests(unittest.TestCase):
         self.assertEqual(self.volume, 21)
         self.assertEqual(self.commands, [1, 1])
 
+    def test_no_progress_stops_after_five_seconds_and_releases_polling(self):
+        self.window._desired_volume = 21
+        with patch.object(REMOTE['time'], 'monotonic') as clock:
+            for seconds in range(6):
+                clock.return_value = 100 + seconds
+                self.ignore_next = True
+                self.pending_result()()
+        self.assertEqual(self.commands, [1] * 5)
+        self.assertFalse(self.window._volume_rate_loop_running)
+        self.assertIsNone(self.window._desired_volume)
+        self.assertFalse(self.window._volume_rate_step_running)
+        self.refresh.assert_called_once_with(200, self.window.poll_status)
+        self.window.update_volume_ui.assert_called_with(self.window.last_volume)
+        self.assertEqual(self.window.last_volume['volume'], 20)
+
+    def test_progress_allows_a_large_change_to_run_longer_than_five_seconds(self):
+        self.window._desired_volume = 30
+        with patch.object(REMOTE['time'], 'monotonic') as clock:
+            for seconds in range(11):
+                clock.return_value = 100 + seconds
+                self.pending_result()()
+        self.assertEqual(self.volume, 30)
+        self.assertEqual(self.commands, [1] * 10)
+        self.assertFalse(self.window._volume_rate_loop_running)
+
+    def test_movement_away_and_back_does_not_reset_no_progress_limit(self):
+        self.window._desired_volume = 25
+        self.window.api.adjust_volume = self.commands.append
+        with patch.object(REMOTE['time'], 'monotonic') as clock:
+            for seconds, volume in enumerate((20, 19, 20, 19, 20, 19)):
+                clock.return_value = 100 + seconds
+                self.volume = volume
+                self.pending_result()()
+        self.assertEqual(len(self.commands), 5)
+        self.assertFalse(self.window._volume_rate_loop_running)
+
+    def test_crossing_target_stops_without_a_reverse_command(self):
+        for direction in (1, -1):
+            with self.subTest(direction=direction):
+                self.volume = 20
+                self.commands.clear()
+                self.window._volume_rate_progress = None
+                self.window._volume_rate_loop_running = True
+                self.window._desired_volume = 20 + direction
+                def double_step(value):
+                    self.commands.append(value)
+                    self.volume += 2 * value
+                self.window.api.adjust_volume = double_step
+                self.pending_result()()
+                self.pending_result()()
+                self.assertEqual(self.commands, [direction])
+                self.assertEqual(self.window.last_volume['volume'], 20 + 2 * direction)
+                self.assertFalse(self.window._volume_rate_loop_running)
+                self.assertIsNone(self.window._desired_volume)
+
+    def test_new_target_survives_a_stall_result_waiting_for_gui_delivery(self):
+        self.window._desired_volume = 21
+        with patch.object(REMOTE['time'], 'monotonic') as clock:
+            clock.return_value = 100
+            self.ignore_next = True
+            self.pending_result()()
+            clock.return_value = 105
+            deliver = self.pending_result()
+            self.keypress(1)
+            deliver()
+        self.assertEqual(self.window._desired_volume, 22)
+        self.assertTrue(self.window._volume_rate_loop_running)
+        self.finish_target()
+        self.assertEqual(self.volume, 22)
+
+    def test_new_target_after_crossing_resets_direction_check(self):
+        self.window._desired_volume = 21
+        self.pending_result()()  # Device reaches 21; next read will see an external jump.
+        self.volume = 22
+        deliver = self.pending_result()  # Crossed old target, but has not reached GUI yet.
+        self.keypress(2)  # New target is 23, so continuing upward is intentional.
+        deliver()
+        self.assertEqual(self.window._desired_volume, 23)
+        self.assertTrue(self.window._volume_rate_loop_running)
+        self.finish_target()
+        self.assertEqual(self.volume, 23)
+        self.assertEqual(self.commands, [1, 1])
+
     def test_limiter_read_updates_volume_freshness_without_refreshing_power(self):
         self.window._desired_volume = 21
         deliver = self.pending_result()

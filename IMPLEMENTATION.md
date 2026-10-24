@@ -464,3 +464,8 @@ User volume/mute/power actions, calibration, shutdown, return to the TV input or
 Integer-only settings that support a disabled state use JSON `null`; zero remains a valid numeric value. Older empty-string DefaultTvVolume disabled values are converted to null at startup.
 
 Old `RepeatMs` values are removed at startup and converted to the old nominal 200 ms slot count (excluding the endpoint), with explicit new settings taking precedence. Runtime validation accepts only the new fields.
+
+
+## TV volume limiter stop conditions
+
+For a fixed user target, the limiter remembers its requested direction, best observed volume and last progress time. It stops without sending another relative command if the observed volume crosses the target or no closer value has been observed for five seconds (`VOLUME_NO_PROGRESS_SECONDS`). Returning to an earlier best value does not count as new progress. Each new user target generation starts a fresh check, and an older stop result cannot discard a newer keypress. Reaching or stopping clears the target and resumes normal volume polling; the actual observed volume replaces the optimistic target in the UI. Existing routing, calibration, standby, offline, request-error and shutdown cancellation paths remain in place. This does not identify which controller changed the volume; an active loop can still act toward its pending target until a stop condition occurs.
