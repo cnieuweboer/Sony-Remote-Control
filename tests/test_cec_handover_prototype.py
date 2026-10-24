@@ -81,13 +81,15 @@ class Tests(unittest.TestCase):
             self.app.processEvents()
             time.sleep(.002)
 
-    def window(self, simulation, tv=True, amp=True, duration=250):
+    def window(self, simulation, tv=True, amp=True, duration=250, settle=0):
         timing = patch.dict(G, SEND_SECONDS=.05, POLL_SECONDS=.03)
         timing.start()
         self.addCleanup(timing.stop)
         self.w = R['Window']({'Host':'127.0.0.1','PreSharedKey':'dummy'}, {'Host':'127.0.0.1'})
         self.w.devices = {role:simulation.device(role) for role in ('tv','amplifier')}
         self.w.duration.setValue(duration)
+        if settle is not None:
+            self.w.settle_delay.setValue(settle)
         self.w.measure_tv.setChecked(tv)
         self.w.measure_amp.setChecked(amp)
         self.submissions = []
@@ -238,6 +240,54 @@ class Tests(unittest.TestCase):
         job = R['Job']('tv', 'volume', called, allowed=lambda started:False)
         job.run()
         called.assert_not_called()
+
+    def test_settle_control_defaults_to_half_second(self):
+        sim = Simulation()
+        self.window(sim, settle=None)
+        self.assertEqual(self.w.settle_delay.value(), 500)
+
+    def test_settling_precedes_measurements_and_preserves_full_repeat_window(self):
+        sim = Simulation()
+        self.window(sim, settle=120, duration=250)
+        self.run_button()
+        self.assertGreaterEqual(self.w.first_send_at - self.w.detected_at, .12)
+        self.assertAlmostEqual(self.w.repeat_end - self.w.first_send_at, .25, places=4)
+        pre = [started for started, role, kind in self.submissions if kind == 'measure pre']
+        self.assertTrue(pre)
+        self.assertTrue(all(started >= self.w.settle_due for started in pre))
+        monitors = [started for started, role, kind in self.submissions
+                    if kind == 'monitor' and self.w.detected_at < started < self.w.settle_due]
+        self.assertTrue(monitors)
+        self.assertIn('Settling delay COMPLETE', self.w.log.toPlainText())
+
+    def test_stop_during_settling_never_sends(self):
+        sim = Simulation()
+        self.window(sim, settle=200)
+        self.w.start_test()
+        self.wait(lambda:self.w.stage == 'settle')
+        self.w.stop_test()
+        self.settle(.3)
+        self.assertFalse(any(event[2] == 'volume' for event in sim.events))
+        self.assertFalse(any(kind.startswith('measure') for _, _, kind in self.submissions))
+
+    def test_input_change_during_settling_cancels(self):
+        sim = Simulation()
+        self.window(sim, settle=200)
+        self.w.start_test()
+        self.wait(lambda:self.w.stage == 'settle')
+        with sim.lock:
+            sim.input = 'tv'
+        self.wait(lambda:self.w.stage is None)
+        self.assertFalse(any(event[2] == 'volume' for event in sim.events))
+
+    def test_failure_during_settling_cancels(self):
+        sim = Simulation()
+        self.window(sim, settle=200)
+        self.w.start_test()
+        self.wait(lambda:self.w.stage == 'settle')
+        self.w.devices['amplifier'].poll = MagicMock(side_effect=TimeoutError('fake timeout'))
+        self.wait(lambda:self.w.stage is None)
+        self.assertFalse(any(event[2] == 'volume' for event in sim.events))
 
     def test_config_and_exact_tv_method_with_http_timing(self):
         with tempfile.TemporaryDirectory() as folder:

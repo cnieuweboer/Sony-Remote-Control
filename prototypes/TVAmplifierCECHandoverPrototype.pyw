@@ -19,7 +19,7 @@ from PySide6.QtWidgets import (QApplication, QCheckBox, QFileDialog, QHBoxLayout
     QMainWindow, QMessageBox, QPlainTextEdit, QPushButton, QSpinBox,
     QVBoxLayout, QWidget)
 
-__version__ = '2026.10.24.3'
+__version__ = '2026.10.24.4'
 TV_INPUT = 'tv'
 OTHER_INPUT = 'usb_dac'
 POLL_SECONDS = .25
@@ -218,6 +218,15 @@ class Window(QMainWindow):
         self.target.setRange(0, 100)
         self.target.setValue(10)
         row.addWidget(self.target)
+        row.addWidget(QLabel('Delay after input confirmation (ms):'))
+        self.settle_delay = QSpinBox()
+        self.settle_delay.setRange(0, 10000)
+        self.settle_delay.setSingleStep(100)
+        self.settle_delay.setValue(500)
+        self.settle_delay.setToolTip('Wait after confirmed usb_dac before pre-measurements or volume commands. Required amplifier monitoring continues.')
+        row.addWidget(self.settle_delay)
+        layout.addLayout(row)
+        row = QHBoxLayout()
         row.addWidget(QLabel('Repeat duration (ms):'))
         self.duration = QSpinBox()
         self.duration.setRange(0, MAX_REPEAT_MS)
@@ -375,7 +384,7 @@ class Window(QMainWindow):
             return
         if role != 'amplifier':
             return
-        if self.stage in ('pre', 'sending', 'post', 'between', 'final_delay', 'final'):
+        if self.stage in ('settle', 'pre', 'sending', 'post', 'between', 'final_delay', 'final'):
             if current.get('input') != OTHER_INPUT:
                 self.finish('Test stopped: amplifier left usb_dac.')
                 return
@@ -383,7 +392,7 @@ class Window(QMainWindow):
                     and current['volume'] != self.baseline['volume']):
                 if not self.changes or self.changes[-1] != current.get('volume'):
                     self.changes.append(current.get('volume'))
-                    self.message('AMPLIFIER VOLUME CHANGED: ' + repr(current.get('volume')))
+                    self.message('AMPLIFIER VOLUME CHANGED [' + self.stage + ']: ' + repr(current.get('volume')))
         elif self.stage == 'wait_input' and request_started >= self.switch_completed and current.get('input') == OTHER_INPUT:
             self.begin_experiment(current, 'Button-driven handover')
         elif (self.stage is None and self.auto_watch.isChecked() and previous
@@ -401,6 +410,7 @@ class Window(QMainWindow):
             self.finish('Test not started: TV readiness/range unavailable.')
             return
         self.options = dict(target=self.target.value(), duration_ms=self.duration.value(),
+                            settle_delay_ms=self.settle_delay.value(),
                             final_delay_ms=self.final_delay.value(), tv=self.measure_tv.isChecked(),
                             amplifier=self.measure_amp.isChecked())
         self.cancelled = threading.Event()
@@ -412,20 +422,14 @@ class Window(QMainWindow):
         self.first_send_at = self.repeat_end = self.next_slot = None
         self.pending_reads.clear()
         self.manual_input = None
-        self.stage = 'pre'
+        self.stage = 'settle'
+        self.settle_due = self.detected_at + self.options['settle_delay_ms'] / 1000
         self.message(reason + ': SETTINGS ' + json.dumps(self.options))
         self.message('Confirmed usb_dac; amplifier baseline from REQUIRED input monitoring: ' + json.dumps(self.baseline))
         if previous:
             self.message('Previous tv-input sample: ' + json.dumps(previous))
-        if self.options['amplifier']:
-            self.message('amplifier pre measurement REUSED required input/status response; no duplicate request.')
-        else:
-            self.message('Extra amplifier measurements OFF. Required input reads still return volume/mute.')
-        if self.options['tv']:
-            self.pending_reads['tv'] = dict(phase='pre', after=self.detected_at)
-        else:
-            self.message('TV measurements OFF: TV-on/range is assumed from startup/manual readiness. '
-                         'No TV reads during or after experiment; TV volume effect will be unmeasured.')
+        self.message(f'Settling delay START: {self.options["settle_delay_ms"]} ms after confirmation; '
+                     f'due +{self.settle_due-self.started:.3f}s. Required input monitoring continues; no pre-measurements or volume sends yet.')
         self.update_controls()
         self.drive_experiment(time.monotonic())
 
@@ -482,9 +486,30 @@ class Window(QMainWindow):
                 and minimum <= self.options['target'] <= maximum):
             self.finish('Test stopped: TV target is outside its reported range, or range is unknown.')
             return
+        if self.stage == 'settle':
+            if now < self.settle_due:
+                self.status.setText(f'Settling after usb_dac confirmation: {max(0, math.ceil((self.settle_due-now)*1000))} ms remaining.')
+                return
+            self.message(f'Settling delay COMPLETE: +{now-self.detected_at:.3f}s after detection. Starting enabled pre-measurements.')
+            self.stage = 'pre'
+            if self.options['amplifier']:
+                if self.options['settle_delay_ms'] == 0:
+                    self.message('amplifier pre measurement REUSED required input/status response; no duplicate request.')
+                else:
+                    self.pending_reads['amplifier'] = dict(phase='pre', after=self.settle_due)
+            else:
+                self.message('Extra amplifier measurements OFF. Required input reads still return volume/mute.')
+            if self.options['tv']:
+                self.pending_reads['tv'] = dict(phase='pre', after=now)
+            else:
+                self.message('TV measurements OFF: TV-on/range is assumed from startup/manual readiness. '
+                             'No TV reads during or after experiment; TV volume effect will be unmeasured.')
         if self.pending_reads:
             self.drive_reads()
         if self.stage == 'pre' and not self.pending_reads and 'tv' not in self.jobs:
+            self.baseline = self.state['amplifier'].copy()
+            self.changes = []
+            self.message('Pre-send amplifier baseline: ' + json.dumps(self.baseline))
             self.initial_tv_volume = self.state['tv'].get('volume') if self.options['tv'] else None
             self.send_volume()
         elif self.stage == 'post' and not self.pending_reads:
@@ -545,7 +570,7 @@ class Window(QMainWindow):
                              and self.state['amplifier'].get('power') == 'on'
                              and self.state['amplifier'].get('input') == TV_INPUT)
         self.refresh.setEnabled(idle and 'tv' not in self.jobs)
-        for widget in (self.target, self.duration, self.final_delay, self.measure_tv, self.measure_amp, self.auto_watch):
+        for widget in (self.target, self.settle_delay, self.duration, self.final_delay, self.measure_tv, self.measure_amp, self.auto_watch):
             widget.setEnabled(idle)
         self.stop.setEnabled(not idle)
         for role, label in self.labels.items():
