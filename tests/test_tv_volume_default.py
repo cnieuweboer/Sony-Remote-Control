@@ -104,6 +104,8 @@ class TvDefaultsTests(unittest.TestCase):
         w._shutting_down = False
         w._calibration_blocked = Mock(return_value=False)
         w.last_power = 'active'
+        w._standby_confirmation_after = None
+        w._tv_controls_available = lambda: R['SonyRemote']._tv_controls_available(w)
         w.amplifier_client = SimpleNamespace(state_is_fresh=True)
         w.amplifier_state = dict(online=True, power='on', valid_for_ms=6000, input='usb_dac')
         w._amplifier_tv_input = lambda: 'tv'

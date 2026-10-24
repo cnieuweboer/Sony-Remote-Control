@@ -580,7 +580,7 @@ class CalibrationServer(QObject):
 APP_NAME = "Sony Remote"
 
 
-__version__ = "2026.10.24.9"
+__version__ = "2026.10.24.10"
 
 
 CONFIG_PATH = Path(__file__).resolve().with_name("SonyRemote.json")
@@ -2934,7 +2934,7 @@ class TvVolumeDefault(QObject):
         w = self.window
         state = w.amplifier_state or {}
         return (not w._shutting_down and not w._calibration_blocked()
-                and w.last_power == "active" and w.amplifier_client.state_is_fresh
+                and w._tv_controls_available() and w.amplifier_client.state_is_fresh
                 and state.get("online") and state.get("power") == "on"
                 and state.get("valid_for_ms", 0) > 0 and state.get("input")
                 and state["input"] != w._amplifier_tv_input())
@@ -3041,6 +3041,9 @@ class SonyRemote(QMainWindow):
         self._config_restart_pending = False
 
         self.last_power = None
+        # None: ordinary control; infinity: standby command pending; otherwise
+        # require a power read started after the command completed.
+        self._standby_confirmation_after = None
         self.last_volume = None
         self._desired_volume = None
         self._volume_rate_loop_running = False
@@ -3211,7 +3214,7 @@ class SonyRemote(QMainWindow):
 
     def _smtc_commands(self):
         if (self._playback_key_mode() != "smtc" or self._shutting_down
-                or self._calibration_blocked() or self.last_power != "active"
+                or self._calibration_blocked() or not self._tv_controls_available()
                 or QApplication.activeModalWidget() is not None
                 or "remote_codes" not in self._discovery_ready):
             return frozenset()
@@ -3864,11 +3867,14 @@ class SonyRemote(QMainWindow):
         cached_power = self.last_power
         def query():
             read_power = "power" in groups or cached_power is None
+            power_started_at = time.monotonic() if read_power else None
             power = self.api.get_power() if read_power else cached_power
-            data = {"power": power, "observed_at": time.monotonic() if read_power else None}
+            data = {"power": power, "observed_at": time.monotonic() if read_power else None,
+                    "power_started_at": power_started_at}
             # Recheck after the power request: a limiter may have started
             # while it was in flight. Never delay the limiter behind this poll.
             if (power == "active" and read_volume
+                    and self._standby_confirmation_after is None
                     and self.polling.reads_volume()):
                 data["volume"] = self.api.get_volume()
                 data["volume_observed_at"] = time.monotonic()
@@ -3882,6 +3888,10 @@ class SonyRemote(QMainWindow):
                 self.polling.observed("power", data["observed_at"])
             self._update_discovery_feedback()
             self.last_power = data.get("power")
+            if (self._standby_confirmation_after is not None
+                    and data["power_started_at"] is not None
+                    and data["power_started_at"] >= self._standby_confirmation_after):
+                self._standby_confirmation_after = None
 
             self.initialized = True
             # Retry only missing discovery, independently of successful status.
@@ -3961,7 +3971,8 @@ class SonyRemote(QMainWindow):
         if power_enabled is None:
             power_enabled = enabled
 
-        self.power_button.setEnabled(power_enabled)
+        enabled = bool(enabled and self._tv_controls_available())
+        self.power_button.setEnabled(power_enabled and self._standby_confirmation_after is None)
 
         for widget in (
             getattr(self, "text_input", None),
@@ -4102,12 +4113,19 @@ class SonyRemote(QMainWindow):
     def _calibration_blocked(self):
         return bool(self.calibration_active or (self.amplifier_state or {}).get("calibration_active", False))
 
+    def _tv_controls_available(self):
+        return (not self._shutting_down and self.last_power == "active"
+                and self._standby_confirmation_after is None)
+
     def toggle_power(self):
         cancel_tv_volume_default(self)
         if self._calibration_blocked():
             return
+        if self._standby_confirmation_after is not None:
+            return
         turn_on = self.last_power != "active"
         if not turn_on:
+            self._standby_confirmation_after = math.inf
             # Cancel intent before queueing standby: old reads/errors and queued
             # relative commands must not continue after the power command.
             self._volume_route_epoch += 1
@@ -4121,14 +4139,26 @@ class SonyRemote(QMainWindow):
             self.volume_rate_timer.stop()
             if self.config["VolumeControls"]:
                 self.update_volume_ui(self.last_volume or {})
-        self.power_button.setEnabled(False)
+        self.set_controls_enabled(self.last_power == "active", power_enabled=False)
+        def succeeded(_result):
+            if not turn_on:
+                self._standby_confirmation_after = time.monotonic()
+        def failed(error):
+            self._standby_confirmation_after = None
+            self.set_controls_enabled(self.last_power == "active",
+                                      power_enabled=self.last_power is not None)
+            self.handle_request_error(error)
+        def finished():
+            self.set_controls_enabled(self.last_power == "active",
+                                      power_enabled=self.last_power is not None)
         accepted = self.run_command(
             lambda: self.api.set_power(turn_on),
-            on_finished=lambda: self.power_button.setEnabled(self.last_power is not None),
+            on_result=succeeded, on_error=failed, on_finished=finished,
             refresh_groups=self.polling.GROUPS, refresh_delay_ms=300,
         )
         if not accepted:
-            self.power_button.setEnabled(self.last_power is not None)
+            self._standby_confirmation_after = None
+            finished()
 
     def _matched_volume_mapping(self):
         mapping = self.volume_mapping
@@ -4173,7 +4203,7 @@ class SonyRemote(QMainWindow):
 
     def _focused_tv_volume_bindings(self):
         if (self._shutting_down or self._calibration_blocked() or not self.initialized
-                or self.last_power != "active" or not self.last_volume or self._use_amplifier()
+                or not self._tv_controls_available() or not self.last_volume or self._use_amplifier()
                 or not self.isActiveWindow() or self.isMinimized() or not self.isVisible()
                 or QApplication.activeModalWidget() is not None
                 or QApplication.activePopupWidget() is not None or not self._amplifier_tv_input()):
@@ -4253,7 +4283,7 @@ class SonyRemote(QMainWindow):
 
     def _update_volume_controls(self):
         if self.config["VolumeControls"]:
-            enabled = (not self._shutting_down and self.initialized and self.last_power == "active"
+            enabled = (self._tv_controls_available() and self.initialized
                        and (self._use_amplifier() or bool(self.last_volume)))
             for widget in (self.volume_up, self.volume_down, self.mute_button):
                 widget.setEnabled(enabled)
@@ -4286,6 +4316,8 @@ class SonyRemote(QMainWindow):
         cancel_tv_volume_default(self)
         if self._calibration_blocked():
             return
+        if not self._tv_controls_available():
+            return
         if self._route_volume_command("mute"):
             return
         if not self.last_volume:
@@ -4296,6 +4328,8 @@ class SonyRemote(QMainWindow):
     def adjust_volume(self, amount):
         cancel_tv_volume_default(self)
         if self._calibration_blocked():
+            return
+        if not self._tv_controls_available():
             return
         if self._route_volume_command("volume_up" if amount > 0 else "volume_down"):
             return
@@ -4506,7 +4540,7 @@ class SonyRemote(QMainWindow):
             self.app_combo.setCurrentIndex(-1)
 
     def launch_app(self, uri):
-        if self._calibration_blocked():
+        if self._calibration_blocked() or not self._tv_controls_available():
             return
         self.run_command(lambda: self.api.launch_app(uri),
                          refresh_groups=self.polling.GROUPS, refresh_delay_ms=300)
@@ -4517,13 +4551,13 @@ class SonyRemote(QMainWindow):
             self.set_input(uri)
 
     def set_input(self, uri):
-        if self._calibration_blocked():
+        if self._calibration_blocked() or not self._tv_controls_available():
             return
         self.run_command(lambda: self.api.set_input(uri),
                          refresh_groups=self.polling.GROUPS, refresh_delay_ms=300)
 
     def send_ircc(self, command, *, background=False):
-        if self._calibration_blocked():
+        if self._calibration_blocked() or not self._tv_controls_available():
             return
         accepted = self.run_command(
             lambda: self.api.ircc(command),
@@ -4534,7 +4568,7 @@ class SonyRemote(QMainWindow):
         return accepted
 
     def send_text_input(self):
-        if self._calibration_blocked():
+        if self._calibration_blocked() or not self._tv_controls_available():
             return
         if not hasattr(self, "text_input"):
             return
@@ -4550,7 +4584,7 @@ class SonyRemote(QMainWindow):
             self._leave_text_input(self.text_input.submission_key)
 
     def send_text_input_and_confirm(self):
-        if self._calibration_blocked():
+        if self._calibration_blocked() or not self._tv_controls_available():
             return
         if not hasattr(self, "text_input"):
             return
@@ -4639,6 +4673,7 @@ class SonyRemote(QMainWindow):
             return
         window = int(self.winId()) if self.isVisible() and not self.isMinimized() else 0
         blocked = (self._shutting_down or self._calibration_blocked()
+                   or not self._tv_controls_available()
                    or QApplication.activeModalWidget() is not None
                    or QApplication.activePopupWidget() is not None)
         owner_deadline = self.amplifier_client.state_deadline if self._amplifier_owns_hotkeys() else 0
@@ -4696,6 +4731,7 @@ class SonyRemote(QMainWindow):
             self._native_volume_queue.clear()
             self._native_volume_drain_pending = False
         if (self._shutting_down or self._calibration_blocked() or not self.isActiveWindow()
+                or not self._tv_controls_available()
                 or QApplication.activeModalWidget() is not None
                 or QApplication.activePopupWidget() is not None):
             return
@@ -4709,6 +4745,7 @@ class SonyRemote(QMainWindow):
 
     def _focused_shortcut_allowed(self, command, *, custom=False):
         if (self._shutting_down or self._calibration_blocked()
+                or not self._tv_controls_available()
                 or not self.isActiveWindow() or self.isMinimized()
                 or QApplication.activeModalWidget() is not None
                 or QApplication.activePopupWidget() is not None):
@@ -4903,11 +4940,12 @@ class SonyRemote(QMainWindow):
             reason = "amplifier_audio_state_incomplete"
         volume = self.last_volume or {}
         report["device"] = {"power": self.last_power,
+            "standby_pending": self._standby_confirmation_after is not None,
             "status_age_seconds": _state_age(self._status_observed_at, now),
             "volume_age_seconds": _state_age(self._volume_observed_at, now),
             "audio": {key: volume.get(key) for key in ("volume", "mute", "minVolume", "maxVolume")}}
         report["routing"] = {"volume_destination": "amplifier" if routed else "tv", "reason": reason,
-            "tv_controls_available": self.initialized and self.last_power == "active" and bool(routed or self.last_volume),
+            "tv_controls_available": self.initialized and self._tv_controls_available() and bool(routed or self.last_volume),
             "tv_input_configured": bool(tv_input), "amplifier_input_matches_tv": bool(tv_input and state.get("input") == tv_input),
             "calibration_matches": self._matched_volume_mapping() is not None}
         with self._native_volume_lock:
@@ -5027,6 +5065,10 @@ class SonyRemote(QMainWindow):
         self._workers.clear()
         self._command_workers.clear()
         self._pending_volume_commands = 0
+        if self._standby_confirmation_after is not None:
+            # Pausing discards worker callbacks. A failed restart must still
+            # reconcile a completed power request through a fresh status read.
+            self._standby_confirmation_after = time.monotonic()
         self.poll_running = False
         self._input_status_running = False
         self._discovery_pending.clear()

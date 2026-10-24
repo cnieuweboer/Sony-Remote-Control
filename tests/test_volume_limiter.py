@@ -26,7 +26,7 @@ class VolumeLimiterTests(unittest.TestCase):
         self.blocked = False
         info = {'volume': 20, 'mute': False, 'minVolume': 0, 'maxVolume': 100}
         self.window = SimpleNamespace(
-            _shutting_down=False, last_power='active',
+            _shutting_down=False, last_power='active', _standby_confirmation_after=None,
             _volume_rate_loop_running=True, _volume_rate_step_running=False,
             _volume_rate_progress=None, _volume_rate_phase='read',
             _volume_rate_candidate=None, _volume_rate_due=0.0,
@@ -45,6 +45,7 @@ class VolumeLimiterTests(unittest.TestCase):
         self.window.polling = SimpleNamespace(observed=Mock())
         self.window._publish_native_volume_state = Mock()
         self.window._accept_volume_status = lambda info, at: CLS._accept_volume_status(self.window, info, at)
+        self.window._tv_controls_available = lambda: CLS._tv_controls_available(self.window)
         self.window._request_poll = Mock()
         timer = patch.object(REMOTE['time'], 'monotonic', lambda: self.now)
         timer.start()
@@ -372,7 +373,7 @@ class UnrestrictedVolumePollingTests(unittest.TestCase):
     def setUp(self):
         self.callbacks = []
         self.window = SimpleNamespace(
-            _shutting_down=False, _amplifier_routed=False,
+            _shutting_down=False, _amplifier_routed=False, last_power='active', _standby_confirmation_after=None,
             _pending_volume_commands=0, _volume_generation=0,
             _volume_rate_loop_running=False, _desired_volume=None,
             _calibration_blocked=lambda: False, _route_volume_command=lambda command: False,
@@ -382,6 +383,7 @@ class UnrestrictedVolumePollingTests(unittest.TestCase):
             poll_status=Mock(), api=SimpleNamespace(adjust_volume=Mock()),
             run_command=self.enqueue,
         )
+        self.window._tv_controls_available = lambda: CLS._tv_controls_available(self.window)
         self.window._request_poll = lambda delay, condition=None, groups=None: REMOTE['QTimer'].singleShot(
             delay, self.window.poll_status if condition is None else
             lambda: self.window.poll_status() if condition() else None)
