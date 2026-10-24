@@ -2,6 +2,10 @@
 
 Release identifiers below come from the corresponding commits. Some releases updated only the calibration helper; the remote and helper can therefore have different version numbers. Historical behavior may have been superseded by later releases.
 
+## 2026-10-24
+
+- Sony Remote 2026.10.24.1 — Add optional grouped DefaultTvVolume settings for confirmed amplifier TV-input handovers, with a delay, bounded repetition, TV range validation and cancellation on manual control or state changes. Invalidate older TV volume work across routing changes.
+
 ## 2026-10-23
 
 - Sony Remote 2026.10.23.1 — Disable the app dropdown and app favorites in standby, consistently with other TV controls. Re-enable after the TV reports active; remove the separate app-enabled override.

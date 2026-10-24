@@ -580,7 +580,7 @@ class CalibrationServer(QObject):
 APP_NAME = "Sony Remote"
 
 
-__version__ = "2026.10.23.1"
+__version__ = "2026.10.24.1"
 
 
 CONFIG_PATH = Path(__file__).resolve().with_name("SonyRemote.json")
@@ -711,6 +711,7 @@ DEFAULT_CONFIG = {
     "PlaybackControls": True,
     "VolumeControls": True,
     "AmplifierTVInput": "",
+    "DefaultTvVolume": {"Volume": "", "DelayMs": 1000, "RepeatMs": 0},
     "VolumeRateLimit": {
         "Active": True,
         "RateMs": 500,
@@ -1068,6 +1069,17 @@ def validate_config(raw_config, *, allow_incomplete=False):
     if not isinstance(config["AmplifierTVInput"], str):
         raise ConfigError('"AmplifierTVInput" must be a string (the amplifier input ID, or empty to disable routing).')
     config["AmplifierTVInput"] = config["AmplifierTVInput"].strip()
+
+    default = config["DefaultTvVolume"]
+    if not isinstance(default, dict) or set(default) - {"Volume", "DelayMs", "RepeatMs"}:
+        raise ConfigError('"DefaultTvVolume" must be an object with Volume, DelayMs and RepeatMs.')
+    default = dict(DEFAULT_CONFIG["DefaultTvVolume"], **default)
+    if default["Volume"] != "" and (type(default["Volume"]) is not int or default["Volume"] < 0):
+        raise ConfigError('"DefaultTvVolume.Volume" must be a non-negative integer or an empty string.')
+    for key in ("DelayMs", "RepeatMs"):
+        if type(default[key]) is not int or default[key] < 0:
+            raise ConfigError(f'"DefaultTvVolume.{key}" must be a non-negative integer.')
+    config["DefaultTvVolume"] = default
 
     rate_limit = config["VolumeRateLimit"]
     if not isinstance(rate_limit, dict):
@@ -1809,6 +1821,10 @@ class SonyApi:
             if entry.get("target") == "speaker":
                 return entry
         return entries[0] if entries else None
+
+    def set_volume(self, value):
+        return self.rpc("audio", "setAudioVolume",
+                        [{"target": "speaker", "volume": str(value), "ui": "on"}], version="1.2")
 
     def adjust_volume(self, amount):
         amount = int(amount)
@@ -2764,6 +2780,83 @@ class PollingCoordinator(QObject):
         self.update(refresh=True)
 
 
+class TvVolumeDefault(QObject):
+    """One input-handover sequence; queued work rechecks its cancellation token."""
+    def __init__(self, window):
+        super().__init__(window)
+        self.window = window
+        self.token = 0
+        self.timer = QTimer(self)
+        self.timer.setSingleShot(True)
+        self.timer.timeout.connect(self.send)
+        self.deadline = None
+
+    def cancel(self):
+        self.token += 1
+        self.timer.stop()
+        self.deadline = None
+
+    def allowed(self):
+        w = self.window
+        state = w.amplifier_state or {}
+        return (not w._shutting_down and not w._calibration_blocked()
+                and w.last_power == "active" and w.amplifier_client.state_is_fresh
+                and state.get("online") and state.get("power") == "on"
+                and state.get("valid_for_ms", 0) > 0 and state.get("input")
+                and state["input"] != w._amplifier_tv_input())
+
+    def start(self):
+        self.cancel()
+        setting = self.window.config["DefaultTvVolume"]
+        if setting["Volume"] != "" and self.allowed():
+            self.timer.start(setting["DelayMs"])
+
+    def send(self):
+        if not self.allowed():
+            self.cancel()
+            return
+        w = self.window
+        setting = w.config["DefaultTvVolume"]
+        now = time.monotonic()
+        if self.deadline is not None and now >= self.deadline:
+            return
+        token = self.token
+        target = setting["Volume"]
+        def command():
+            if token != self.token or not self.allowed():
+                return
+            info = w.api.get_volume()
+            if token != self.token or not self.allowed():
+                return
+            minimum, maximum = info.get("minVolume"), info.get("maxVolume")
+            if (type(minimum) is not int or type(maximum) is not int
+                    or not minimum <= target <= maximum):
+                raise ValueError("DefaultTvVolume.Volume is outside the TV's reported volume range.")
+            if self.deadline is not None and time.monotonic() >= self.deadline:
+                return
+            if self.deadline is None:
+                self.deadline = time.monotonic() + setting["RepeatMs"] / 1000
+            w.api.set_volume(target)
+        def finished():
+            if token != self.token:
+                return
+            if self.allowed() and self.deadline is not None and time.monotonic() + .2 < self.deadline:
+                self.timer.start(200)
+            else:
+                w._request_poll(200, groups={"volume"})
+        def failed(error):
+            self.cancel()
+            w.handle_request_error(error, background=True)
+        if not w.run_command(command, on_error=failed, on_finished=finished):
+            self.cancel()
+
+
+def cancel_tv_volume_default(window):
+    controller = getattr(window, "tv_volume_default", None)
+    if controller is not None:
+        controller.cancel()
+
+
 class SonyRemote(QMainWindow):
     _native_volume_ready = Signal()
 
@@ -2818,6 +2911,7 @@ class SonyRemote(QMainWindow):
         self._pending_volume_commands = 0
         self._volume_generation = 0
 
+        self.tv_volume_default = TvVolumeDefault(self)
         self.amplifier_state = None
         self._amplifier_routed = False
         self._smtc = None
@@ -2869,6 +2963,7 @@ class SonyRemote(QMainWindow):
         return state
 
     def _calibration_changed(self, active):
+        cancel_tv_volume_default(self)
         self.calibration_active = active
         self.setEnabled(not active)
         self._desired_volume = None
@@ -3656,6 +3751,7 @@ class SonyRemote(QMainWindow):
             )
             self.update_power_ui(self.last_power)
             if not is_active:
+                cancel_tv_volume_default(self)
                 self._desired_volume = None
                 self._volume_rate_loop_running = False
                 self.volume_rate_timer.stop()
@@ -3865,6 +3961,7 @@ class SonyRemote(QMainWindow):
         return bool(self.calibration_active or (self.amplifier_state or {}).get("calibration_active", False))
 
     def toggle_power(self):
+        cancel_tv_volume_default(self)
         if self._calibration_blocked():
             return
         turn_on = self.last_power != "active"
@@ -3961,13 +4058,24 @@ class SonyRemote(QMainWindow):
         return _binding_owned(self.amplifier_state["global_shortcuts"], code)
 
     def _amplifier_state_changed(self, state):
+        previous = self.amplifier_state or {}
+        confirmed_handover = bool(self._amplifier_routed and state
+            and state.get("input") and state["input"] != previous.get("input")
+            and previous.get("input") == self._amplifier_tv_input())
         self.amplifier_state = state
+        controller = getattr(self, "tv_volume_default", None)
+        if controller is not None:
+            if not controller.allowed():
+                controller.cancel()
+            elif confirmed_handover:
+                controller.start()
         if (self._amplifier_error_category in ("connection", "protocol_state") and state
                 and state["valid_for_ms"] > 0 and self.amplifier_client.state_is_fresh):
             self._clear_amplifier_error()
         routed = self._use_amplifier()
         falling_back = self._amplifier_routed and not routed
         if routed != self._amplifier_routed:
+            self._volume_route_epoch = getattr(self, "_volume_route_epoch", 0) + 1
             self._volume_generation += 1
             self._desired_volume = None
             self._volume_rate_loop_running = False
@@ -4019,6 +4127,7 @@ class SonyRemote(QMainWindow):
         return True
 
     def toggle_mute(self):
+        cancel_tv_volume_default(self)
         if self._calibration_blocked():
             return
         if self._route_volume_command("mute"):
@@ -4029,6 +4138,7 @@ class SonyRemote(QMainWindow):
         self.run_command(lambda: self.api.set_mute(target), refresh_groups={"volume"})
 
     def adjust_volume(self, amount):
+        cancel_tv_volume_default(self)
         if self._calibration_blocked():
             return
         if self._route_volume_command("volume_up" if amount > 0 else "volume_down"):
@@ -4067,8 +4177,9 @@ class SonyRemote(QMainWindow):
                         return True
                     return False
                 self._request_poll(200, volume_is_idle, groups={"volume"})
+            epoch = getattr(self, "_volume_route_epoch", 0)
             accepted = self.run_command(
-                lambda: None if self._amplifier_routed else self.api.adjust_volume(1 if amount > 0 else -1),
+                lambda: None if self._amplifier_routed or epoch != getattr(self, "_volume_route_epoch", 0) else self.api.adjust_volume(1 if amount > 0 else -1),
                 on_finished=finished,
             )
             if not accepted:
@@ -4099,13 +4210,16 @@ class SonyRemote(QMainWindow):
             return
 
         self._volume_rate_step_running = True
+        epoch = getattr(self, "_volume_route_epoch", 0)
 
         def step():
             info = self.api.get_volume()
             observed_at = time.monotonic()
             current = int(info.get("volume", 0))
             target = self._desired_volume
-            if target is None or current == target:
+            if (epoch != getattr(self, "_volume_route_epoch", 0)
+                    or self._use_amplifier() or not self._volume_rate_loop_running
+                    or target is None or current == target):
                 return {"done": True, "info": info, "observed_at": observed_at}
             direction = 1 if current < target else -1
             self.api.adjust_volume(direction)
@@ -4113,6 +4227,10 @@ class SonyRemote(QMainWindow):
 
         def done(result):
             self._volume_rate_step_running = False
+            if epoch != getattr(self, "_volume_route_epoch", 0):
+                if self._volume_rate_loop_running:
+                    self._schedule_volume_rate_step(0)
+                return
             if self._use_amplifier() or not self._volume_rate_loop_running:
                 return
             info = result.get("info")
@@ -4140,6 +4258,10 @@ class SonyRemote(QMainWindow):
 
         def failed(error):
             self._volume_rate_step_running = False
+            if epoch != getattr(self, "_volume_route_epoch", 0):
+                if self._volume_rate_loop_running:
+                    self._schedule_volume_rate_step(0)
+                return
             self._volume_rate_loop_running = False
             self._desired_volume = None
             self.handle_request_error(error)
@@ -4638,6 +4760,7 @@ class SonyRemote(QMainWindow):
         QApplication.quit()
 
     def _pause_background_work(self):
+        cancel_tv_volume_default(self)
         self._shutting_down = True
         self.discovery.pause()
         self.polling.pause()

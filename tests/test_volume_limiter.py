@@ -84,6 +84,28 @@ class VolumeLimiterTests(unittest.TestCase):
         self.assertEqual(self.volume, 20 + amount)
         self.assertEqual(self.commands, [amount])
 
+    def test_route_changes_during_read_prevent_old_relative_write(self):
+        self.window._desired_volume = 21
+        def read_after_handover():
+            self.window._volume_route_epoch = 1
+            self.window._desired_volume = 25  # A newer TV target after returning.
+            return dict(self.window.last_volume, volume=20)
+        self.window.api.get_volume = read_after_handover
+        self.pending_result()()
+        self.assertEqual(self.commands, [])
+        self.assertEqual(self.window._desired_volume, 25)
+        self.window._schedule_volume_rate_step.assert_called_with(0)
+
+    def test_old_failed_step_does_not_clear_new_target_after_handover(self):
+        CLS._volume_rate_step(self.window)
+        _, callbacks = self.work.popleft()
+        self.window._volume_route_epoch = 1
+        self.window._desired_volume = 25
+        callbacks['on_error'](TimeoutError())
+        self.assertEqual(self.window._desired_volume, 25)
+        self.assertTrue(self.window._volume_rate_loop_running)
+        self.window._schedule_volume_rate_step.assert_called_with(0)
+
     def test_new_up_key_after_reached_target_survives_old_completion(self):
         self.assert_new_key_survives(1)
 

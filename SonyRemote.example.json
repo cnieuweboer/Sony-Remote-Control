@@ -32,6 +32,11 @@
   "CloseToTray": false,
   "DropdownAnimationWorkaround": true,
   "AmplifierTVInput": "",
+  "DefaultTvVolume": {
+    "Volume": "",
+    "DelayMs": 1000,
+    "RepeatMs": 0
+  },
   "Shortcuts": {
     "VolumeUp": [
       "Volume Up"

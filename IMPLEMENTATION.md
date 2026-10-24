@@ -446,3 +446,12 @@ The `requests` groups also carry success/failure/recovery totals for delivered w
 ### Additional TV command shortcuts
 
 Sony accepts additional non-empty action names in `Shortcuts` alongside predefined actions, preserving discovery-independent configuration validation, defaults and duplicate-key checks. Additional actions compile to tagged IRCC commands so they cannot accidentally invoke local functions such as volume routing. Dispatch remains gated by discovered remote-command availability, text/popup/modal guards and existing press ownership. Unadvertised actions remain inactive, including in the native Windows volume handler. Both dump modes list unavailable enabled additional commands, or null while command discovery is incomplete. Use full dumps to inspect the cached getRemoteControllerInfo response for exact case-sensitive command names. No new discovery or polling is added.
+
+
+## TV speaker default after amplifier input handover
+
+`DefaultTvVolume` contains `Volume` (non-negative raw TV integer, or empty to disable), `DelayMs` (default 1000) and `RepeatMs` (default 0). A fresh, online/on amplifier IPC transition from the configured/calibrated TV input to another input starts a single cancellable sequence while the TV is active. Initial connection, stale/offline status and standby alone do not trigger it. The existing input selection used for volume routing remains authoritative; there are no additional amplifier requests.
+
+After the delay, commands run on the existing serialized command pool. The TV's reported speaker range is checked before each absolute set (`audio/setAudioVolume`, version 1.2); out-of-range values stop the sequence without clamping. Repeats are spaced at least 200 ms apart, without catch-up or an additional send at the end of the repeat period. Queued writes recheck cancellation, routing and the repeat deadline. Failures cancel rather than retry. A normal volume refresh follows completion. Mute is never explicitly changed.
+
+User volume/mute/power actions, calibration, shutdown, return to the TV input or loss of usable amplifier state cancel the sequence. An HTTP request already sent cannot be recalled. Routing generations also invalidate older queued relative commands and limiter results, preventing an earlier TV target from competing with the handover. A later manual action may still wait for an already executing HTTP call.
