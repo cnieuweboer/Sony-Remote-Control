@@ -580,7 +580,7 @@ class CalibrationServer(QObject):
 APP_NAME = "Sony Remote"
 
 
-__version__ = "2026.10.24.12"
+__version__ = "2026.10.29.1"
 
 
 CONFIG_PATH = Path(__file__).resolve().with_name("SonyRemote.json")
@@ -2475,6 +2475,37 @@ class TvTextEdit(QTextEdit):
         super().keyPressEvent(event)
 
 
+class WindowDrag(QObject):
+    """Start native moves only for actual drags, preserving ordinary releases."""
+    def __init__(self, widget, *, background=False):
+        super().__init__(widget)
+        self._origin = None
+        self._background = background
+        widget.installEventFilter(self)
+
+    def eventFilter(self, watched, event):
+        kind = event.type()
+        if kind in (QEvent.Hide, QEvent.WindowDeactivate):
+            self._origin = None
+        elif kind == QEvent.MouseButtonPress:
+            if (event.button() == Qt.LeftButton and event.buttons() == Qt.LeftButton
+                    and (not self._background or watched.childAt(event.position().toPoint()) is None)):
+                self._origin = event.globalPosition().toPoint()
+                # Preserve the window's existing click-to-leave-text-editing behavior.
+        elif kind == QEvent.MouseButtonRelease and event.button() == Qt.LeftButton:
+            self._origin = None
+        elif kind == QEvent.MouseMove and self._origin is not None:
+            if not event.buttons() & Qt.LeftButton:
+                self._origin = None
+            elif (event.globalPosition().toPoint() - self._origin).manhattanLength() >= QApplication.startDragDistance():
+                self._origin = None
+                handle = watched.window().windowHandle()
+                if handle is not None and handle.startSystemMove():
+                    event.accept()
+                    return True
+        return False
+
+
 class FavoriteButton(QPushButton):
     """Keep favorite columns equal; elide only the painted label."""
 
@@ -3105,6 +3136,9 @@ class SonyRemote(QMainWindow):
         self.amplifier_client.command_succeeded.connect(self._clear_amplifier_error)
         self.amplifier_client.command_acknowledged.connect(self._amplifier_acknowledged)
         self._build_ui()
+        self._window_drags = [WindowDrag(self.centralWidget(), background=True)]
+        if config["VolumeControls"]:
+            self._window_drags.append(WindowDrag(self.volume_value))
         self._apply_style()
         self._setup_timers()
         self._setup_config_watcher()

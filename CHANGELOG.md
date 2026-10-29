@@ -2,6 +2,10 @@
 
 Release identifiers below come from the corresponding commits. Some releases updated only the calibration helper; the remote and helper can therefore have different version numbers. Historical behavior may have been superseded by later releases.
 
+## 2026-10-29
+
+- Sony Remote 2026.10.29.1 — Allow dragging the window from its empty background or volume number after crossing Qt's normal drag threshold. Preserve ordinary click release/hover behavior, click-to-leave-text-editing and existing control interactions, without changing layout. Background dragging also works when VolumeControls is disabled.
+
 ## 2026-10-24
 
 - Sony Remote 2026.10.24.12 — Remove unused prepared-mapping metadata, the redundant DefaultTvVolume defaults merge and unnecessary volume-route epoch fallbacks. Clean unused test imports/assignments and initialize test fixtures explicitly. Display, configuration and routing behavior are unchanged.

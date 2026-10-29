@@ -2,6 +2,10 @@
 
 For setup and everyday use, see the [README](README.md). Dated changes are in the [release history](CHANGELOG.md).
 
+## Window dragging
+
+Local `WindowDrag` event filters on the central widget's empty background and, when present, the volume number start native window movement only after `QApplication.startDragDistance()` is reached. Simple clicks retain their ordinary release path and the existing behavior of leaving text editing. Child controls and grouped areas retain their interactions; no layout change or additional dependency is needed. `tests/test_window_drag.py` checks clicks, hover state, threshold movement, cancellation and text focus.
+
 ## Focused shortcut handling
 
 Navigation and focused playback shortcuts use an application-wide Qt event filter on every platform. Windows volume/mute use a dedicated low-level hook; other platforms use the Qt filter for volume too. It handles mapped keys before buttons and comboboxes, preserves text editing and popup navigation, and retains physical-press ownership until release. Sony yields focused volume/mute to valid amplifier global ownership; optional Windows SMTC remains a separate playback path. See [Cross-platform focused shortcuts](#cross-platform-focused-shortcuts-202610213) for event ordering and regression coverage.
