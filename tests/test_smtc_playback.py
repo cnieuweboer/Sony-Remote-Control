@@ -241,7 +241,7 @@ class RoutingTests(unittest.TestCase):
         controls.press('STOP')
         self.fixture.wait(lambda: self.window.api.ircc.call_count == 3 and not self.window._command_workers)
         self.assertEqual([call.args[0] for call in self.window.api.ircc.call_args_list],
-                         ['Play', 'Pause', 'Stop'])
+                         ['PlayPause', 'PlayPause', 'Stop'])
         self.assertEqual(controls.playback_status, Status.STOPPED)
         self.window.show_error.assert_not_called()
 
@@ -256,20 +256,56 @@ class RoutingTests(unittest.TestCase):
         self.fixture.wait(lambda: self.window.api.ircc.called)
         self.window.api.ircc.assert_called_once_with('Next')
 
-    def test_unavailable_explicit_commands_are_not_advertised_or_toggled(self):
+    def test_toggle_only_tv_still_advertises_both_smtc_actions(self):
         del self.window.api.remote_codes['Play']
         del self.window.api.remote_codes['Pause']
         controls = self.enable()
-        self.assertFalse(controls.is_play_enabled)
-        self.assertFalse(controls.is_pause_enabled)
+        self.assertTrue(controls.is_play_enabled)
+        self.assertTrue(controls.is_pause_enabled)
         controls.press('PLAY')
         controls.press('PAUSE')
+        self.fixture.wait(lambda: self.window.api.ircc.call_count == 2 and not self.window._command_workers)
+        self.assertEqual([call.args[0] for call in self.window.api.ircc.call_args_list],
+                         ['PlayPause', 'PlayPause'])
+
+    def test_explicit_commands_remain_fallback_without_tv_toggle(self):
+        del self.window.api.remote_codes['PlayPause']
+        controls = self.enable()
+        controls.press('PLAY')
+        controls.press('PAUSE')
+        self.fixture.wait(lambda: self.window.api.ircc.call_count == 2 and not self.window._command_workers)
+        self.assertEqual([call.args[0] for call in self.window.api.ircc.call_args_list], ['Play', 'Pause'])
+        del self.window.api.remote_codes['Pause']
+        self.window._refresh_playback_routing()
+        self.assertTrue(controls.is_play_enabled)
+        self.assertFalse(controls.is_pause_enabled)
+        controls.press('PAUSE')
         self.fixture.app.processEvents()
-        self.window.api.ircc.assert_not_called()
-        # The on-screen toggle remains usable independently of key ownership.
-        self.window.send_ircc('PlayPause')
-        self.fixture.wait(lambda: self.window.api.ircc.called)
-        self.window.api.ircc.assert_called_once_with('PlayPause')
+        self.assertEqual(self.window.api.ircc.call_count, 2)
+
+    def test_stale_playback_hint_cannot_turn_toggle_key_into_noop(self):
+        controls = self.enable()
+        # Playback may change on the TV without any update to our session hint.
+        actual_playing = [False]
+        def apply(command):
+            if command == 'PlayPause':
+                actual_playing[0] = not actual_playing[0]
+            elif command == 'Play':
+                actual_playing[0] = True
+            elif command == 'Pause':
+                actual_playing[0] = False
+        self.window.api.ircc.side_effect = apply
+        for incoming, before, after in (('PAUSE', False, True), ('PLAY', True, False),
+                                         ('PLAY', False, True), ('PAUSE', True, False)):
+            with self.subTest(incoming=incoming, before=before):
+                actual_playing[0] = before
+                count = self.window.api.ircc.call_count
+                controls.press(incoming)
+                self.fixture.wait(lambda: self.window.api.ircc.call_count == count + 1
+                                  and not self.window._command_workers)
+                self.assertEqual(actual_playing[0], after)
+                self.window.api.ircc.assert_called_with('PlayPause')
+        self.window.show_error.assert_not_called()
 
     def test_standby_offline_and_calibration_disable_participation(self):
         controls = self.enable()

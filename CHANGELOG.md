@@ -4,6 +4,8 @@ Release identifiers below come from the corresponding commits. Some releases upd
 
 ## 2026-10-29
 
+- Sony Remote 2026.10.29.2 — Route SMTC Play/Pause actions through the TV's PlayPause toggle when available, matching the on-screen button and avoiding missed state changes caused by an out-of-date Windows playback hint. Keep separate Play/Pause commands as a fallback; Stop/Next/Previous, queueing and amplifier hotkey ownership are unchanged.
+
 - Sony Remote 2026.10.29.1 — Allow dragging the window from its empty background or volume number after crossing Qt's normal drag threshold. Preserve ordinary click release/hover behavior, click-to-leave-text-editing and existing control interactions, without changing layout. Background dragging also works when VolumeControls is disabled.
 
 ## 2026-10-24

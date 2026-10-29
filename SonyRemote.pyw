@@ -580,7 +580,7 @@ class CalibrationServer(QObject):
 APP_NAME = "Sony Remote"
 
 
-__version__ = "2026.10.29.1"
+__version__ = "2026.10.29.2"
 
 
 CONFIG_PATH = Path(__file__).resolve().with_name("SonyRemote.json")
@@ -3281,6 +3281,13 @@ class SonyRemote(QMainWindow):
                             "The remote's on-screen buttons remain available. "
                             "Set SMTCPlaybackKeys to false to restore focused playback keys.")
 
+    def _smtc_tv_command(self, command):
+        # Windows chooses Play/Pause using our optimistic session hint, which
+        # cannot track playback changed on the TV. Prefer its actual toggle.
+        if command in ("Play", "Pause") and "PlayPause" in self.api.remote_codes:
+            return "PlayPause"
+        return command
+
     def _smtc_commands(self):
         if (self._playback_key_mode() != "smtc" or self._shutting_down
                 or self._calibration_blocked() or not self._tv_controls_available()
@@ -3288,7 +3295,7 @@ class SonyRemote(QMainWindow):
                 or "remote_codes" not in self._discovery_ready):
             return frozenset()
         return frozenset(command for command in _SMTC_BUTTON_COMMANDS.values()
-                         if self.api.resolve_remote_command(command) in self.api.remote_codes
+                         if self.api.resolve_remote_command(self._smtc_tv_command(command)) in self.api.remote_codes
                          and not any(self._amplifier_owns_hotkeys(key) for key in _SMTC_COMMAND_KEYS[command]))
 
     def _refresh_playback_routing(self):
@@ -3302,7 +3309,7 @@ class SonyRemote(QMainWindow):
     def _handle_smtc_button(self, command):
         # Availability may have changed since Windows queued this event.
         if command in self._smtc_commands():
-            self.send_ircc(command, background=True)
+            self.send_ircc(self._smtc_tv_command(command), background=True)
 
     def _setup_shortcuts(self):
         self._popup_shortcut_keys = set()
